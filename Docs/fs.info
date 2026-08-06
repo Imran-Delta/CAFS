@@ -1,5 +1,5 @@
 # =================================================================
-# MYFS FILESYSTEM INFORMATION (v14 – format version 3)
+# CAFS FILESYSTEM INFORMATION (v14 – format version 3)
 # =================================================================
 # This file documents the on-disk layout, binary structures,
 # and atomic update protocols. It is NOT a configuration file.
@@ -222,7 +222,7 @@
 #    primary (LBA 4) is already valid and matches the anchor; the backup
 #    is stale but harmless and will be overwritten on the next update.
 #
-# 3. Config Sync (myfs.sync-config, for LBA 2 changes):
+# 3. Config Sync (cafs.sync-config, for LBA 2 changes):
 #    - Write new LBA 2. fsync().
 #    - Write new LBA 0. fsync().
 #    - Write LBA 1 as a byte-for-byte copy of LBA 0. fsync().  <-- MANDATORY
@@ -365,7 +365,7 @@
 #                 0x02 = DELETE
 #                 0x03 = UPDATE
 #                 0x04 = CHECKPOINT
-#   Offset 1-16 : key (16 bytes)        <-- myfs_key_t
+#   Offset 1-16 : key (16 bytes)        <-- cafs_key_t
 #   Offset 17-32: value (16 bytes)
 #   Offset 33-40: checksum (uint64)     <-- xxhash64 over op_type + key + value
 #   Offset 41-47: sequence_number (uint64)

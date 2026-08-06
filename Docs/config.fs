@@ -1,5 +1,5 @@
 # =================================================================
-# MYFS CONFIGURATION PARAMETERS (v14 – format version 3)
+# CAFS CONFIGURATION PARAMETERS (v14 – format version 3)
 # =================================================================
 # This file contains all user- and administrator-facing settings.
 # For on-disk layout, binary structures, and atomic protocols,
@@ -13,11 +13,11 @@
 # 3. Mount options are NEVER written back to config.fs.
 # 4. To permanently change a setting:
 #    a. Edit config.fs
-#    b. Run myfs.sync-config
+#    b. Run cafs.sync-config
 #    c. Remount
 # 5. [mount_hints] is EXCLUDED from LBA2 (crash survival) and
 #    EXCLUDED from config_self_checksum computation.
-# 6. config_self_checksum is recomputed by myfs.sync-config over
+# 6. config_self_checksum is recomputed by cafs.sync-config over
 #    the canonical TOML payload (excluding [mount_hints] and itself).
 # =================================================================
 
@@ -31,7 +31,7 @@ volume_uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 uuid_sequence = 0
 config_generation = 0
 
-# hex-encoded 64-bit checksum; computed by myfs.sync-config over the canonical TOML
+# hex-encoded 64-bit checksum; computed by cafs.sync-config over the canonical TOML
 # with this field temporarily set to "" (empty string) and [mount_hints] removed.
 config_self_checksum = "0000000000000000"
 
@@ -232,7 +232,7 @@ journal_lock_behavior = "block"           # "block", "warn"
 journal_fallback_to_scan = true
 migration_staging_size = "10GB"           # CRASH-CRITICAL (in LBA2)
 abort_on_error = false
-uuid_sync_tool = "myfs.sync-uuid"
+uuid_sync_tool = "cafs.sync-uuid"
 auto_remount_on_irrecoverable = false     # RUNTIME ONLY (not in LBA2)
 
 # =================================================================
@@ -306,7 +306,7 @@ default_options = [
 # These fields are read by the FUSE driver at mount time and used
 # as defaults. They are overridden by command-line options.
 #
-# WARNING: Changing these does NOT require myfs.sync-config.
+# WARNING: Changing these does NOT require cafs.sync-config.
 # They do NOT survive a crash (they are not in LBA2).
 # They are EXCLUDED from config_self_checksum computation.
 # =================================================================
