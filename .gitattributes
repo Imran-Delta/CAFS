@@ -1,0 +1,38 @@
+# All files are text by default, for consistent diff/merge
+* text=auto
+
+# Explicitly mark documentation as text
+*.md text
+*.txt text
+*.toml text
+*.cfg text
+*.conf text
+*.spec text
+
+# Explicitly mark code as text
+*.c text
+*.h text
+*.cpp text
+*.hpp text
+
+# Mark binary files (images, etc.) as binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.bz2 binary
+*.xz binary
+*.dat binary
+
+# Explicitely mark data files with correct interpreter
+config.fs diff=toml
+
+# Mark scripts as text with appropriate line endings
+*.sh text eol=lf
+*.py text eol=lf
+*.pl text eol=lf
+Makefile text eol=lf
+*.makefile text eol=lf

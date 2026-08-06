@@ -1,0 +1,45 @@
+# Build artifacts
+*.o
+*.so
+*.a
+*.exe
+*.dll
+*.dylib
+fs
+fs.exe
+myfs
+myfs.exe
+
+# Backup files
+*~
+*.swp
+*.swo
+*.bak
+*.orig
+*.rej
+
+# Logs
+*.log
+*.trace
+
+# Temporary files
+/tmp/
+*.tmp
+*.img
+*.mount
+.cache/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+*.kate-swp
+*.user
+
+# Dependencies
+/usr/
+/local/
+
+# Test files
+/test_*
+/test/
