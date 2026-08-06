@@ -1,0 +1,452 @@
+# =================================================================
+# MYFS FILESYSTEM INFORMATION (v14 – format version 3)
+# =================================================================
+# This file documents the on-disk layout, binary structures,
+# and atomic update protocols. It is NOT a configuration file.
+#
+# =================================================================
+# TO THE AUDITOR: FOUR CRITICAL DESIGN DECISIONS
+# =================================================================
+# 1. B+ Tree is the ONLY persistent structure.
+#    No full hash table, no extent list. Only B+ Tree + WAL survive crashes.
+#
+# 2. WAL is the ONLY write buffer.
+#    No separate extent list for writes. WAL handles batching + crash recovery.
+#
+# 3. Hot Hash Cache is volatile (RAM only) and read-only.
+#    Never authoritative. Invalidated on writes. Cache miss = B+ Tree fallback.
+#
+# 4. Scaling is addressed honestly.
+#    100M files = 1-2 GB RAM (reasonable). Warnings given if cache insufficient.
+#    Beyond single-node: sharding or distributed design (not in v1).
+# =================================================================
+
+# =================================================================
+# CONFIGURATION PERSISTENCE NOTE
+# =================================================================
+# LBA2 stores ONLY crash-critical parameters.
+# [mount_hints], [buffer], and [optimization] are NOT stored in LBA2.
+# They are read from config.fs at mount time and overridden by command-line.
+# =================================================================
+
+# --------------------------------------------------------------
+# STATIC ANCHOR LAYOUT (LBA 0-3) - FIXED, NEVER SHIFTS
+# --------------------------------------------------------------
+# LBA 0: Primary Superblock (4KB) - contains runtime fields
+# LBA 1: Backup Superblock (4KB) - byte-for-byte copy of LBA 0
+# LBA 2: Critical Config Snapshot (4KB) - all layout parameters + B+ Tree root
+# LBA 3: Parity Block (LBA0 XOR LBA2) over the entire 4KB
+# --------------------------------------------------------------
+
+# --------------------------------------------------------------
+# POINTER TABLE (LBA 4 & 5) - FIXED 4KB BLOCK WITH 8 ENTRIES
+# --------------------------------------------------------------
+# Offset 0-7   : Zone Table LBA (uint64)
+# Offset 8-15  : WAL Region LBA (uint64)
+# Offset 16-23 : Relocation Log Head LBA (uint64)
+# Offset 24-31 : Relocation Log Tail LBA (uint64)
+# Offset 32-39 : Dedup Table Root LBA (uint64)
+# Offset 40-47 : Compaction Checkpoint LBA (uint64)
+# Offset 48-55 : Fsck Scratch LBA (uint64)
+# Offset 56-63 : pointer_table_generation (uint64) <-- MUST match LBA0.config_generation
+# Offset 64-4079: reserved (zero)
+# Offset 4080-4095: checksum (16 bytes) -- computed with anchor_checksum_algo from LBA2
+#
+# LBA 4 = Primary Pointer Table
+# LBA 5 = Backup Pointer Table (byte-for-byte copy of LBA 4)
+# --------------------------------------------------------------
+
+# --------------------------------------------------------------
+# DYNAMIC STRUCTURES (LBA 6+) - POINTED TO BY TABLE
+# --------------------------------------------------------------
+# Zone Table         : LBA = pointer_table[0]
+# WAL Region         : LBA = pointer_table[1]
+# Relocation Log     : LBA = pointer_table[2] (head), pointer_table[3] (tail)
+# Dedup Table        : LBA = pointer_table[4]
+# Compaction Chkpt   : LBA = pointer_table[5]
+# Fsck Scratch       : LBA = pointer_table[6]
+# --------------------------------------------------------------
+
+# =================================================================
+# APPENDIX A: SUPERBLOCK (LBA 0 & 1) BINARY LAYOUT (v3)
+# =================================================================
+# LBA 0 (Primary Superblock) - 4KB:
+#   Offset 0-3   : magic = 0x53555042 ("SUPB")
+#   Offset 4-7   : format_version (uint32)          <-- MUST be 3
+#   Offset 8-23  : volume_uuid (16 bytes)
+#   Offset 24-31 : config_generation (uint64)
+#   Offset 32-39 : pointer_table_lba (uint64)       <-- always 4
+#   Offset 40-47 : journal_sequence (uint64)
+#   Offset 48-55 : last_mount_time (uint64)         <-- 0 = dirty
+#   Offset 56-59 : flags (uint32)                   <-- 0x1 clean, 0x2 fsck required, 0x10 flipped
+#   Offset 60-63 : data_checksum_algo_id (uint32)   <-- for user data, not used for anchors
+#   Offset 64-67 : anchor_checksum_algo_id (uint32) <-- MUST match LBA2.anchor_checksum_algo_id
+#   Offset 68-71 : root_hash_algo_id (uint32)
+#   Offset 72-4079: zero padding
+#   Offset 4080-4095: checksum (16 bytes)            <-- anchor checksum over bytes 0-4079
+#
+# LBA 1: byte-for-byte copy of LBA 0.
+# =================================================================
+
+# =================================================================
+# APPENDIX B: POINTER TABLE (LBA 4 & 5) - PACKED 4KB BLOCK
+# =================================================================
+# Offset 0-7   : Zone Table LBA (uint64)
+# Offset 8-15  : WAL Region LBA (uint64)
+# Offset 16-23 : Relocation Log Head LBA (uint64)
+# Offset 24-31 : Relocation Log Tail LBA (uint64)
+# Offset 32-39 : Dedup Table Root LBA (uint64)
+# Offset 40-47 : Compaction Checkpoint LBA (uint64)
+# Offset 48-55 : Fsck Scratch LBA (uint64)
+# Offset 56-63 : pointer_table_generation (uint64) <-- MUST match LBA0.config_generation
+# Offset 64-4079: reserved (zero)
+# Offset 4080-4095: checksum (16 bytes)             <-- anchor checksum over bytes 0-4079
+#
+# LBA 4 = Primary Pointer Table
+# LBA 5 = Backup Pointer Table (byte-for-byte copy)
+# =================================================================
+
+# =================================================================
+# APPENDIX C: LBA 2 (CRITICAL CONFIG SNAPSHOT) BINARY LAYOUT (v3)
+# =================================================================
+# All fields are little-endian. Checksum covers bytes 0-4079.
+#
+# ---- LAYOUT PARAMETERS (CRASH-CRITICAL) ----
+#
+# Offset 0-3   : magic = 0x43464753 ("CFGS")
+# Offset 4-7   : format_version (uint32)            <-- MUST be 3
+# Offset 8-23  : volume_uuid (16 bytes)
+# Offset 24-31 : config_generation (uint64)         <-- matches LBA0
+# Offset 32-35 : block_size (uint32)
+# Offset 36-43 : zone_size (uint64)
+# Offset 44-47 : max_flush_ms (uint32)
+# Offset 48-51 : data_checksum_algo_id (uint32)     <-- maps to data_checksum_algo
+# Offset 52-55 : anchor_checksum_algo_id (uint32)   <-- Immutable; must be 1 (blake3-128)
+# Offset 56-59 : root_hash_algo_id (uint32)
+# Offset 60    : verify_data (uint8)
+# Offset 61    : flush_behavior (uint8, 0=strict, 1=relaxed)
+# Offset 62    : case_sensitive (uint8)
+# Offset 63    : permission_model (uint8, 0=unix, 1=windows, 2=both)
+# Offset 64-67 : max_filename_bytes (uint32)
+# Offset 68-71 : min_filename_bytes (uint32)
+# Offset 72-75 : directory_lookup_depth (uint32)
+# Offset 76-79 : max_entries_hot (uint32)
+# Offset 80-83 : max_entries_cold (uint32)
+# Offset 84-87 : min_fill_percent (uint32)
+# Offset 88    : compression_algo (uint8, 0=none, 1=zstd, 2=lz4)
+# Offset 89-92 : compression_level (uint32)
+# Offset 93-96 : min_compression_ratio (uint32, scaled * 1000)
+# Offset 97-100: max_extents_per_file (uint32)
+# Offset 101   : raw_mode_priority (uint8)
+# Offset 102   : cow_default_mode (uint8)
+# Offset 103-110: wal_region_size (uint64)
+# Offset 111   : wal_sync_on_every_write (uint8)
+# Offset 112-115: journal_slot_count (uint32)
+# Offset 116   : rotate_threshold_percent (uint8)
+# Offset 117   : write_cache_mode (uint8, 0=flush_then_clean, 1=writethrough)
+# Offset 118-121: idle_threshold_seconds (uint32)
+# Offset 122-125: panic_free_space_threshold_percent (uint32)
+# Offset 126-129: panic_fragmentation_threshold_percent (uint32)
+# Offset 130-133: panic_check_interval_seconds (uint32)
+# Offset 134-137: panic_aggressive_io_speed_mbps (uint32)
+# Offset 138   : journal_lock_behavior (uint8, 0=block, 1=warn)
+# Offset 139-146: compaction_target_density (uint64, scaled * 1000)
+# Offset 147-154: compaction_min_tail_free (uint64)
+# Offset 155-158: checkpoint_interval_blocks (uint32)
+# Offset 159   : verify_on_move (uint8)
+# Offset 160-163: sync_interval_seconds (uint32)
+# Offset 164-171: migration_staging_size (uint64)
+# Offset 172   : drive_flip_enabled (uint8)
+# Offset 173   : dedup_enabled (uint8)
+# Offset 174   : skip_dedup_for_raw (uint8)
+# Offset 175   : auto_rebuild_on_corruption (uint8)
+# Offset 176-179: max_overflow_chain_depth (uint32)
+# Offset 180-183: primary_bucket_count (uint32)
+# Offset 184-187: relocation_log_max_intents (uint32)
+# Offset 188   : abort_on_log_corruption (uint8)
+#
+# ---- CRASH-SAFE RUNTIME FIELDS (v3 - NOW PERSISTENT) ----
+#
+# Offset 189-192: sample_window_seconds (uint32)
+# Offset 193-196: max_io_speed_mbps (uint32)
+# Offset 197-200: scan_interval_seconds (uint32)
+#
+# ---- B+ TREE ROOT (v3 - CRASH-CRITICAL) ----
+#
+# Offset 201-208: btree_root_lba (uint64)           <-- Root LBA of the B+ Tree
+#
+# ---- RESERVED (v3) ----
+#
+# Offset 209-231: reserved (zero)                   <-- 23 bytes available for future
+#
+# ---- LOAD-AWARE & BAD-BLOCK FIELDS (v3) ----
+#
+# Offset 232-235: light_io_threshold_mbps (uint32)
+# Offset 236-239: heavy_io_threshold_mbps (uint32)
+# Offset 240-243: light_load_interval_multiplier (uint32, scaled * 1000)
+# Offset 244-247: heavy_load_interval_multiplier (uint32, scaled * 1000)
+# Offset 248-251: panic_cooldown_seconds (uint32)
+# Offset 252   : relocation_on_checksum_fail (uint8)
+# Offset 253   : force_readonly_on_unrecoverable (uint8)
+#
+# ---- PADDING AND CHECKSUM ----
+#
+# Offset 254-4079: zero padding
+# Offset 4080-4095: checksum (16 bytes)              <-- anchor checksum over bytes 0-4079
+# =================================================================
+
+# =================================================================
+# APPENDIX D: ATOMIC PROTOCOLS SUMMARY (v14 – v3.1)
+# =================================================================
+#
+# 1. Universal Superblock Commit (Routine Updates):
+#    - Write new LBA 0. fsync().
+#    - Write LBA 1 as a byte-for-byte copy of LBA 0. fsync().  <-- MANDATORY
+#    - Compute LBA 3 = LBA 0 XOR LBA 2. Write LBA 3. fsync().
+#
+# 2. Pointer Table Update (when any dynamic pointer changes):
+#    - Write new LBA 4 (Primary Pointer Table) with new generation. fsync().
+#    - Write new LBA 2 (Config Snapshot) with new generation. fsync().
+#    - Write new LBA 0 (Superblock) with new generation. fsync().
+#    - Write LBA 1 as a byte-for-byte copy of LBA 0. fsync().  <-- MANDATORY
+#    - Compute LBA 3 = LBA 0 XOR LBA 2. Write LBA 3. fsync().
+#    - Write new LBA 5 (Backup Pointer Table) - byte-for-byte copy of LBA 4. fsync().
+#    - Write new config_generation to WAL Primary and Backup headers. fsync().
+#
+#    Rationale: This order preserves the old backup pointer table (LBA 5)
+#    until the anchor blocks (LBA 0/1/2) are safely committed. If a crash
+#    occurs after LBA 4 is written but before LBA 0/1/2, the backup (LBA 5)
+#    still holds the old generation, matching LBA 0. Mount recovery will
+#    detect the mismatch and restore LBA 4 from LBA 5, keeping the system
+#    mountable. If the crash occurs after LBA 0/1/2 but before LBA 5, the
+#    primary (LBA 4) is already valid and matches the anchor; the backup
+#    is stale but harmless and will be overwritten on the next update.
+#
+# 3. Config Sync (myfs.sync-config, for LBA 2 changes):
+#    - Write new LBA 2. fsync().
+#    - Write new LBA 0. fsync().
+#    - Write LBA 1 as a byte-for-byte copy of LBA 0. fsync().  <-- MANDATORY
+#    - Compute LBA 3 = LBA 0 XOR LBA 2. Write LBA 3. fsync().
+#    - Write config_generation to WAL headers. fsync().
+#    - Atomic rename conf.tmp → config.fs.
+#
+# 4. Mount-Time Recovery (Symmetric Fallback) – CORRECTED ORDER:
+#    a. Read all anchor blocks (LBA0-5). Treat I/O errors as checksum failures.
+#
+#    b. Superblock Recovery (LBA0/LBA1):
+#       - Verify LBA0 using anchor_checksum_algo_id from LBA0 itself (offset 64-67).
+#       - If LBA0 valid: use it.
+#       - Else if LBA1 valid: copy to LBA0 and use it.
+#       - Else (both dead):
+#            - Read anchor_checksum_algo_id directly from LBA2 offset 52-55.
+#              (Since format_version == 3, this must be ID 1; driver may hardcode 1.)
+#            - If LBA2 valid and LBA3 valid (LBA2 XOR LBA3 == SUPB magic):
+#                 reconstruct LBA0 = LBA2 XOR LBA3; write LBA0 and LBA1; fsync.
+#            - Else: REFUSE MOUNT.
+#
+#    c. Config Snapshot Recovery (LBA2):
+#       - Use the verified anchor_checksum_algo_id from LBA0 (or from LBA2 itself
+#         if LBA0 was just reconstructed) to verify LBA2.
+#       - If LBA2 valid: use it.
+#       - Else if LBA0 and LBA3 valid and (LBA0 XOR LBA3) matches CFGS magic:
+#            reconstruct LBA2 = LBA0 XOR LBA3; write LBA2; fsync.
+#       - Else: REFUSE MOUNT.
+#
+#    d. Pointer Table Recovery (LBA4/LBA5):
+#       - Use the verified anchor_checksum_algo_id from LBA0 to verify LBA4 and LBA5.
+#       - Select the first valid table whose generation matches either LBA0.generation
+#         or LBA2.generation (they may differ at this point).
+#       - If no table valid: REFUSE MOUNT.
+#       - Extract WAL LBA from the selected pointer table (offset 8-15).
+#
+#    e. Generation Match & Parity Healing:
+#       - If LBA0.generation == LBA2.generation:
+#            - Recompute expected_parity = LBA0 XOR LBA2.
+#            - If on-disk LBA3 != expected_parity: overwrite LBA3 with expected_parity and fsync().
+#       - If mismatch:
+#            - Read WAL.gen (from WAL header using LBA obtained in step d).
+#            - If WAL.gen == LBA0.gen:
+#                 restore LBA2 = LBA0 XOR LBA3; verify LBA2 checksum; if valid, write LBA2; recompute LBA3.
+#            - Else if WAL.gen == LBA2.gen:
+#                 restore LBA0 = LBA2 XOR LBA3; verify LBA0 checksum; if valid, write LBA0, LBA1; recompute LBA3.
+#            - Else: REFUSE MOUNT.
+#
+#    f. Final Pointer Table Verification:
+#       - After generation unification, verify the selected pointer table's generation
+#         matches the unified generation. If not, try the other table.
+#       - If no table matches: REFUSE MOUNT.
+#
+#    g. Proceed to mount.
+#
+# 5. Relocation Log Intent Types (extension for bad blocks):
+#    - 0x01: DEFRAG – standard extent relocation.
+#    - 0x02: BAD_BLOCK_RELOC – relocation due to checksum failure or media error.
+#      This entry stores old LBA, new LBA, and owning inode/extent ID for potential replay.
+# =================================================================
+
+# =================================================================
+# APPENDIX E: ALGORITHM IDENTIFIER MAPPING
+# =================================================================
+# All IDs are stored as uint32 (little-endian) in the binary layouts.
+# =================================================================
+
+# data_checksum_algo_id (used in LBA0 & LBA2)
+#   0 = none
+#   1 = crc32c
+#   2 = xxhash64   <-- default
+#   3 = blake3
+
+# anchor_checksum_algo_id (used in LBA0 & LBA2 & LBA4/LBA5)
+#   1 = blake3-128 (16-byte output)   <-- ONLY VALID ID FOR VERSION 3
+#   (Other values reserved for future; changing this after mkfs is forbidden)
+
+# root_hash_algo_id (used in LBA0)
+#   0 = none
+#   1 = blake3     <-- default
+#   2 = sha256
+
+# compression_algo (used in LBA2, offset 88)
+#   0 = none
+#   1 = zstd       <-- default
+#   2 = lz4
+# =================================================================
+
+# =================================================================
+# APPENDIX F: INODE STRUCTURE (v14)
+# =================================================================
+# Inodes are stored in the B+ Tree (key = inode_number).
+# Each inode is 128 bytes.
+#
+# Offset 0-3   : magic = 0x494E4F44 ("INOD")
+# Offset 4-7   : inode_number (uint32)
+# Offset 8-11  : mode (uint16)          <-- RWX bits (owner/group/other)
+# Offset 12-15 : uid (uint32)
+# Offset 16-19 : gid (uint32)
+# Offset 20-27 : size (uint64)
+# Offset 28-35 : atime (uint64)
+# Offset 36-43 : mtime (uint64)
+# Offset 44-51 : ctime (uint64)
+# Offset 52-53 : flags (uint16)         <-- See flags table below
+# Offset 54-55 : nlink (uint16)
+# Offset 56-63 : blocks (uint64)        <-- Number of 512-byte blocks
+# Offset 64-71 : xattr_lba (uint64)     <-- Pointer to extended attributes (B+ Tree)
+# Offset 72-79 : rec_lba (uint64)       <-- Pointer to recovery block (if RECOVERY flag set)
+# Offset 80-87 : pad (8 bytes)          <-- Reserved for future
+# =================================================================
+
+# =================================================================
+# APPENDIX G: FLAGS TABLE (16 bits)
+# =================================================================
+# Bit | Flag                 | Value   | Description
+# 0   | OPT_READ             | 0x0001  | Optimize for reads (aggressive cache)
+# 1   | OPT_WRITE            | 0x0002  | Optimize for writes (aggressive flush)
+# 2   | OPT_SEQUENTIAL       | 0x0004  | Sequential access (use extent list)
+# 3   | OPT_RANDOM           | 0x0008  | Random access (bypass extent list)
+# 4   | OPT_JOURNAL          | 0x0010  | Use WAL for writes (journal mode)
+# 5   | OPT_HASH             | 0x0020  | Use hash table for directory lookups
+# 6   | OPT_EXTENT           | 0x0040  | Use extent list for writes
+# 7   | OPT_BTREE            | 0x0080  | Bypass accelerators, use B+ Tree directly
+# 8   | OPT_RAW              | 0x0100  | Bypass compression, dedup, COW
+# 9   | OPT_READ_ONLY        | 0x0200  | File cannot be modified
+# 10  | OPT_APPEND_ONLY      | 0x0400  | Only append operations allowed
+# 11  | OPT_DELETE_ONLY      | 0x0800  | File can only be deleted (no read/write)
+# 12  | OPT_NOATIME          | 0x1000  | Don't update access time
+# 13  | OPT_SYNC             | 0x2000  | Synchronous writes (no WAL buffering)
+# 14  | OPT_IMMUTABLE        | 0x4000  | Cannot be changed at all
+# 15  | OPT_NOFAIL           | 0x8000  | Don't panic on corruption (return partial data)
+# =================================================================
+
+# =================================================================
+# APPENDIX H: WAL ENTRY FORMAT
+# =================================================================
+# Each WAL entry is 48 bytes:
+#   Offset 0   : operation_type (uint8)
+#                 0x01 = INSERT
+#                 0x02 = DELETE
+#                 0x03 = UPDATE
+#                 0x04 = CHECKPOINT
+#   Offset 1-16 : key (16 bytes)        <-- myfs_key_t
+#   Offset 17-32: value (16 bytes)
+#   Offset 33-40: checksum (uint64)     <-- xxhash64 over op_type + key + value
+#   Offset 41-47: sequence_number (uint64)
+# =================================================================
+
+# =================================================================
+# APPENDIX I: B+ TREE NODE LAYOUT
+# =================================================================
+# Node size = block_size (from config)
+# Common Header (40 bytes):
+#   Offset 0-3   : magic = 0x42545245 ("BTRE")
+#   Offset 4-5   : flags (uint16) – bit 0: leaf (1), internal (0)
+#   Offset 6-7   : key_count (uint16)
+#   Offset 8-15  : parent_lba (uint64) – 0 = root
+#   Offset 16-23 : left_sibling (uint64) – 0 = none
+#   Offset 24-31 : right_sibling (uint64) – 0 = none
+#   Offset 32-39 : checksum (uint64) – xxhash64 over rest of node
+#
+# Internal Node (after header):
+#   keys (key_count * key_size) followed by child pointers ((key_count + 1) * 8)
+#
+# Leaf Node (after header):
+#   keys (key_count * key_size) followed by values (key_count * value_size)
+# =================================================================
+
+# =================================================================
+# APPENDIX J: WHAT IS IN LBA2 vs WHAT IS NOT
+# =================================================================
+# STORED IN LBA2 (Survives Crash)            | NOT STORED (Runtime Only)
+# --------------------------------------------+--------------------------------
+# block_size                                 | [mount_hints] (all)
+# zone_size                                  | [buffer] (all)
+# data_checksum_algo_id                      | [optimization] (all)
+# anchor_checksum_algo_id                    | hot_cache_*
+# root_hash_algo_id                          | btree_cache_size_mb
+# verify_data                                | wal_max_size_mb
+# flush_behavior                             | wal_checkpoint_interval_seconds
+# case_sensitive                             | auto_remount_on_irrecoverable
+# permission_model                           | dedup.* (except enabled)
+# max_filename_bytes                         | defrag.*
+# min_filename_bytes                         | hash_cache.*
+# directory_lookup_depth                     | cold_storage.*
+# max_entries_hot/cold                       | migration.*
+# min_fill_percent                           | fuse.*
+# compression_algo/level                     | 
+# min_compression_ratio                      |
+# max_extents_per_file                       |
+# raw_mode_priority                          |
+# cow_default_mode                           |
+# wal_region_size                            |
+# wal_sync_on_every_write                    |
+# journal_slot_count                         |
+# rotate_threshold_percent                   |
+# write_cache_mode                           |
+# idle_threshold_seconds                     |
+# panic_* (thresholds, intervals)            |
+# journal_lock_behavior                      |
+# compaction_*                               |
+# sync_interval_seconds                      |
+# migration_staging_size                     |
+# drive_flip_enabled                         |
+# dedup_enabled                              |
+# skip_dedup_for_raw                         |
+# auto_rebuild_on_corruption                 |
+# max_overflow_chain_depth                   |
+# primary_bucket_count                       |
+# relocation_log_max_intents                 |
+# abort_on_log_corruption                    |
+# sample_window_seconds    <-- NOW PERSISTENT |
+# max_io_speed_mbps        <-- NOW PERSISTENT |
+# scan_interval_seconds    <-- NOW PERSISTENT |
+# btree_root_lba           <-- NOW PERSISTENT |
+# light_io_threshold_mbps                    |
+# heavy_io_threshold_mbps                    |
+# light_load_interval_multiplier             |
+# heavy_load_interval_multiplier             |
+# panic_cooldown_seconds                     |
+# relocation_on_checksum_fail                |
+# force_readonly_on_unrecoverable            |
+# =================================================================
+
+# =================================================================
+# END OF FS.INFO
+# =================================================================
