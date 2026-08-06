@@ -1,6 +1,7 @@
-# FS
+# Configurable Adaptive FileSystem
 
 A FUSE‑based filesystem.
+Kernel Driver not recommended.
 
 ## Status
 
