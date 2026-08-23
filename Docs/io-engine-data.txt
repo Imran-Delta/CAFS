@@ -1,0 +1,532 @@
+---
+
+CAFS I/O ENGINE SPECIFICATION
+
+Version: 1.0
+Status: LOCKED — Ready for Implementation
+Scope: Block I/O, Checksums, SMART Counters, Platform Abstraction
+
+---
+
+1. Overview
+
+The I/O Engine is the absolute bottom layer of CAFS. It is the only component that directly accesses the block device. All higher layers (FUSE Worker, Cleaner, Scrubber, Allocator, Recovery) use only the exported API defined in this document.
+
+Core Responsibilities:
+
+· Open/close the block device.
+· Read/write blocks at specific LBAs.
+· Compute and verify checksums (CRC32C, XXHASH32).
+· Maintain host-level health counters (SMART Alt Table) batched to disk.
+· Handle O_DIRECT alignment via per-call scratch buffers.
+· Abstract platform differences (Linux, Windows).
+
+Non-Responsibilities (Delegated Upwards):
+
+· Filesystem semantics (inodes, extents, directories, B-trees).
+· Block allocation or relocation (Allocator's job).
+· Drive-level S.M.A.R.T. (firmware's job).
+· WAL replay or recovery logic (Recovery's job).
+· Final SMART table reconciliation (Smart Handler's job).
+· Zone Table, Dedup Table, Relocation Log, Buffer/Temp caches.
+
+Implementation Language: The engine is written in assembly for each supported platform. External dependencies (checksum algorithms, logging) are delegated to external C functions or implemented in assembly where feasible.
+
+---
+
+2. LBA Layout — Engine's View
+
+The Superblock is fixed at 4096 bytes (4 KB) for v1.
+
+Terminology: In this document, LBA (Logical Block Address) refers to a block index, not a byte offset. The byte offset on the device is LBA * block_size.
+
+LBA Purpose Discovery Method
+0 Superblock Fixed.
+(discovered) Pointer Table Read from Superblock offset 16.
+(discovered) SMART Table Read from Pointer Table entry 7.
+
+The engine discovers these LBAs at init time. The values in the table are for reference only (Superblock = 0; Pointer Table and SMART Table are dynamic).
+
+The engine does NOT know:
+
+· Zone Table location.
+· WAL location.
+· Relocation Log location.
+· Dedup Table location.
+· Buffer/Temp caches.
+
+Scratch Buffer: Provided by the caller on each I/O operation. Size = max(block_size, 4096) bytes, aligned for O_DIRECT. The engine uses this for all temporary operations (misaligned copies, SMART scratch writes, Superblock reads).
+
+---
+
+2.1 Superblock Layout (LBA 0, 4096 Bytes)
+
+Offset Size Field Endianness
+0 8 Magic (CAFSMAGIC) Little-endian
+8 4 Version Little-endian
+12 4 Block Size Little-endian
+16 8 Pointer Table LBA Little-endian
+24 4068 Reserved / Future use —
+4092 4 Checksum (over entire 4096 bytes) Little-endian
+
+Checksum Computation: The checksum field (last 4 bytes) is set to zero before computing the checksum over the entire Superblock.
+
+On-disk Endianness: All multi-byte fields are little-endian.
+
+---
+
+2.2 Pointer Table Layout (LBA Discovered from Superblock, 4096 Bytes)
+
+Entry width = 8 bytes. Total entries = 512.
+
+Entry Offset Field Endianness
+0 0 Zone Table LBA Little-endian
+1 8 WAL LBA Little-endian
+2 16 Relocation Log LBA Little-endian
+3 24 Dedup Table LBA Little-endian
+4 32 Compaction Checkpoint LBA Little-endian
+5 40 Fsck Scratch LBA Little-endian
+6 48 Backup Pointer Table LBA Little-endian
+7 56 SMART Table LBA Little-endian
+8-511 64-4095 Reserved —
+
+Checksum: The Pointer Table has its own checksum in the last 4 bytes (offset 4092), computed over the entire 4096-byte block (checksum field zeroed during computation).
+
+---
+
+2.3 SMART Table Layout (LBA Discovered from Pointer Table, 4096 Bytes)
+
+The SMART Table stores the main counters. The engine writes to a scratch area (provided by caller) and the Smart Handler reconciles to this table.
+
+Offset Field Size Endianness
+0 Magic (SMARTMAGIC) 8 bytes Little-endian
+8 Sequence Number 8 bytes Little-endian
+16 Total Reads 8 bytes Little-endian
+24 Total Writes 8 bytes Little-endian
+32 Total Read Errors 4 bytes Little-endian
+36 Total Write Errors 4 bytes Little-endian
+40 Total Checksum Mismatch 4 bytes Little-endian
+44 Total Host Relocations 8 bytes Little-endian
+52 Last Access LBA 8 bytes Little-endian
+60 Last Access Timestamp 8 bytes Little-endian
+68 Mount Count 4 bytes Little-endian
+72 Clean Unmount Flag 1 byte Little-endian
+73-4091 Reserved — —
+4092 Checksum 4 bytes Little-endian
+
+Write Granularity: The SMART table resides at smart_table_lba. The engine writes a full block_size block. The area beyond the 4096-byte table is zero-filled. The checksum is computed over the entire block_size block (checksum field zeroed during computation).
+
+---
+
+3. Exported API — Function Signatures
+
+All functions are callable from C. The assembly implementation follows the platform's C ABI.
+
+3.1 Context
+
+```c
+struct cafs_io_ctx;
+typedef struct cafs_io_ctx cafs_io_ctx_t;
+```
+
+3.2 Configuration Struct
+
+```c
+typedef struct {
+    uint64_t block_size;        // Expected block size (validated on-disk)
+    int direct_io;              // 0 = buffered, 1 = O_DIRECT
+    int direct_io_required;     // 0 = fallback, 1 = fail if unsupported
+    int destroy_flush;          // 0 = no flush on destroy, 1 = flush + warning
+    int misaligned_action;      // 0 = copy internally, 1 = return -EINVAL
+    int checksum_algo;          // 0 = CRC32C, 1 = XXHASH32
+    int sync_open;              // 0 = O_SYNC off (flush flag controls), 1 = O_SYNC on
+} cafs_io_config_t;
+```
+
+Note: The config struct is populated by the upper layer, which parses config.fs. The engine does not read config.fs directly.
+
+---
+
+3.3 Context Management
+
+```c
+cafs_io_ctx_t* cafs_io_init(const char *device_path, const cafs_io_config_t *config);
+void cafs_io_destroy(cafs_io_ctx_t *ctx);
+void cafs_io_destroy_flush(cafs_io_ctx_t *ctx);
+```
+
+---
+
+3.4 Core I/O (with per-call scratch)
+
+```c
+int cafs_io_read_block(cafs_io_ctx_t *ctx, uint64_t lba, void *buf, void *scratch, int verify, int algo);
+int cafs_io_write_block(cafs_io_ctx_t *ctx, uint64_t lba, const void *buf, void *scratch, int compute, int algo, int flush);
+```
+
+Scratch Buffer Requirements:
+
+· Size: at least max(block_size, 4096) bytes.
+· Alignment: aligned to block_size for O_DIRECT.
+· Lifetime: only required for the duration of the call.
+· Thread-safety: Each call must use a unique scratch buffer (or the caller must serialise access).
+
+---
+
+3.5 Verification & Recovery
+
+```c
+int cafs_io_verify_checksum(cafs_io_ctx_t *ctx, uint64_t lba, int algo);
+int cafs_io_read_metadata(cafs_io_ctx_t *ctx, uint64_t lba, void *buf);
+```
+
+cafs_io_read_metadata: Reads a block from the device without checksum verification. This is intended for reading metadata blocks (Superblock, Pointer Table, SMART Table) during recovery or when the checksum itself is corrupt. The data is returned in buf; the last 4 bytes are not verified. Returns 0 on success, negative errno on failure.
+
+---
+
+3.6 Utility
+
+```c
+uint64_t cafs_io_total_blocks(cafs_io_ctx_t *ctx);
+uint64_t cafs_io_block_size(cafs_io_ctx_t *ctx);
+int cafs_io_flush(cafs_io_ctx_t *ctx);
+uint32_t cafs_io_compute_checksum(const void *data, size_t len, int algo);
+```
+
+---
+
+3.7 Convenience
+
+```c
+int cafs_io_zero_block(cafs_io_ctx_t *ctx, uint64_t lba, void *scratch);
+void cafs_io_increment_relocation(cafs_io_ctx_t *ctx);
+```
+
+---
+
+4. Configuration (config.fs — Upper Layer Parses)
+
+The upper layer parses config.fs and populates the cafs_io_config_t struct. The following sections are relevant:
+
+```ini
+[io]
+# I/O Engine persistent settings
+destroy_flush = 0
+misaligned_action = copy
+checksum_algo = 0   # 0 = CRC32C, 1 = XXHASH32
+
+[physical]
+block_size = 4096
+
+[mount_hints]
+direct_io = 1
+direct_io_required = 0
+sync_open = 0       # 0 = O_SYNC off, 1 = O_SYNC on
+```
+
+Note: The engine does not parse config.fs directly. It receives all configuration via the struct.
+
+---
+
+5. Init Sequence (Final)
+
+```
+cafs_io_init(device_path, config):
+    1. open(device_path, O_RDWR | O_SYNC | (config.direct_io ? O_DIRECT : 0))
+       - If config.sync_open == 0, omit O_SYNC (flush flag controls durability)
+    2. If open fails with -EINVAL and config.direct_io_required == 0:
+         retry without O_DIRECT
+    3. Get device size:
+       - Linux: ioctl(fd, BLKGETSIZE64, &bytes)
+       - Windows: DeviceIoControl(handle, IOCTL_DISK_GET_LENGTH_INFO, ...)
+    4. total_blocks = bytes / config.block_size
+    5. Allocate internal scratch buffer (size = max(config.block_size, 4096))
+    6. pread(LBA 0 * block_size, scratch, 4096)  // Superblock is always 4096 bytes
+    7. Verify Superblock checksum (last 4 bytes) — checksum field zeroed during computation
+    8. Extract block_size from Superblock (offset 12)
+    9. Validate config.block_size == on_disk_block_size
+       - If mismatch: return NULL (-EINVAL)
+    10. Extract pointer_table_lba from Superblock (offset 16)
+    11. pread(pointer_table_lba * block_size, scratch, 4096)  // Pointer Table is always 4096 bytes
+    12. Verify Pointer Table checksum (last 4 bytes) — checksum field zeroed during computation
+    13. Extract smart_table_lba = Pointer Table entry 7 (offset 56)
+    14. Store smart_table_lba in engine context
+    15. pread(smart_table_lba * block_size, scratch, block_size)  // Read SMART table
+    16. Verify SMART table checksum (last 4 bytes) — checksum field zeroed during computation
+    17. Seed in-memory counters from SMART table
+    18. Increment in-memory mount_count
+    19. Copy SMART table to scratch, increment sequence, write back to disk:
+        pwrite(smart_table_lba * block_size, scratch, block_size)
+    20. Return ctx
+```
+
+Note: If config is passed (non-null), the engine validates config.block_size against on-disk. If config is null, the engine uses the on-disk block_size and config values are loaded from the on-disk Config Snapshot (LBA 2). If config is passed and the on-disk Config Snapshot exists, the engine validates the passed config against the on-disk config and returns a mismatch if they differ.
+
+---
+
+6. Checksum Algorithms
+
+All algorithms output exactly 4 bytes.
+
+ID Name Output Hardware Acceleration Default
+0 CRC32C 32-bit SSE4.2 (x86), CRC32 (ARMv8) Yes
+1 XXHASH32 32-bit None (pure software) No
+
+Checksum Computation Rule: When computing a checksum, the 4‑byte checksum field is set to zero before calculation. For blocks, this means the last 4 bytes are treated as zero for the duration of the checksum computation.
+
+Checksum Storage: The checksum is stored in the last 4 bytes of each block.
+
+Payload Size: The payload is the first block_size - 4 bytes. The engine does not strip the checksum on read; the caller receives the full block_size bytes and must ignore the last 4 bytes if only the payload is needed.
+
+cafs_io_block_size(): Returns the full block size (e.g., 4096). The payload capacity is block_size - 4 bytes.
+
+---
+
+7. SMART Alt Table (Health Counters)
+
+7.1 In-Memory Counters
+
+Counter Type Update Trigger Batch Rule
+total_reads uint64_t Every successful read 1024 ops
+total_writes uint64_t Every successful write 1024 ops
+total_read_errors uint32_t Every read failure 2 events / 16s
+total_write_errors uint32_t Every write failure 2 events / 16s
+total_checksum_mismatch uint32_t Every verification failure 2 events / 16s
+total_host_relocations uint64_t External call (Allocator) Same as writes
+last_access_lba uint64_t Every I/O Same as writes
+last_access_timestamp uint64_t Every I/O Rounded to 30m, same as writes
+mount_count uint32_t Init Written immediately
+clean_unmount_flag uint8_t Destroy Written immediately
+
+7.2 Batch Rules (Hardcoded for v1)
+
+Event Type Batch Limit Timeout
+Reads / Writes 1024 ops None
+Errors 2 events 16 seconds
+Timestamp 30-minute rounding N/A
+
+Timestamp Rounding: last_access_timestamp is rounded down to the nearest 30-minute interval:
+
+```
+(current_unix_timestamp / 1800) * 1800
+```
+
+where 1800 = 30 minutes in seconds. The rounding is applied before the value enters the accumulator.
+
+7.3 Lock-Free Batch Flushing
+
+Multiple threads may hit the batch limit simultaneously. The engine uses a compare-and-swap (CAS) loop to ensure only one thread flushes:
+
+1. Each counter has an in-memory accumulator (atomic).
+2. On each I/O, the relevant counter is incremented atomically.
+3. When the accumulator crosses the batch limit:
+   · A thread attempts to CAS a "flush in progress" flag from 0 to 1.
+   · If successful, it flushes (copies counters to scratch, writes to disk, resets accumulators).
+   · If unsuccessful, it continues (another thread is flushing).
+4. Timed error flushes use the same CAS mechanism.
+
+7.4 Scratch Buffer (Per-Call)
+
+· Provided by: The caller on each read_block/write_block call.
+· Size: At least max(block_size, 4096) bytes.
+· Alignment: Must be aligned to block_size for O_DIRECT.
+· Thread-safety: Each call must use a unique scratch buffer, or the caller must serialise access.
+
+SMART Scratch Layout (Within Scratch Buffer):
+
+Offset Field Size Endianness
+0 sequence 8 bytes Little-endian
+8 total_reads 8 bytes Little-endian
+16 total_writes 8 bytes Little-endian
+24 total_read_errors 4 bytes Little-endian
+28 total_write_errors 4 bytes Little-endian
+32 total_checksum_mismatch 4 bytes Little-endian
+36 total_host_relocations 8 bytes Little-endian
+44 last_access_lba 8 bytes Little-endian
+52 last_access_timestamp 8 bytes Little-endian
+60 mount_count 4 bytes Little-endian
+64 clean_unmount_flag 1 byte Little-endian
+65 reserved Padding to block_size —
+
+---
+
+8. Alignment & Scratch Buffers
+
+8.1 Direct I/O Requirements
+
+When direct_io=1:
+
+· Buffer address must be aligned to block_size.
+· File offset (lba * block_size) must be aligned to block_size (automatically true).
+· Length (block_size) must be aligned to block_size (automatically true).
+
+Windows: The alignment requirement is the physical sector size (queried via IOCTL_DISK_GET_DRIVE_GEOMETRY_EX). The engine uses block_size if it is a multiple of the sector size; otherwise, it uses the physical sector size (which is a divisor of block_size).
+
+8.2 Misaligned Buffer Handling
+
+· Default (misaligned_action = copy): Engine copies to the provided scratch buffer, performs I/O, copies back (for reads).
+· Optional (misaligned_action = reject): Engine returns -EINVAL.
+
+The scratch buffer is provided per call. The engine does not allocate or manage scratch buffers.
+
+---
+
+9. Platform Support (v1)
+
+OS Architectures Status
+Linux x86_64, x86 ✅ Full support
+Windows x86_64, x86 ✅ Full support
+Linux aarch64, ARM ❌ Not in v1
+Windows aarch64, ARM ❌ Not in v1
+macOS Any ❌ Not in v1
+
+9.1 Linux Syscalls
+
+Operation Syscall Notes
+Open sys_openat (AT_FDCWD) Use openat not legacy open
+Read sys_pread64 Offset-based, thread-safe
+Write sys_pwrite64 Offset-based, thread-safe
+Flush sys_fdatasync (fallback sys_fsync) —
+Close sys_close —
+Device Size ioctl(fd, BLKGETSIZE64, &bytes) For block devices
+
+Retry Logic: The engine retries on EINTR (interrupted syscall) up to 3 times. For short reads/writes, the engine retries only if the underlying file descriptor is a regular file (not a block device). On block devices, a short read/write is treated as an error (returns -EIO).
+
+9.2 Windows API
+
+Operation Win32 API Notes
+Open CreateFile GENERIC_READ\|GENERIC_WRITE, FILE_FLAG_NO_BUFFERING\|FILE_FLAG_WRITE_THROUGH
+Read ReadFile Use OVERLAPPED for offset
+Write WriteFile Use OVERLAPPED for offset
+Flush FlushFileBuffers —
+Close CloseHandle —
+Device Size DeviceIoControl(IOCTL_DISK_GET_LENGTH_INFO) For raw disks
+
+Retry Logic: Same as Linux.
+
+9.3 Assembly Implementation
+
+The engine is written in assembly for each supported platform. The core syscall wrappers are in assembly; checksum algorithms and logging are external C functions (or assembly where optimized).
+
+Calling Convention: Each assembly function follows the platform's C ABI:
+
+· Linux x86_64: System V AMD64 ABI
+· Linux x86: cdecl
+· Windows x86_64: Microsoft x64 ABI
+· Windows x86: cdecl (or stdcall)
+
+External Dependencies:
+
+· Checksum algorithms (CRC32C, XXHASH32) → C functions or assembly
+· Logging → write(STDERR_FILENO) syscall (Linux) or WriteFile with STD_ERROR_HANDLE (Windows)
+· No libc dependencies for core I/O
+
+---
+
+10. Thread Safety
+
+· The engine is thread-safe with the following conditions:
+· pread/pwrite provide kernel-level serialisation for concurrent I/O to different LBAs.
+· SMART counter updates use atomic operations (__sync_add_and_fetch / InterlockedIncrement).
+· Batch flushing uses a CAS-based lock-free serialisation (only one thread flushes at a time).
+· Each call must provide a unique scratch buffer (or the caller must serialise access to the scratch buffer). The engine does not share scratch buffers between calls.
+· No internal locks are used.
+
+---
+
+11. Error Codes
+
+Return Meaning
+0 Success
+-EINVAL Invalid argument (NULL, bad LBA, invalid algo, block_size mismatch)
+-EIO I/O error, or checksum mismatch (for read_block and verify_checksum)
+-ENOSPC Device full (write)
+-EACCES Permission denied
+-ENODEV Device not found (init)
+-EFAULT Bad address (rare)
+-EINTR Syscall interrupted (retried internally)
+
+Special: cafs_io_verify_checksum returns:
+
+· 1 = checksum matches
+· 0 = checksum mismatch
+· Negative errno = I/O error
+
+---
+
+12. External Dependencies
+
+Component Dependency
+Superblock (LBA 0) Provides block_size and pointer_table_lba.
+Pointer Table (LBA discovered) Provides smart_table_lba (entry 7).
+Scratch Buffer Provided by caller on each I/O call.
+config.fs Parsed by upper layer; struct passed to engine.
+Smart Handler Reads SMART scratch area, reconciles with main table.
+Logging write syscall (Linux) or WriteFile with STD_ERROR_HANDLE (Windows).
+
+---
+
+13. License
+
+This specification and the resulting implementation are licensed under the BSD 3-Clause License.
+
+---
+
+14. Version History
+
+Version Date Changes
+1.0 2026-08-08 Final locked specification.
+
+---
+
+End of Specification
+
+This document is the complete, locked specification for the CAFS I/O Engine. Implementation may proceed.
+
+---
+
+Appendix A: Quick Reference Card
+
+```
+FUNCTIONS:
+init(device_path, config) → ctx
+destroy(ctx)
+destroy_flush(ctx)
+read_block(ctx, lba, buf, scratch, verify, algo) → 0/-errno
+write_block(ctx, lba, buf, scratch, compute, algo, flush) → 0/-errno
+verify_checksum(ctx, lba, algo) → 1/0/-errno
+read_metadata(ctx, lba, buf) → 0/-errno
+total_blocks(ctx) → uint64_t
+block_size(ctx) → uint64_t
+flush(ctx) → 0/-errno
+compute_checksum(data, len, algo) → uint32_t
+zero_block(ctx, lba, scratch) → 0/-errno
+inc_relocation(ctx) → void
+
+FLAGS:
+verify       : 0=off, 1=on
+compute      : 0=caller provided, 1=engine computes
+algo         : 0=CRC32C, 1=XXHASH32
+flush        : 0=no, 1=yes
+sync_open    : 0=O_SYNC off, 1=O_SYNC on
+
+LBA DISCOVERY:
+LBA 0 → Superblock → block_size (offset 12), pointer_table_lba (offset 16)
+[discovered] → Pointer Table → smart_table_lba (entry 7, offset 56)
+[discovered] → SMART Table
+
+SCRATCH BUFFER:
+Provided per call. Size = max(block_size, 4096). Aligned for O_DIRECT.
+Must be unique per call (or caller serialises).
+
+SMART BATCH:
+1024 ops     → Reads/Writes
+2 events     → Errors (with 16s timeout)
+30 minutes   → Timestamp rounding
+```
+
+---
+
+End of Appendix A
+
+---
