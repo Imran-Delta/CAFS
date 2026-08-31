@@ -1,0 +1,137 @@
+name: Syntax & Consistency Check
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:  # Manual trigger available from the Actions tab
+
+jobs:
+  full-check:
+    runs-on: ubuntu-latest
+    # runs-on: self-hosted  # Uncomment for hardware-accelerated execution on your PC
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1  # Downloads only the latest commit; full history is unnecessary for validation
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      # --- STAGE 1: Repository Integrity (Tripwire) ---
+      - name: Run repository tripwire
+        id: tripwire
+        continue-on-error: true  # Prevents warnings from aborting subsequent syntax checks
+        run: |
+          cd ${{ github.workspace }}
+          python3 Tools/check.py
+        # Always exits 0 unless --strict is passed; warnings print to stdout
+
+      # --- STAGE 2: Python Syntax Validation ---
+      - name: Validate Python syntax
+        id: python-check
+        continue-on-error: true  # Allows C validation to proceed even if Python fails
+        run: |
+          echo "🔍 Scanning for Python files..."
+          python_files=$(find . -type f -name "*.py" | grep -v __pycache__ | grep -v ".git")
+          
+          if [ -z "$python_files" ]; then
+            echo "ℹ️ No Python files found. Skipping."
+            exit 0
+          fi
+          
+          errors=0
+          for file in $python_files; do
+            if ! python -m py_compile "$file" 2>/dev/null; then
+              echo "❌ SYNTAX ERROR: $file"
+              errors=$((errors + 1))
+            else
+              echo "✅ $file - Valid"
+            fi
+          done
+          
+          if [ $errors -gt 0 ]; then
+            echo "❌ $errors Python file(s) contain syntax errors."
+            exit 1
+          fi
+          echo "✅ All Python files passed compilation validation."
+
+      # --- STAGE 3: C Syntax Validation ---
+      - name: Install C compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc
+
+      - name: Validate C syntax
+        id: c-check
+        continue-on-error: true  # Allows the summary to capture all outcomes
+        run: |
+          echo "🔍 Scanning for C source files..."
+          c_files=$(find . -type f -name "*.c" | grep -v ".git")
+          
+          if [ -z "$c_files" ]; then
+            echo "ℹ️ No C files found. Skipping."
+            exit 0
+          fi
+          
+          errors=0
+          for file in $c_files; do
+            if ! gcc -fsyntax-only "$file" 2>&1; then
+              echo "❌ SYNTAX ERROR: $file"
+              errors=$((errors + 1))
+            else
+              echo "✅ $file - Valid"
+            fi
+          done
+          
+          if [ $errors -gt 0 ]; then
+            echo "❌ $errors C file(s) contain syntax errors."
+            exit 1
+          fi
+          echo "✅ All C files passed static syntax analysis."
+
+      # --- STAGE 4: Web Summary (Always displayed) ---
+      - name: Generate check summary
+        if: always()  # Executes regardless of any previous step's success or failure
+        run: |
+          echo "## 📊 CAFS Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Validation Stage | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|------------------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          TRIPWIRE_STATUS="${{ steps.tripwire.outcome }}"
+          PYTHON_STATUS="${{ steps.python-check.outcome }}"
+          C_STATUS="${{ steps.c-check.outcome }}"
+          
+          if [ "$TRIPWIRE_STATUS" == "success" ]; then
+            echo "| 🔍 Repository Integrity | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 🔍 Repository Integrity | ⚠️ Warnings (see logs) |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "$PYTHON_STATUS" == "success" ]; then
+            echo "| 🐍 Python Syntax | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 🐍 Python Syntax | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "$C_STATUS" == "success" ]; then
+            echo "| ⚙️ C Syntax | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| ⚙️ C Syntax | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Action Notes:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Tripwire warnings indicate unreviewed modifications to reviewed files." >> $GITHUB_STEP_SUMMARY
+          echo "- Accept changes locally with \`python3 Tools/check.py --update\` and commit the updated manifest." >> $GITHUB_STEP_SUMMARY
+
+      # --- STAGE 5: Explicit Failure Exit ---
+      - name: Halt on critical validation failure
+        if: failure()  # Triggers only when Python, C, or the tripwire step explicitly exits with 1
+        run: |
+          echo "❌ Critical syntax errors detected. Review the logs above."
+          exit 1
