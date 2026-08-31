@@ -1,7 +1,7 @@
 # CAFS Filesystem Information
-**Document version:** v17
+**Document version:** v19
 **On-disk format version:** 4
-**Status:** Draft for validation
+**Status:** Locked
 
 ---
 
@@ -58,10 +58,18 @@ LBA5 is a copy of the LBA4 pointer block, so both point to the same Function Tab
 
 Same structure, with enlarged reserved areas:
 
-- Primary pointer fields: offsets 0–27.
-- Primary reserved: offsets 28–2047.
-- Fallback pointer fields: offsets 2048–3075.
-- Fallback reserved: offsets 3076–4095.
+| Offset | Size | Field |
+|---|---|---|
+| 0–7 | 8 | magic = `0xCAFSPTR` |
+| 8–15 | 8 | real_lba |
+| 16–23 | 8 | real_size |
+| 24–27 | 4 | checksum over bytes 0–23 |
+| 28–2047 | 2020 | reserved, zero |
+| 2048–2055 | 8 | fallback_magic = `0xCAFSPTR` |
+| 2056–2063 | 8 | fallback_real_lba |
+| 2064–2071 | 8 | fallback_real_size |
+| 2072–2075 | 4 | fallback_checksum over bytes 2048–2071 |
+| 2076–4095 | 2020 | reserved, zero |
 
 ### 3.3 Pointer Block Checksum
 
@@ -71,7 +79,7 @@ Same structure, with enlarged reserved areas:
 | 2 | XXHASH32 |
 
 - Primary checksum: computed over bytes 0–23.
-- Fallback checksum: computed over bytes 1024–1047 for 2048-byte blocks, or equivalent fallback field region for 4096-byte blocks.
+- Fallback checksum: computed over bytes 1024–1047 for 2048-byte blocks (Section 3.1), or bytes 2048–2071 for 4096-byte blocks (Section 3.2).
 
 ---
 
@@ -94,8 +102,11 @@ Pointed by LBA0 primary pointer.
 | 64–67 | 4 | anchor_checksum_algo_id = 1 |
 | 68–71 | 4 | pointer_checksum_algo_id |
 | 72–79 | 8 | last_applied_wal_seq |
-| 80–4079 | 4000 | reserved, zero |
+| 80–83 | 4 | root_hash_algo_id |
+| 84–4079 | 3996 | reserved, zero |
 | 4080–4095 | 16 | checksum, BLAKE3-128 over bytes 0–4079 |
+
+`root_hash_algo_id` was dropped in the v15→v17 transition when `pointer_checksum_algo_id` was added at its old offset (68–71) without a replacement slot. Restored here at 80–83, matching how its two siblings (`data_checksum_algo_id`, `anchor_checksum_algo_id`) both keep dedicated Superblock fields.
 
 ---
 
@@ -115,10 +126,13 @@ Layout:
 Rules:
 
 - `[mount_hints]` is removed before snapshot generation.
+- Within any section that mixes crash-critical and runtime fields (identified by inline `# CRASH-CRITICAL` / `# RUNTIME ONLY` comments, e.g. `[recovery]`, `[dedup]`), only the fields marked `# CRASH-CRITICAL` are kept; runtime fields in that section are stripped along with `[mount_hints]`.
+- Comments and blank lines are stripped; only section headers and `key = value` pairs are kept.
 - `config_self_checksum` is set to `""`.
-- The TOML text is hashed.
-- The hash is placed into `config_self_checksum` inside the TOML text.
+- The stripped TOML text is hashed with **xxhash64**.
+- The hash is placed into `config_self_checksum` inside the TOML text, hex-encoded, matching config.fs's own field format.
 - The block-level BLAKE3-128 checksum is then computed over the final 4KB block.
+- The stripped TOML text (`N` bytes above) MUST fit within 4080 bytes. `cafs.sync-config` rejects a config that doesn't, before it reaches mkfs or remount.
 
 Config fields:
 
@@ -158,6 +172,8 @@ Pointed by LBA3.
 | 56–63 | 8 | fsck_scratch_lba |
 | 64–127 | 64 | reserved, zero |
 | 128–143 | 16 | checksum, BLAKE3-128 over bytes 0–127 |
+
+There are three fields named `generation` / `config_generation` in this format: Superblock `config_generation` (Section 4), `config.fs`'s own `[identity].config_generation` (embedded verbatim in the Config Snapshot's TOML text, Section 5), and this table's `generation`. All three MUST hold the same value at all times outside of an in-flight Full Anchor Commit (Section 13.2). Section 13.2 step 7 ("verify generation matches") checks all three against each other, not just two.
 
 ---
 
@@ -245,6 +261,20 @@ The anchor diff block is a separate 4KB block containing:
 | 8... | variable | diffs[] |
 | end-4 | 4 | CRC32C over preceding payload |
 
+`anchor_id` values (v16 defined 0–6 for these; the original mapping wasn't carried into v17 and isn't recovered from a source document — this is a reconstruction, not a verified original, and should be swapped for the real v16 table if that turns up):
+
+| ID | Structure |
+|---|---|
+| 0 | Superblock |
+| 1 | Config Snapshot |
+| 2 | Parity Block |
+| 3 | Meta/User Pointer Table |
+| 4 | Function Table |
+| 5 | SMART Main |
+| 6 | SMART Backup |
+
+`diffs[]` MUST fit within 4084 bytes (4096 minus the 8-byte header minus the 4-byte trailing CRC32C). A diff set that doesn't fit is not chained across multiple anchor diff blocks — there is no chaining field for this block type (unlike WAL blocks, which chain via `prev_lba`/`next_lba`). It falls back to a full anchor rewrite via Section 13.1 instead.
+
 Each diff:
 
 | Offset | Size | Field |
@@ -268,7 +298,11 @@ Each diff:
 
 2. If tail block is full:
    - Allocate new zeroed block.
-   - Log allocation as a normal WAL INSERT entry before use.
+   - The new block's own first entry (entry_count=1, below) IS the
+     allocation-log INSERT — every new WAL block's first entry
+     records its own allocation. This is what Section 10.2 step 3
+     scans for. (The old tail can't receive it: this branch's
+     precondition is that the old tail has no free slot.)
    - Write new block with:
      - `block_seq = tail.block_seq + 1`
      - `prev_lba = tail_lba`
@@ -283,6 +317,9 @@ Each diff:
    - Write old tail.
    - `fsync()`.
    - Update volatile tail pointer.
+   - The operation that triggered this rollover is then appended
+     via step 1 against the new tail, which now has entry_count=1
+     and free slots remaining.
 
 No Function Table update occurs during ordinary appends.
 
@@ -303,6 +340,20 @@ No Function Table update occurs during ordinary appends.
    - Apply diff.
 6. Set volatile tail to last valid block.
 7. Update Superblock `last_applied_wal_seq`.
+
+### 10.2b WAL Region Sizing Guidance
+
+`[wal].region_size` (config.fs) should hold at least a few minutes of
+write traffic at the expected sustained write rate, so Head
+Advancement (10.3) doesn't run on every append under heavy load:
+
+    region_size >= sustained_write_MBps * 60 * target_minutes_between_advancement
+
+`[wal].sync_interval_seconds` and `[wal].sync_on_every_write` trade
+latency for durability window. `sync_on_every_write = true` ignores
+`sync_interval_seconds` and fsyncs every append (10.1 step 1).
+`false` batches up to `sync_interval_seconds` of unsynced appends —
+that interval is also the crash-loss window.
 
 ### 10.3 Head Advancement
 
@@ -359,12 +410,19 @@ Exceptions:
 | Anchor block | Change |
 |---|---|
 | LBA0 pointer block | Fallback pointer points to Superblock Backup |
+| LBA1 pointer block | Fallback pointer points to Config Snapshot Backup |
 | LBA2 pointer block | Primary pointer points to Backup Parity Block |
-| Other pointer fields | Identical to primary anchor region |
+| LBA3 pointer block | Fallback pointer points to Meta/User Pointer Table Backup |
+| LBA4 pointer block | Fallback pointer points to Function Table Backup |
+| LBA5 pointer block | Byte-for-byte copy of this region's own (already-updated) LBA4 pointer block — same rule as the primary region, so it inherits the LBA4 exception above automatically |
+
+Every "X Backup" above is a genuine second, independently-written copy of that real structure's content — not the same LBA the primary fallback or primary pointer already reaches. Only the WAL and SMART tables have no backup copy under this mechanism (WAL corruption requires fsck per Section 14; SMART already has its own M-SMART/B-SMART split per Section 11.2).
 
 Backup parity is:
 
     XOR(backup Superblock, backup Config Snapshot)
+
+This covers Superblock and Config Snapshot only — the Parity Block mechanism doesn't extend to Meta/User Table or Function Table. Their sole redundancy is the distinct backup copy above; if both the primary and that backup are corrupt, only full fsck recovers them (Section 14, Track C).
 
 The B-SMART pointer is stored inside the Function Table, not directly in the anchor region.
 
@@ -390,19 +448,57 @@ The B-SMART pointer is stored inside the Function Table, not directly in the anc
 6. Write primary anchor region LBA0–5. `fsync()`.
 7. Verify generation matches.
 
+### 13.3 In-Place Content Update
+
+For a content change that does not relocate the structure (e.g. Head
+Advancement rewriting the Function Table's `wal_lba`, or any Meta/User
+Table pointer field changing): 13.1's pointer-block steps don't apply —
+the structure's LBA is unchanged, so nothing points anywhere new.
+
+1. Rewrite the structure in place at its existing LBA. Recompute its
+   checksum. `fsync()`.
+2. Write the same content to its distinct backup copy (Section 12),
+   at the backup's existing LBA. Recompute its checksum. `fsync()`.
+3. No pointer block, parity block, or end-of-device backup write is
+   needed — none of them changed.
+
+If the structure is the Superblock or Config Snapshot (Parity-covered,
+Section 6), the Parity Block must also be recomputed and rewritten as
+step 2.5, since it's a function of both their contents.
+
 ---
 
 ## 14. Recovery Order
 
-If anchor corruption is detected:
+Anchor corruption recovery depends on which of two things failed: a
+pointer block (LBA0–5, Section 3), or a real structure the pointers
+point to (Sections 4–8). These are different failure domains with
+different recovery paths — a corrupt pointer block doesn't mean the
+real structure it points to is also corrupt, and vice versa.
 
-1. Primary pointer block
-2. Fallback pointer fields
-3. End-of-device backup
-4. XOR parity reconstruction
-5. Full fsck
+**Track A — a pointer block (LBA0–5) fails its own checksum:**
 
-WAL corruption is not covered by anchor backup. It requires fsck.
+1. Try that block's fallback pointer fields (Section 3.1/3.2) — same
+   block, offset 1024 or 2048.
+2. Try the end-of-device backup copy of that pointer block (Section 12).
+3. Full fsck (rebuild the pointer from an anchor-region scan) if both fail.
+
+**Track B — Superblock or Config Snapshot fails its own checksum**
+(the pointer block pointing to it is fine):
+
+1. Try its distinct backup copy (Section 12).
+2. XOR-reconstruct it from the Parity Block against its surviving
+   sibling (Section 6) — Superblock and Config Snapshot are the only
+   two structures the Parity Block covers.
+3. Full fsck if both fail.
+
+**Track C — Meta/User Pointer Table or Function Table fails its own
+checksum** (the pointer block pointing to it is fine):
+
+1. Try its distinct backup copy (Section 12).
+2. Full fsck if that fails — no Parity Block covers these two.
+
+WAL corruption is not covered by any of the above. It requires fsck.
 
 ---
 
@@ -417,17 +513,42 @@ WAL corruption is not covered by anchor backup. It requires fsck.
 
 ## 16. Algorithm Identifiers
 
-| ID | Data | Anchor | Root Hash | Compression |
-|----|------|--------|-----------|-------------|
-| 0 | none | — | none | none |
-| 1 | crc32c | blake3-128 | blake3 | zstd |
-| 2 | xxhash64 | — | sha256 | lz4 |
-| 3 | blake3 | — | — | — |
+Each of the four fields below has its own independent ID space. The
+same number means a different algorithm depending on which field it's
+read from — `data_checksum_algo_id = 2` and `root_hash_algo_id = 2`
+are unrelated (xxhash64 vs. sha256). Don't cross-reference IDs across
+tables.
 
-- `anchor_checksum_algo_id`: must be `1` for format version 4.
-- `pointer_checksum_algo_id`: `1` = CRC32C, `2` = XXHASH32.
-- Real structures use BLAKE3-128.
-- Pointer blocks use CRC32C or XXHASH32.
+**data_checksum_algo_id:**
+
+| ID | Algorithm |
+|----|-----------|
+| 0 | none |
+| 1 | crc32c |
+| 2 | xxhash64 |
+| 3 | blake3 |
+
+**anchor_checksum_algo_id:** must be `1` (blake3-128) for format version 4 — no other value is valid.
+
+**root_hash_algo_id:**
+
+| ID | Algorithm |
+|----|-----------|
+| 0 | none |
+| 1 | blake3 |
+| 2 | sha256 |
+
+**compression_algo (config.fs field, not a Superblock ID):**
+
+| Value | Algorithm |
+|----|-----------|
+| none | none |
+| zstd | zstd |
+| lz4 | lz4 |
+
+**pointer_checksum_algo_id** (Section 3.3, separate from all of the above): `1` = CRC32C, `2` = XXHASH32.
+
+Real structures (Superblock, Config Snapshot, Meta/User Table, Function Table) use BLAKE3-128 exclusively (`anchor_checksum_algo_id`) — the four tables above are for *other* checksums (data blocks, B-tree root hash, compression), not for the anchor-block integrity checksum itself. Pointer blocks (LBA0–5) use `pointer_checksum_algo_id` only.
 
 ---
 
@@ -442,8 +563,33 @@ WAL corruption is not covered by anchor backup. It requires fsck.
 - Superblock `journal_sequence` renamed to `wal_sequence`.
 - `[mount_hints]` remains runtime-only and excluded from Config Snapshot.
 
+## 17b. Changes from v17
+
+- Config Snapshot confirmed as the permanent format (TOML text, Section 5) — the competing fixed-offset binary struct proposal that circulated separately is discarded.
+- Restored `root_hash_algo_id` to the Superblock (Section 4).
+- Restored distinct backup copies for Config Snapshot, Meta/User Table, and Function Table (Section 12) — previously only Superblock and the Parity Block had real redundancy.
+- Pinned down the LBA4–5 fallback pointer field layout (Section 3.2/3.3).
+- Stated the config_self_checksum algorithm (xxhash64) and a 4080-byte bound on the stripped TOML (Section 5).
+- Stated the sync rule across the three `generation` fields (Section 7).
+- Assigned `anchor_id` values and bounded the ANCHOR_DIFF payload size (Section 9.3).
+- Clarified which block receives the WAL allocation-log entry on rollover (Section 10.1).
+- Added WAL region sizing guidance using config.fs's real key names (Section 10.2b).
+- Added an in-place content update protocol (Section 13.3), needed now that Section 12 has more structures with real backups to keep in sync.
+- Split Recovery Order into three failure-domain tracks (Section 14).
+- Split the conflated algorithm ID table into four independent tables (Section 16).
+
 ---
 
-## 18. End of Document
+## 18. Known Open Gaps
 
-**CAFS FS.INFO v17 — format version 4**
+Not resolved in this document — flagged rather than silently left implicit:
+
+- **Data-block / B-tree node checksum storage layout is entirely undocumented.** `data_checksum_algo_id` selects an algorithm (Section 16), but nothing here specifies where or how that checksum is stored per data block or B-tree node, or confirms/denies the I/O engine's separate claim that xxhash64 output gets truncated to 4 bytes for storage. This needs its own design pass — the B-tree node and extent formats aren't in this document at all.
+- **WAL Block Header checksum (Section 9.1) covers the header plus all current entries, recomputed on every append** — O(block_size) cost per write as the block fills. Left as-is; noting it here as an acknowledged tradeoff rather than a resolved decision, in case it wasn't the intended one.
+- `config.fs [identity].uuid_sequence`, `volume_label`, `volume_label_strict` remain crash-critical fields with no protocol role described anywhere in this document. Treated as inert passthrough data carried in the Config Snapshot's TOML text; no action taken.
+
+---
+
+## 19. End of Document
+
+**CAFS FS.INFO v19 — format version 4**

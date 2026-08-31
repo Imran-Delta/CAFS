@@ -1,9 +1,30 @@
 # =================================================================
-# CAFS CONFIGURATION PARAMETERS (v14 – format version 3)
+# CAFS CONFIGURATION PARAMETERS (v19 – format version 4)
 # =================================================================
 # This file contains all user- and administrator-facing settings.
 # For on-disk layout, binary structures, and atomic protocols,
-# see fs.info.
+# see fs.info. The Config Snapshot in LBA1 is this file, verbatim,
+# minus [mount_hints] — see fs.info Section 5.
+#
+# CHANGES FROM v14:
+#   - format_version: 3 -> 4 (matches fs.info Superblock)
+#   - [dedup].enabled: true -> false (matches fs.info's stated default)
+#   - [dedup].algo is now crash-critical (see section below); the rest
+#     of [dedup] stays runtime-only
+#   - [buffer].block_size -> [buffer].granularity (was colliding with
+#     [physical].block_size in name only, not value)
+#   - [journal] removed; the WAL is the journal (journal_lock_behavior
+#     already lived in [recovery], unaffected)
+#   - [integrity].anchor_checksum_algo comment corrected: it protects
+#     the real structures (Superblock/Config Snapshot/Meta Table/
+#     Function Table), not the LBA0/2/4/5 pointer blocks, which use
+#     [physical].pointer_checksum_algo instead (new field, see below)
+#   - [physical]: added pointer_checksum_algo (fs.info Section 3.3)
+#   - [mount_hints]: added sync_open, direct_io_required (already
+#     assumed to exist by the I/O engine spec; they didn't)
+#   - new [io] section: destroy_flush, misaligned_action (same reason)
+#   - new [allocator] section: explicit defaults for the two
+#     allocator-doc conflicts that don't resolve by specificity alone
 #
 # NOTES ON CONFIGURATION PERSISTENCE:
 # =================================================================
@@ -26,7 +47,7 @@
 # =================================================================
 
 [identity]
-format_version = 3
+format_version = 4
 volume_uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 uuid_sequence = 0
 config_generation = 0
@@ -48,6 +69,11 @@ zone_size = "1GB"
 page_buffer_size = "4MB"
 max_flush_ms = 1000
 
+# Checksum algorithm for the LBA0-5 pointer blocks (fs.info Section 3.3).
+# Set at format time; changing after mkfs requires a reformat.
+# Options: "crc32c" (default), "xxhash32"
+pointer_checksum_algo = "crc32c"
+
 # =================================================================
 # SECTION: INTEGRITY (CRASH-CRITICAL – STORED IN LBA2)
 # =================================================================
@@ -57,7 +83,10 @@ max_flush_ms = 1000
 # Options: "none", "crc32c", "xxhash64", "blake3"
 data_checksum_algo = "xxhash64"
 
-# Anchor checksum algorithm (LBA0, LBA2, LBA4, LBA5).
+# Anchor checksum algorithm for the real structures: Superblock,
+# Config Snapshot, Meta/User Pointer Table, Function Table.
+# (NOT the LBA0/2/4/5 pointer blocks themselves - those use
+# [physical].pointer_checksum_algo instead.)
 # WARNING: This is an immutable format parameter. Changing it after mkfs is forbidden.
 # The only valid value is "blake3-128" (16-byte output).
 anchor_checksum_algo = "blake3-128"
@@ -119,14 +148,6 @@ sync_interval_seconds = 2
 sync_on_every_write = false
 
 # =================================================================
-# SECTION: JOURNAL (CRASH-CRITICAL – STORED IN LBA2)
-# =================================================================
-
-[journal]
-slot_count = 2
-rotate_threshold_percent = 90
-
-# =================================================================
 # SECTION: WRITE CACHE (CRASH-CRITICAL – STORED IN LBA2)
 # =================================================================
 
@@ -183,16 +204,16 @@ verbose_logging = true
 cooldown_seconds = 120         # 2 minutes; prevents rapid toggling
 
 # =================================================================
-# SECTION: DEDUP (RUNTIME ONLY – NOT IN LBA2)
+# SECTION: DEDUP (MOSTLY RUNTIME - algo is CRASH-CRITICAL, see below)
 # =================================================================
 
 [dedup]
-enabled = true
-algo = "blake3"
-min_file_size_for_dedup = "64KB"
-scan_interval_seconds = 3600
-max_ram_table_mb = 512
-skip_dedup_for_raw = true
+enabled = false                        # RUNTIME ONLY (not in LBA2)
+algo = "blake3"                        # CRASH-CRITICAL (in LBA2) - immutable, fs.info Section 5
+min_file_size_for_dedup = "64KB"       # RUNTIME ONLY (not in LBA2)
+scan_interval_seconds = 3600           # RUNTIME ONLY (not in LBA2)
+max_ram_table_mb = 512                 # RUNTIME ONLY (not in LBA2)
+skip_dedup_for_raw = true              # RUNTIME ONLY (not in LBA2)
 
 # =================================================================
 # SECTION: DEFRAG (RUNTIME ONLY – NOT IN LBA2)
@@ -324,11 +345,33 @@ reduced_functions = false
 # Use O_DIRECT for user data (bypasses page cache)
 direct_io = false
 
+# If true, fail the mount when O_DIRECT can't be opened instead of
+# silently retrying without it
+direct_io_required = false
+
+# Use O_SYNC on the underlying device fd
+sync_open = false
+
 # Mount read-only
 readonly = false
 
 # Zone-level write locking (only relevant if locking_model = "zone")
 zone_locking = true
+
+# =================================================================
+# SECTION: IO (RUNTIME ONLY – NOT IN LBA2)
+# =================================================================
+# Low-level I/O engine behavior. Not crash-critical: these affect how
+# writes are issued, not what's persisted.
+# =================================================================
+
+[io]
+# Flush pending writes on clean unmount/destroy before closing the device fd
+destroy_flush = true
+
+# What to do with an I/O request that isn't block_size-aligned:
+# "copy" (bounce through an aligned buffer) or "reject" (return an error)
+misaligned_action = "copy"
 
 # =================================================================
 # SECTION: BUFFER POOL CONFIGURATION (RUNTIME ONLY – NOT IN LBA2)
@@ -341,7 +384,7 @@ zone_locking = true
 profile = "auto"
 
 # Manual overrides (if set, overrides profile defaults)
-block_size = 0              # 0 = use profile default (or 4096)
+granularity = 0              # 0 = use profile default (or 4096)
 metadata_pool_mb = 0        # 0 = use profile default
 data_pool_mb = 0            # 0 = use profile default
 scratch_pool_mb = 0         # 0 = use profile default
@@ -357,6 +400,27 @@ btree_cache_size_mb = 256
 # WAL checkpoint (both time and size – whichever hits first)
 wal_max_size_mb = 64
 wal_checkpoint_interval_seconds = 5
+
+# =================================================================
+# SECTION: ALLOCATOR (RUNTIME ONLY – NOT IN LBA2)
+# =================================================================
+# Defaults for the hybridization engine (see the allocator spec).
+# General rule: when more than one mutually-exclusive scoring
+# condition matches, the more specific one wins (its trigger range is
+# a strict subset of the other's). Where two matching conditions
+# share no variable and neither is a subset of the other, specificity
+# has no defined answer - this section is the explicit override for
+# those cases; an unset value falls back to the stated default.
+# =================================================================
+
+[allocator]
+# Delayed Allocation's On path for SSD was originally scored as a
+# coin-flip (0.5) with no defined threshold. Explicit default now.
+delayed_allocation_on_ssd_default = true
+
+# Delayed Allocation On (HDD, high fragmentation, no shared variable
+# with Off) and Off (low free space) can both trigger at once.
+delayed_allocation_conflict_default = "off"   # "on" or "off"
 
 # =================================================================
 # SECTION: PER-FILE / PER-DIRECTORY OPTIMIZATION FLAGS
