@@ -1,0 +1,28 @@
+# ADR-004: Python Integration — Embedded Interpreter
+
+**Status**: Accepted (2026-08-31)
+
+## Context
+
+The SMART Handler is implemented in Python. The system must support Python execution on all target platforms (Linux x86_64, Linux i686, Windows x86_64, Windows i686) without requiring the user to install Python.
+
+Two approaches were considered:
+1. **System Python**: Rely on `python3` being installed on the system.
+2. **Embedded Python**: Bundle the Python interpreter into the CAFS binary.
+
+## Decision
+
+Embed Python interpreter into the CAFS binary. Provide a compile-time option (`--exclude=pyi`) to use system Python instead.
+
+## Rationale
+
+- **No external dependencies**: User doesn't need to install Python.
+- **Works out-of-the-box**: All platforms supported.
+- **Optional fallback**: `--exclude=pyi` allows system Python for users who want smaller binaries.
+
+## Consequences
+
+- **Positive**: No Python installation required.
+- **Positive**: Cross-platform compatibility guaranteed.
+- **Negative**: Binary size increases by ~15MB (acceptable).
+- **Mitigation**: `--exclude=pyi` flag reduces binary size to ~2MB for users who don't need Python.

@@ -1,0 +1,29 @@
+# ADR-001: SMART Handler — Python vs. C
+
+**Status**: Accepted (2026-08-31)
+
+## Context
+
+The CAFS SMART system requires periodic analysis of drive health counters to provide health scores, trend detection, and recommendations to the Allocator. The analysis involves mathematical computations (error ratios, variance, trend detection) that are not time-critical.
+
+Two implementation paths were considered:
+1. **Pure C**: All logic in C, integrated directly into the mntproc.
+2. **Python**: Logic in a Python script called by the mntproc.
+
+## Decision
+
+The SMART Handler will be implemented in Python and called by the C mntproc via `stdin`/`stdout` pipes.
+
+## Rationale
+
+- **Iteration speed**: Python allows rapid experimentation with health formulas without recompiling the entire filesystem.
+- **Reduced complexity**: The C code remains focused on I/O, locking, and crash-safe flush coordination.
+- **Development velocity**: Python's native JSON support, math libraries, and debugging tools reduce development overhead.
+- **Separation of concerns**: C owns the critical path (I/O, locking, persistence). Python owns analytics.
+
+## Consequences
+
+- **Positive**: Faster development cycle; C code stays lean.
+- **Negative**: Python interpreter adds ~15MB to binary size (acceptable).
+- **Negative**: Python call adds process spawn overhead (every 60 seconds — acceptable).
+- **Mitigation**: Embedded Python interpreter is optional at compile time (`--exclude=pyi`).

@@ -1,0 +1,32 @@
+# ADR-005: SMART Tables — Hierarchy and Redundancy
+
+**Status**: Accepted (2026-08-31)
+
+## Context
+
+SMART counters are written by the I/O Engine on every I/O. They must be stored persistently, with redundancy and crash recovery.
+
+## Decision
+
+Four SMART tables in a hierarchy:
+
+| Table | Location | Purpose |
+|---|---|---|
+| **V-SMART** | RAM (volatile) | I/O Engine increments on every I/O |
+| **Cache SMART** | On-disk staging | Batch accumulation before final flush |
+| **B-SMART** | On-disk backup | Redundant copy at end of drive |
+| **M-SMART** | On-disk main | Authoritative source of truth |
+
+## Rationale
+
+- **Redundancy**: B-SMART provides fallback if M-SMART is corrupt.
+- **Crash recovery**: Recovery checks M → B → Cache → WAL.
+- **Performance**: V-SMART is RAM-based for fast I/O increments.
+- **Batch efficiency**: Cache SMART allows batch accumulation before flushing to B-SMART/M-SMART.
+
+## Consequences
+
+- **Positive**: Crash-safe; redundancy prevents data loss.
+- **Positive**: Performance (V-SMART is RAM-based).
+- **Negative**: Four tables increase complexity.
+- **Mitigation**: The hierarchy is well-defined and documented in `fs.info`.

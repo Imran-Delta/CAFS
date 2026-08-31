@@ -1,0 +1,43 @@
+# ADR-002: SMART Flush — Crash-Safe Order
+
+**Status**: Accepted (2026-08-31)
+
+## Context
+
+SMART counters are updated on every I/O. They must be persisted to disk in a crash-safe manner to avoid losing health data during power failure.
+
+The flush path must guarantee that:
+- No data is lost beyond the flush window.
+- The system can recover on mount.
+- The WAL provides atomicity.
+
+## Decision
+
+Flush order: **V-SMART → Cache SMART → B-SMART → WAL → M-SMART**.
+
+```
+
+1. Lock V-SMART (RAM)
+2. Read diffs
+3. Clear V-SMART
+4. Unlock V-SMART
+5. Build ANCHOR_DIFF WAL entry
+6. Write Cache SMART → fsync()
+7. Write B-SMART → fsync()
+8. Append WAL entry → fsync()
+9. Mark WAL entry as committed
+
+```
+
+## Rationale
+
+- **WAL is the source of truth**: M-SMART is updated via WAL replay, guaranteeing atomicity.
+- **Redundancy**: B-SMART provides a backup if M-SMART is corrupt.
+- **Recovery**: On mount, the system checks M-SMART → B-SMART → Cache SMART → WAL.
+
+## Consequences
+
+- **Positive**: Crash-safe; mount recovery is deterministic.
+- **Positive**: No data loss beyond the 60-second flush window.
+- **Negative**: Extra write to Cache SMART adds overhead (but flush runs every 60 seconds).
+- **Mitigation**: Flush threshold (1024 updates) triggers early flush under heavy load.

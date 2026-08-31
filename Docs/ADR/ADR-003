@@ -1,0 +1,28 @@
+# ADR-003: SMART Bucket System — Sufficient Statistics
+
+**Status**: Accepted (2026-08-31)
+
+## Context
+
+To detect trends (degrading vs. stable health), the system needs historical context. Storing every SMART sample is infeasible (too much data). A simple average loses variance, min, max, and distribution information.
+
+A method was needed to compress historical data without losing mathematical accuracy for aggregate statistics.
+
+## Decision
+
+Store buckets using **sufficient statistics**: `(count, sum, sum_sq, min, max)` for each health-relevant metric.
+
+Each bucket represents a time window (default: 1 hour). The system maintains up to 24 buckets (23 full + 1 partial), giving 24 hours of history.
+
+## Rationale
+
+- **Mathematical accuracy**: Average, variance, min, max can be perfectly reconstructed across any number of buckets.
+- **Compression**: 24 buckets × ~7 metrics × 5 stats = ~2KB of memory.
+- **No data loss for aggregation**: Combining buckets is a simple sum of counts, sums, sum_sq, min, max.
+
+## Consequences
+
+- **Positive**: Low memory footprint (~2KB for 24 buckets).
+- **Positive**: Variance and trend detection are possible.
+- **Negative**: Loss of point-in-time auditing (can't ask "what was the exact value at 2:15 AM?").
+- **Mitigation**: Point-in-time auditing is not required for CAFS's health monitoring.
