@@ -1,0 +1,88 @@
+name: Syntax Check
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Check Python syntax
+        id: python-check
+        continue-on-error: true
+        run: |
+          echo "Checking Python files for syntax errors..."
+          python_files=$(find . -type f -name "*.py" | grep -v __pycache__)
+          
+          if [ -z "$python_files" ]; then
+            echo "No Python files found."
+            exit 0
+          fi
+          
+          errors=0
+          for file in $python_files; do
+            if ! python -m py_compile "$file"; then
+              echo "❌ SYNTAX ERROR in $file"
+              errors=$((errors + 1))
+            else
+              echo "✅ $file - OK"
+            fi
+          done
+          
+          if [ $errors -gt 0 ]; then
+            echo "Found $errors Python file(s) with syntax errors!"
+            exit 1
+          fi
+      
+      - name: Set up C compiler
+        run: sudo apt-get install -y gcc
+      
+      - name: Check C syntax
+        id: c-check
+        continue-on-error: true
+        run: |
+          echo "Checking C files for syntax errors..."
+          c_files=$(find . -type f -name "*.c")
+          
+          if [ -z "$c_files" ]; then
+            echo "No C files found."
+            exit 0
+          fi
+          
+          errors=0
+          for file in $c_files; do
+            if ! gcc -fsyntax-only "$file" 2>&1; then
+              echo "❌ SYNTAX ERROR in $file"
+              errors=$((errors + 1))
+            else
+              echo "✅ $file - OK"
+            fi
+          done
+          
+          if [ $errors -gt 0 ]; then
+            echo "Found $errors C file(s) with syntax errors!"
+            exit 1
+          fi
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Syntax Check Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Python Files" >> $GITHUB_STEP_SUMMARY
+          echo "Status: ${{ steps.python-check.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### C Files" >> $GITHUB_STEP_SUMMARY
+          echo "Status: ${{ steps.c-check.outcome }}" >> $GITHUB_STEP_SUMMARY
