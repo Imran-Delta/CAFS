@@ -5,18 +5,18 @@ on:
     branches: [ main, develop ]
   pull_request:
     branches: [ main, develop ]
-  workflow_dispatch:  # Manual trigger available from the Actions tab
+  workflow_dispatch:
 
 jobs:
   full-check:
     runs-on: ubuntu-latest
-    # runs-on: self-hosted  # Uncomment for hardware-accelerated execution on your PC
+    # runs-on: self-hosted  # Uncomment for hardware execution on your PC
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1  # Downloads only the latest commit; full history is unnecessary for validation
+          fetch-depth: 1  # Downloads only the latest commit
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -26,11 +26,10 @@ jobs:
       # --- STAGE 1: Repository Integrity (Tripwire) ---
       - name: Run repository tripwire
         id: tripwire
-        continue-on-error: true  # Prevents warnings from aborting subsequent syntax checks
+        continue-on-error: true  # Allows subsequent checks to run regardless of warnings
         run: |
           cd ${{ github.workspace }}
           python3 Tools/check.py
-        # Always exits 0 unless --strict is passed; warnings print to stdout
 
       # --- STAGE 2: Python Syntax Validation ---
       - name: Validate Python syntax
@@ -67,7 +66,7 @@ jobs:
 
       - name: Validate C syntax
         id: c-check
-        continue-on-error: true  # Allows the summary to capture all outcomes
+        continue-on-error: true  # Allows summary to capture all outcomes
         run: |
           echo "🔍 Scanning for C source files..."
           c_files=$(find . -type f -name "*.c" | grep -v ".git")
@@ -93,9 +92,9 @@ jobs:
           fi
           echo "✅ All C files passed static syntax analysis."
 
-      # --- STAGE 4: Web Summary (Always displayed) ---
+      # --- STAGE 4: Summary (Always displayed) ---
       - name: Generate check summary
-        if: always()  # Executes regardless of any previous step's success or failure
+        if: always()  # Executes regardless of any previous step's outcome
         run: |
           echo "## 📊 CAFS Validation Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -129,9 +128,35 @@ jobs:
           echo "- Tripwire warnings indicate unreviewed modifications to reviewed files." >> $GITHUB_STEP_SUMMARY
           echo "- Accept changes locally with \`python3 Tools/check.py --update\` and commit the updated manifest." >> $GITHUB_STEP_SUMMARY
 
-      # --- STAGE 5: Explicit Failure Exit ---
-      - name: Halt on critical validation failure
-        if: failure()  # Triggers only when Python, C, or the tripwire step explicitly exits with 1
+      # --- STAGE 5: Final Job Status Aggregator ---
+      - name: Aggregate final job status
+        if: always()  # Evaluates all outcomes after all checks complete
         run: |
-          echo "❌ Critical syntax errors detected. Review the logs above."
-          exit 1
+          EXIT_CODE=0
+          
+          echo "🔍 Aggregating final validation status..."
+          
+          if [ "${{ steps.tripwire.outcome }}" == "failure" ]; then
+            echo "❌ Tripwire check reported warnings."
+            EXIT_CODE=1
+          fi
+          
+          if [ "${{ steps.python-check.outcome }}" == "failure" ]; then
+            echo "❌ Python syntax check failed."
+            EXIT_CODE=1
+          fi
+          
+          if [ "${{ steps.c-check.outcome }}" == "failure" ]; then
+            echo "❌ C syntax check failed."
+            EXIT_CODE=1
+          fi
+          
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo ""
+            echo "🚫 One or more critical checks failed. Review the logs above."
+            exit 1
+          else
+            echo ""
+            echo "✅ All validation stages passed successfully."
+            exit 0
+          fi
