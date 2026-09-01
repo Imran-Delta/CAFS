@@ -1,30 +1,32 @@
-BSD 3-Clause License
+CAFS Repository License
+======================
 
 Copyright (c) 2026, Imran Bin Gifary (System Delta)
 All rights reserved.
 
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
+DUAL LICENSING STRUCTURE
+------------------------
 
-1. Redistributions of source code must retain the above copyright notice,
-   this list of conditions and the following disclaimer.
+This repository contains code under two different licenses depending on the component:
 
-2. Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
+1. **DEFAULT LICENSE - BSD 3-Clause License**
+   - Applies to: The entire CAFS repository
+   - Excludes: src/Kernel directory
+   - See: LICENSES/BSD-3-Clause.txt
 
-3. Neither the name of the copyright holder nor the names of its
-   contributors may be used to endorse or promote products derived from
-   this software without specific prior written permission.
+2. **KERNEL LICENSE - GPL 2.0 (or later)**
+   - Applies to: src/Kernel/ directory only
+   - Rationale: Kernel-level driver code follows the same license as the Linux kernel
+   - See: LICENSES/GPL-2.0.txt
 
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-POSSIBILITY OF SUCH DAMAGE.
+LICENSING BY DIRECTORY
+----------------------
+
+- Root directory and subdirectories (except src/Kernel/): BSD 3-Clause License
+- src/Kernel/: GPL 2.0 License
+
+When redistributing or modifying:
+- For non-kernel code: Follow BSD-3-Clause terms (see LICENSES/BSD-3-Clause.txt)
+- For kernel code: Follow GPL-2.0 terms (see LICENSES/GPL-2.0.txt)
+
+For more information on each license, refer to the LICENSES/ folder.
