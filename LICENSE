@@ -11,22 +11,22 @@ This repository contains code under two different licenses depending on the comp
 
 1. **DEFAULT LICENSE - BSD 3-Clause License**
    - Applies to: The entire CAFS repository
-   - Excludes: src/Kernel directory
+   - Excludes: Src/Kernel directory
    - See: LICENSES/BSD-3-Clause.txt
 
-2. **KERNEL LICENSE - GPL 2.0 (or later)**
-   - Applies to: src/Kernel/ directory only
+2. **KERNEL LICENSE - GPL 2.0**
+   - Applies to: Src/Kernel/ directory only
    - Rationale: Kernel-level driver code follows the same license as the Linux kernel
    - See: LICENSES/GPL-2.0.txt
 
 LICENSING BY DIRECTORY
 ----------------------
 
-- Root directory and subdirectories (except src/Kernel/): BSD 3-Clause License
-- src/Kernel/: GPL 2.0 License
+- Root directory and subdirectories (except Src/Kernel/): BSD 3-Clause License
+- Src/Kernel/: GPL 2.0 License
 
 When redistributing or modifying:
-- For non-kernel code: Follow BSD-3-Clause terms (see LICENSES/BSD-3-Clause.txt)
-- For kernel code: Follow GPL-2.0 terms (see LICENSES/GPL-2.0.txt)
+- For non-kernel code: Follow BSD-3-Clause terms (see LICENSES/BSD-3-Clause)
+- For kernel code: Follow GPL-2.0 terms (see LICENSES/GPL-2.0)
 
 For more information on each license, refer to the LICENSES/ folder.
