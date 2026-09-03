@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tools/Src_Drafts/smart_handler.py — unified SMART telemetry processor.
+Tools/Src/smart_handler.py — unified SMART telemetry processor.
 
 One file, three modes, all stdin JSON in / stdout JSON out:
 

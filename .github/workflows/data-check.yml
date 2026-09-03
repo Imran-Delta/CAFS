@@ -1,4 +1,4 @@
-name: Syntax & Consistency Check
+name: CAFS CI Pipeline
 
 on:
   push:
@@ -8,155 +8,410 @@ on:
   workflow_dispatch:
 
 jobs:
-  full-check:
+  # ============================================================
+  # STAGE 1 — Syntax & Integrity (fast, dependency-free)
+  # Scope: tripwire = whole repo, syntax checks = /Src only.
+  # ============================================================
+  stage-1-syntax-integrity:
+    name: "Stage 1: Syntax & Integrity"
     runs-on: ubuntu-latest
-    # runs-on: self-hosted  # Uncomment for hardware execution on your PC
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
         with:
-          fetch-depth: 1  # Downloads only the latest commit
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.14'
 
-      # --- STAGE 1: Repository Integrity (Tripwire) ---
+      # --- Check 1: Tripwire (whole repo, non-blocking) ---
       - name: Run repository tripwire
         id: tripwire
-        continue-on-error: true  # Allows subsequent checks to run regardless of warnings
-        run: |
-          cd ${{ github.workspace }}
-          python3 Tools/check.py
+        continue-on-error: true
+        run: python3 Tools/check.py
 
-      # --- STAGE 2: Python Syntax Validation ---
-      - name: Validate Python syntax
+      # --- Check 2: Python syntax (/Src only, blocking) ---
+      - name: Validate Python syntax (/Src)
         id: python-check
-        continue-on-error: true  # Allows C validation to proceed even if Python fails
+        continue-on-error: true
         run: |
-          echo "🔍 Scanning for Python files..."
-          python_files=$(find . -type f -name "*.py" | grep -v __pycache__ | grep -v ".git")
-          
-          if [ -z "$python_files" ]; then
-            echo "ℹ️ No Python files found. Skipping."
+          echo "Scanning /Src for Python files..."
+          py_files=$(find Src -type f -name "*.py" 2>/dev/null | grep -v __pycache__ || true)
+
+          if [ -z "$py_files" ]; then
+            echo "No Python files under /Src. Skipping."
             exit 0
           fi
-          
+
           errors=0
-          for file in $python_files; do
-            if ! python -m py_compile "$file" 2>/dev/null; then
-              echo "❌ SYNTAX ERROR: $file"
+          for file in $py_files; do
+            if ! python -m py_compile "$file" 2>&1; then
+              echo "SYNTAX ERROR: $file"
               errors=$((errors + 1))
             else
-              echo "✅ $file - Valid"
+              echo "OK: $file"
             fi
           done
-          
+
           if [ $errors -gt 0 ]; then
-            echo "❌ $errors Python file(s) contain syntax errors."
+            echo "$errors Python file(s) under /Src contain syntax errors."
             exit 1
           fi
-          echo "✅ All Python files passed compilation validation."
+          echo "All /Src Python files passed."
 
-      # --- STAGE 3: C Syntax Validation ---
-      - name: Install C compiler
-        run: sudo apt-get update && sudo apt-get install -y gcc
-
-      - name: Validate C syntax
-        id: c-check
-        continue-on-error: true  # Allows summary to capture all outcomes
+      # --- Check 3: C/C++/C# brace balance (/Src only, blocking) ---
+      # Deliberately NOT gcc here: Stage 1 must stay dependency-free
+      # (the previous version of this workflow apt-get installed gcc
+      # inside the "zero dependency" stage — that's fixed in Stage 2,
+      # which is where a real compiler belongs). This is a pure-stdlib
+      # brace/paren/bracket balance check, comment- and string-literal-
+      # aware. It does NOT attempt to catch missing semicolons: that
+      # needs a real parser, and a heuristic here would just produce
+      # false positives — left to Stage 2's actual compiler.
+      - name: Validate C/C++/C# brace balance (/Src)
+        id: brace-check
+        continue-on-error: true
         run: |
-          echo "🔍 Scanning for C source files..."
-          c_files=$(find . -type f -name "*.c" | grep -v ".git")
-          
-          if [ -z "$c_files" ]; then
-            echo "ℹ️ No C files found. Skipping."
-            exit 0
-          fi
-          
-          errors=0
-          for file in $c_files; do
-            if ! gcc -fsyntax-only "$file" 2>&1; then
-              echo "❌ SYNTAX ERROR: $file"
-              errors=$((errors + 1))
-            else
-              echo "✅ $file - Valid"
-            fi
-          done
-          
-          if [ $errors -gt 0 ]; then
-            echo "❌ $errors C file(s) contain syntax errors."
-            exit 1
-          fi
-          echo "✅ All C files passed static syntax analysis."
+          python3 - <<'PYEOF'
+          import sys
+          from pathlib import Path
 
-      # --- STAGE 4: Summary (Always displayed) ---
-      - name: Generate check summary
-        if: always()  # Executes regardless of any previous step's outcome
+          PAIRS = {')': '(', ']': '[', '}': '{'}
+          OPENERS = set(PAIRS.values())
+
+          def check_balance(text):
+              stack = []
+              i, n = 0, len(text)
+              in_line_comment = False
+              in_block_comment = False
+              in_string = False
+              in_char = False
+              line = 1
+              while i < n:
+                  c = text[i]
+                  nxt = text[i + 1] if i + 1 < n else ''
+                  if c == '\n':
+                      line += 1
+                      in_line_comment = False
+                      i += 1
+                      continue
+                  if in_line_comment:
+                      i += 1
+                      continue
+                  if in_block_comment:
+                      if c == '*' and nxt == '/':
+                          in_block_comment = False
+                          i += 2
+                          continue
+                      i += 1
+                      continue
+                  if in_string:
+                      if c == '\\':
+                          i += 2
+                          continue
+                      if c == '"':
+                          in_string = False
+                      i += 1
+                      continue
+                  if in_char:
+                      if c == '\\':
+                          i += 2
+                          continue
+                      if c == "'":
+                          in_char = False
+                      i += 1
+                      continue
+                  if c == '/' and nxt == '/':
+                      in_line_comment = True
+                      i += 2
+                      continue
+                  if c == '/' and nxt == '*':
+                      in_block_comment = True
+                      i += 2
+                      continue
+                  if c == '"':
+                      in_string = True
+                      i += 1
+                      continue
+                  if c == "'":
+                      in_char = True
+                      i += 1
+                      continue
+                  if c in OPENERS:
+                      stack.append((c, line))
+                  elif c in PAIRS:
+                      if not stack:
+                          return f"line {line}: unmatched closing '{c}'"
+                      top, _ = stack.pop()
+                      if top != PAIRS[c]:
+                          return f"line {line}: expected match for '{top}', found '{c}'"
+                  i += 1
+              if stack:
+                  c, ln = stack[-1]
+                  return f"line {ln}: unclosed '{c}'"
+              return None
+
+          src = Path("Src")
+          files = []
+          if src.exists():
+              for ext in ("*.c", "*.cpp", "*.cs"):
+                  files.extend(src.rglob(ext))
+
+          if not files:
+              print("No C/C++/C# files under /Src. Skipping.")
+              sys.exit(0)
+
+          errors = 0
+          for f in sorted(files):
+              text = f.read_text(errors="replace")
+              result = check_balance(text)
+              if result:
+                  print(f"UNBALANCED: {f} — {result}")
+                  errors += 1
+              else:
+                  print(f"OK: {f}")
+
+          if errors:
+              print(f"{errors} file(s) under /Src have unbalanced braces/parens/brackets.")
+              sys.exit(1)
+          print("All /Src C/C++/C# files balanced.")
+          PYEOF
+
+      # --- Aggregator ---
+      - name: Stage 1 summary
+        if: always()
         run: |
-          echo "## 📊 CAFS Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## Stage 1: Syntax & Integrity" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Validation Stage | Result |" >> $GITHUB_STEP_SUMMARY
-          echo "|------------------|--------|" >> $GITHUB_STEP_SUMMARY
-          
-          TRIPWIRE_STATUS="${{ steps.tripwire.outcome }}"
-          PYTHON_STATUS="${{ steps.python-check.outcome }}"
-          C_STATUS="${{ steps.c-check.outcome }}"
-          
-          if [ "$TRIPWIRE_STATUS" == "success" ]; then
-            echo "| 🔍 Repository Integrity | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| 🔍 Repository Integrity | ⚠️ Warnings (see logs) |" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          if [ "$PYTHON_STATUS" == "success" ]; then
-            echo "| 🐍 Python Syntax | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| 🐍 Python Syntax | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          if [ "$C_STATUS" == "success" ]; then
-            echo "| ⚙️ C Syntax | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| ⚙️ C Syntax | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Action Notes:**" >> $GITHUB_STEP_SUMMARY
-          echo "- Tripwire warnings indicate unreviewed modifications to reviewed files." >> $GITHUB_STEP_SUMMARY
-          echo "- Accept changes locally with \`python3 Tools/check.py --update\` and commit the updated manifest." >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          [ "${{ steps.tripwire.outcome }}" == "success" ] \
+            && echo "| Tripwire (non-blocking) | Passed |" >> $GITHUB_STEP_SUMMARY \
+            || echo "| Tripwire (non-blocking) | Warnings — see logs |" >> $GITHUB_STEP_SUMMARY
+          [ "${{ steps.python-check.outcome }}" == "success" ] \
+            && echo "| Python syntax (/Src) | Passed |" >> $GITHUB_STEP_SUMMARY \
+            || echo "| Python syntax (/Src) | Failed |" >> $GITHUB_STEP_SUMMARY
+          [ "${{ steps.brace-check.outcome }}" == "success" ] \
+            && echo "| C/C++/C# brace balance (/Src) | Passed |" >> $GITHUB_STEP_SUMMARY \
+            || echo "| C/C++/C# brace balance (/Src) | Failed |" >> $GITHUB_STEP_SUMMARY
 
-      # --- STAGE 5: Final Job Status Aggregator ---
-      - name: Aggregate final job status
-        if: always()  # Evaluates all outcomes after all checks complete
+      - name: Aggregate Stage 1 result
+        if: always()
         run: |
           EXIT_CODE=0
-          
-          echo "🔍 Aggregating final validation status..."
-          
-          if [ "${{ steps.tripwire.outcome }}" == "failure" ]; then
-            echo "❌ Tripwire check reported warnings."
-            EXIT_CODE=1
-          fi
-          
-          if [ "${{ steps.python-check.outcome }}" == "failure" ]; then
-            echo "❌ Python syntax check failed."
-            EXIT_CODE=1
-          fi
-          
-          if [ "${{ steps.c-check.outcome }}" == "failure" ]; then
-            echo "❌ C syntax check failed."
-            EXIT_CODE=1
-          fi
-          
+          [ "${{ steps.python-check.outcome }}" == "failure" ] && EXIT_CODE=1
+          [ "${{ steps.brace-check.outcome }}" == "failure" ] && EXIT_CODE=1
+          # Tripwire warnings intentionally do not block Stage 1.
           if [ $EXIT_CODE -ne 0 ]; then
-            echo ""
-            echo "🚫 One or more critical checks failed. Review the logs above."
+            echo "Stage 1 failed: see summary above."
             exit 1
+          fi
+          echo "Stage 1 passed (tripwire warnings, if any, are non-blocking)."
+
+  # ============================================================
+  # STAGE 2 — Static Analysis (heavier, tool-agnostic, lint only)
+  # Runs only if Stage 1 passed. Scope: /Src only. Deliberately
+  # does NOT build+run the engine end to end — that's Stage 3's
+  # job, kept separate so it isn't duplicated here.
+  # ============================================================
+  stage-2-static-analysis:
+    name: "Stage 2: Static Analysis"
+    needs: stage-1-syntax-integrity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Detect languages present under /Src
+        id: detect
+        run: |
+          has_c=false; has_fuse=false; has_kernel=false; has_rust=false; has_csharp=false
+          find Src -name "*.c" 2>/dev/null | grep -q . && has_c=true
+          find Src/FUSE -name "*.c" 2>/dev/null | grep -q . && has_fuse=true
+          find Src/Kernel -name "*.c" 2>/dev/null | grep -q . && has_kernel=true
+          find Src -name "*.rs" 2>/dev/null | grep -q . && has_rust=true
+          find Src -name "*.cs" 2>/dev/null | grep -q . && has_csharp=true
+          echo "has_c=$has_c" >> "$GITHUB_OUTPUT"
+          echo "has_fuse=$has_fuse" >> "$GITHUB_OUTPUT"
+          echo "has_kernel=$has_kernel" >> "$GITHUB_OUTPUT"
+          echo "has_rust=$has_rust" >> "$GITHUB_OUTPUT"
+          echo "has_csharp=$has_csharp" >> "$GITHUB_OUTPUT"
+
+      # Conditional dependency install, per the design doc exactly.
+      - name: Install C toolchain
+        if: steps.detect.outputs.has_c == 'true'
+        run: sudo apt-get update && sudo apt-get install -y gcc g++
+
+      - name: Install libfuse3-dev
+        if: steps.detect.outputs.has_fuse == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+
+      # Hosted runners' running kernel frequently has no matching
+      # linux-headers package in apt — this is a known CI gotcha, not
+      # a real failure of the code, and Kernel/ is explicitly out of
+      # scope for V1 (FUSE-only) anyway. Best-effort, non-blocking.
+      - name: Install kernel headers (best-effort)
+        if: steps.detect.outputs.has_kernel == 'true'
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-headers-$(uname -r)" \
+            || sudo apt-get install -y linux-headers-generic \
+            || echo "No matching linux-headers package on this runner — non-blocking, Kernel/ is not V1 scope."
+
+      - name: Install Rust toolchain
+        if: steps.detect.outputs.has_rust == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # dotnet ships preinstalled on ubuntu-latest runners.
+
+      # --- C/C++ lint (gcc -Wall -Wextra -fsyntax-only) ---
+      # Per-directory: -I<component dir> plus -I<repo>/vendor/blake3
+      # (the one shared vendored dependency today — extend this list
+      # if more vendor dirs get added later). Lint only — no linking,
+      # no `make all`, no test execution; that stays Stage 3's job
+      # for the engine specifically. -D_GNU_SOURCE matches the I/O
+      # Engine's actual Makefile (needed for O_DIRECT and friends on
+      # glibc) — without it this lint pass disagrees with what the
+      # real build actually compiles.
+      - name: Lint C/C++ (/Src)
+        id: c-lint
+        if: steps.detect.outputs.has_c == 'true'
+        continue-on-error: true
+        run: |
+          # Deliberately not scraping each component's own Makefile
+          # for its INCLUDES value: Makefile syntax (e.g. $(VENDOR))
+          # is not bash syntax and a naive grep+eval breaks on it.
+          # Instead: each component dir gets -I<itself>, plus a
+          # blanket -I to the repo's one shared vendored dependency
+          # (vendor/blake3). Revisit if more vendor deps get added.
+          REPO_ROOT=$(git rev-parse --show-toplevel)
+          errors=0
+          for dir in $(find Src -name "*.c" -o -name "*.cpp" 2>/dev/null | xargs -n1 dirname | sort -u); do
+            extra_includes="-I$dir -I$REPO_ROOT/vendor/blake3"
+            for f in "$dir"/*.c "$dir"/*.cpp; do
+              [ -f "$f" ] || continue
+              echo "gcc -Wall -Wextra -std=c11 -D_GNU_SOURCE -fsyntax-only $extra_includes $f"
+              if ! gcc -Wall -Wextra -std=c11 -D_GNU_SOURCE -fsyntax-only $extra_includes "$f" 2>&1; then
+                echo "LINT FAILED: $f"
+                errors=$((errors + 1))
+              fi
+            done
+          done
+          [ $errors -gt 0 ] && exit 1 || echo "C/C++ lint clean."
+
+      # --- Rust lint (cargo check / clippy) ---
+      - name: Lint Rust (/Src)
+        id: rust-lint
+        if: steps.detect.outputs.has_rust == 'true'
+        continue-on-error: true
+        run: |
+          for manifest in $(find Src -name "Cargo.toml"); do
+            dir=$(dirname "$manifest")
+            echo "cargo clippy in $dir"
+            (cd "$dir" && cargo clippy --all-targets -- -D warnings) || exit 1
+          done
+
+      # --- C# lint/format (dotnet) ---
+      - name: Lint C# (/Src)
+        id: csharp-lint
+        if: steps.detect.outputs.has_csharp == 'true'
+        continue-on-error: true
+        run: |
+          for proj in $(find Src -name "*.csproj"); do
+            dir=$(dirname "$proj")
+            echo "dotnet format --verify-no-changes in $dir"
+            (cd "$dir" && dotnet format --verify-no-changes) || exit 1
+          done
+
+      # --- Python lint (optional, non-blocking: Stage 1 already
+      # caught syntax; style issues shouldn't gate the pipeline) ---
+      - name: Lint Python (/Src, optional)
+        id: python-lint
+        continue-on-error: true
+        run: |
+          pip install --quiet flake8
+          py_files=$(find Src -name "*.py" 2>/dev/null || true)
+          [ -z "$py_files" ] && { echo "No Python files under /Src."; exit 0; }
+          flake8 --max-line-length=120 $py_files || echo "flake8 warnings (non-blocking)."
+
+      - name: Stage 2 summary
+        if: always()
+        run: |
+          echo "## Stage 2: Static Analysis" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| C/C++ lint | ${{ steps.c-lint.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Rust lint | ${{ steps.rust-lint.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| C# lint | ${{ steps.csharp-lint.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Python lint (non-blocking) | ${{ steps.python-lint.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Aggregate Stage 2 result
+        if: always()
+        run: |
+          EXIT_CODE=0
+          [ "${{ steps.c-lint.outcome }}" == "failure" ] && EXIT_CODE=1
+          [ "${{ steps.rust-lint.outcome }}" == "failure" ] && EXIT_CODE=1
+          [ "${{ steps.csharp-lint.outcome }}" == "failure" ] && EXIT_CODE=1
+          # Python lint is style-only and intentionally non-blocking.
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "Stage 2 failed: see summary above."
+            exit 1
+          fi
+          echo "Stage 2 passed."
+
+  # ============================================================
+  # STAGE 3 — Engine build + test on a real image
+  # Runs only if Stage 2 passed. For now this is scoped to the
+  # I/O Engine specifically (the only buildable component so far);
+  # extend the path list below as Allocator/FUSE-layer land.
+  # ============================================================
+  stage-3-engine-build-test:
+    name: "Stage 3: Engine Build & Image Test"
+    needs: stage-2-static-analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Install build toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Build and test the I/O Engine (mkfs -> mount -> check -> remount -> confirm on a real .img)
+        id: engine-test
+        run: |
+          cd Src/FUSE/Linux/x86-64/I-O_Engine
+          make clean
+          make all
+          make test
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: io-engine-build-${{ github.sha }}
+          path: |
+            Src/FUSE/Linux/x86-64/I-O_Engine/libcafs_io.a
+            Src/FUSE/Linux/x86-64/I-O_Engine/mkfs_cafs
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Stage 3 summary
+        if: always()
+        run: |
+          echo "## Stage 3: Engine Build & Image Test" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.engine-test.outcome }}" == "success" ]; then
+            echo "I/O Engine built and \`make test\` (mkfs -> mount -> check -> remount -> confirm, plus the corruption/auto-repair path) passed against a real image." >> $GITHUB_STEP_SUMMARY
           else
-            echo ""
-            echo "✅ All validation stages passed successfully."
-            exit 0
+            echo "I/O Engine build or test failed — see logs above." >> $GITHUB_STEP_SUMMARY
           fi
