@@ -294,7 +294,7 @@ jobs:
           REPO_ROOT=$(git rev-parse --show-toplevel)
           errors=0
           for dir in $(find Src -name "*.c" -o -name "*.cpp" 2>/dev/null | xargs -n1 dirname | sort -u); do
-            extra_includes="-I$dir -I$REPO_ROOT/vendor/blake3"
+            extra_includes="-I$dir -I$REPO_ROOT/Src/vendor/blake3"
             for f in "$dir"/*.c "$dir"/*.cpp; do
               [ -f "$f" ] || continue
               echo "gcc -Wall -Wextra -std=c11 -D_GNU_SOURCE -fsyntax-only $extra_includes $f"
