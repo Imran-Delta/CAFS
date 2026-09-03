@@ -1,0 +1,23 @@
+# ADR-007: I/O Engine — V1 Scope: Superblock-Only Verification and Repair
+
+**Status**: Accepted (2026-09-03)
+
+## Context
+
+The full mount pipeline (mount → check → remount → confirm) needs to exist before any of it can be tested against real hardware or even a real image file. Building complete verification and auto-repair logic for every anchor structure (Config Snapshot, Parity, Function Table) before a single read/write path has been proven working risks a large amount of untested code accumulating at once.
+
+## Decision
+
+For V1, `check()` verifies and — when foreseeable and safe (mount is writable, a valid backup exists) — repairs only the Superblock. Config Snapshot, Parity Block, and Function Table are read at mount time but their checksums are neither verified nor acted on.
+
+## Rationale
+
+- **Proof of concept first**: get mount/check/remount/confirm and raw read/write working end to end against a real image before adding verification breadth.
+- **Superblock is the one structure that's load-bearing for every other step**: `function_table_anchor_lba`, checksum algorithm IDs, and config discovery all originate from it. Nothing else in the pipeline can proceed meaningfully if it's wrong.
+- **The other three don't gate anything yet**: Config Snapshot parsing, Parity reconstruction, and Function Table's WAL/SMART pointers aren't consumed by any code path this version actually exercises.
+
+## Consequences
+
+- **Positive**: a small, fully tested, fully working core (24/24 assertions passing against `mkfs_cafs`-produced images, including the corruption/auto-repair path) exists to build on.
+- **Negative**: a corrupted Config Snapshot, Parity Block, or Function Table currently goes undetected — `check()` reports overall status based on Superblock alone.
+- **Mitigation**: explicitly documented as a scope cut in the engine's README, not a silent gap; extending `check()` to the other three structures (verify-only for Function Table/Meta Table, XOR-reconstruct for Config Snapshot) is described there as known future work.

@@ -1,0 +1,25 @@
+# ADR-006: I/O Engine — Anchor Redundancy Scope (Superblock + SMART Only)
+
+**Status**: Accepted (2026-09-03)
+
+## Context
+
+fs.info's original anchor design (§12) mirrors all six LBA0-5 pointer blocks at the end of the device, giving every anchor real structure — Superblock, Config Snapshot, Parity Block, Meta/User Pointer Table, Function Table — a distinct backup copy. Every anchor write potentially touches five backup structures in addition to the primary, and keeping them in sync adds torn-write surface without a correspondingly large safety gain: most of those structures are either reconstructable another way (Config Snapshot, via Parity XOR against Superblock) or hold pointers/metadata whose loss doesn't prevent mounting (Function Table, Meta/User Table).
+
+## Decision
+
+End-of-device redundancy is kept only for the Superblock and the SMART tables (M-SMART/B-SMART). Config Snapshot, Parity Block, Function Table, and Meta/User Pointer Table have exactly one on-disk copy each — no backup, no end-of-device mirror.
+
+## Rationale
+
+- **Write amplification**: every anchor update under the full-mirror design touched up to 6 structures; under this design, at most 2 (Superblock + its backup).
+- **Torn-write surface**: fewer structures to keep synchronized means fewer partial-update states a crash can leave behind.
+- **Selective value**: Config Snapshot stays indirectly recoverable via `Parity XOR Superblock` even with no direct backup. Function Table and Meta/User Table hold pointers/metadata, not data the filesystem can't function without — losing either costs discoverability (WAL, SMART, Zone Table locations), not the ability to mount.
+- **Superblock and SMART are different**: Superblock gates every mount (nothing proceeds without it); SMART is the ongoing health signal the Allocator consumes continuously. Both justify the redundancy cost the others don't.
+
+## Consequences
+
+- **Positive**: significantly less write amplification per anchor update; smaller crash-window.
+- **Positive**: matches what's implemented in the I/O Engine V1 today, exactly (`check()` only ever repairs Superblock; there's no "Backup Parity Block" concept in the codebase).
+- **Negative**: Function Table and Meta/User Table now have zero redundancy — a checksum failure on either is unrecoverable data loss for that structure specifically.
+- **Mitigation**: consistent with the project's existing "won't die easily" floor — the filesystem stays mountable and metadata-consistent even when some data is unrecoverable; this just extends that floor to two more structures that were never load-bearing for mount itself.

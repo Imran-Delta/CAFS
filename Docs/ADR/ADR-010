@@ -1,0 +1,26 @@
+# ADR-010: I/O Engine — Resolved fs.info Ambiguities for V1
+
+**Status**: Accepted (2026-09-03)
+
+## Context
+
+Building the I/O Engine against `fs.info` surfaced several places where the spec doesn't fully define behavior needed for a working implementation: no stated addressing unit for "LBA," an invalid hex literal for the pointer-block magic, no stated bootstrap procedure for discovering the pointer-block checksum algorithm before anything has been verified yet, and an inconsistent use of "LBA" to mean two different things in different fields.
+
+## Decision
+
+Four resolutions, all implemented in `cafs_io_layout.h` and cited there:
+
+1. **LBA addressing unit**: raw byte offset from device start, applied uniformly to `real_lba`/`fallback_real_lba` fields too.
+2. **Pointer block magic** (`fs.info` writes `0xCAFSPTR`, not valid hex — P/T/R aren't hex digits): the literal 8-byte ASCII string `"CAFSPTR\0"`, compared byte-for-byte rather than parsed as an integer.
+3. **Pointer-block checksum algorithm bootstrap**: try CRC32C, then XXHASH32, accept whichever matches. Both are the only two legal IDs per §3.3; a false match between two different 4-byte algorithms on corrupted data is not a realistic risk.
+4. **`function_table_anchor_lba` = 4**: this field holds the anchor *slot index* (0-5), not a byte offset — inconsistent with every other `real_lba`-style field in the format, which are byte offsets. `mkfs_cafs` writes literal `4`; nothing currently reads it back to cross-check, consistent with the Superblock-only check policy (ADR-007).
+
+## Rationale
+
+Each of these blocks a specific, concrete piece of code (anchor offset math, magic comparison, first-ever checksum verification, Superblock field layout) — a decision had to be made one way or another to write anything at all. Recorded here rather than left as an undocumented implementation detail, so a fuller spec pass on `fs.info` can confirm or override each one deliberately.
+
+## Consequences
+
+- **Positive**: unblocks implementation without waiting on a full spec revision; each choice is narrow and independently reversible.
+- **Negative**: `fs.info` itself remains unfixed — a future reader of `fs.info` alone (without this ADR) will still hit the same ambiguities.
+- **Mitigation**: `fs.info` should get a follow-up pass incorporating these four resolutions directly, closing this ADR out as "merged into the spec" rather than leaving it as a permanent patch on top.

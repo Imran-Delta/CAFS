@@ -1,0 +1,23 @@
+# ADR-009: I/O Engine — Language and Toolchain: Assembly + C, Not Rust, for V1
+
+**Status**: Accepted (2026-09-03)
+
+## Context
+
+Two toolchains were on the table for the I/O Engine: (1) hand-written x86-64 assembly for the raw device syscalls plus C for everything else, or (2) Rust, for its compile-time memory-safety guarantees. A survey of existing Rust I/O crates (`rio`, `safer-ring`, `io-engine`, `lio`, and the foundational `io-uring`) was done specifically to check whether an existing, mature crate could shortcut this decision.
+
+## Decision
+
+V1 stays Assembly (raw syscalls: `openat`, `pread64`, `pwrite64`, `fdatasync`, `close`, `ioctl`) + C, matching the repo-wide BSD-3-Clause license. Rust remains under consideration for a future version, not adopted now.
+
+## Rationale
+
+- **Crate survey didn't find a clear win**: `rio` is GPL-3.0 by default (MIT/Apache-2.0 only via paid GitHub Sponsors) — incompatible with BSD-3-Clause without paying for the exception. `safer-ring` is v0.0.1, 362 all-time downloads, single-maintainer — essentially unproven. `io-engine` and `lio` are legitimate and permissively licensed but small; neither removes enough risk to justify a mid-flight language switch.
+- **Memory safety and specification correctness are different axes**: Rust's compile-time guarantees rule out a category of bugs (use-after-free, data races) but do nothing to catch a wrong byte offset, wrong checksum algorithm, or misread field width against `fs.info` — the actual source of every bug found while building this engine (e.g. the `O_DIRECT`/`_GNU_SOURCE` CI-lint mismatch, the `pointer_checksum_algo_used` field that was declared but never populated) was specification/logic, not memory safety. A rewrite wouldn't have prevented either.
+- **Working, tested code already exists**: the C+asm engine passes 24/24 assertions against a real image (`mkfs_cafs` → mount → check → remount → confirm, plus corruption/auto-repair), including from a from-scratch checkout. Restarting in Rust discards that.
+
+## Consequences
+
+- **Positive**: no license entanglement; matches the existing BSD-3-Clause repo without exception beyond the already-disclosed vendored BLAKE3.
+- **Negative**: forgoes Rust's memory-safety guarantees for this component — a real, non-zero cost for hand-written syscall wrappers and manual buffer arithmetic.
+- **Mitigation**: kept narrow in scope (six syscall wrappers, no complex ownership patterns) and covered by a real test suite exercised on every change; revisit if a Rust I/O crate matures (permissive license, real adoption, security audit) or if this component's complexity grows enough that manual memory management risk outweighs the switching cost.

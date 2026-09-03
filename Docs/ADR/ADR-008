@@ -1,0 +1,23 @@
+# ADR-008: I/O Engine — confirm() Write Path Bypasses the Full SMART Flush Pipeline
+
+**Status**: Accepted (2026-09-03)
+
+## Context
+
+ADR-002 defines the full crash-safe SMART flush order: V-SMART → Cache SMART → B-SMART → WAL → M-SMART, coordinated by the SMART Handler (ADR-001) and reconciled via `smart_handler.py`. That pipeline depends on the C-process architecture and IPC protocol, both still open per the project roadmap. The I/O Engine's `confirm()` stage needs to mark a mount as active (Superblock `last_mount_time`, SMART `mount_count`/`clean_unmount_flag`) today, independent of when that fuller pipeline gets built.
+
+## Decision
+
+`confirm()` writes `last_mount_time` directly to the Superblock, and — best-effort, if a usable M-SMART location was found at mount — increments `mount_count` and sets `clean_unmount_flag = 0` directly on M-SMART. It does not go through V-SMART, Cache SMART, B-SMART, or the WAL.
+
+## Rationale
+
+- **Decoupling**: the I/O Engine's own mount lifecycle shouldn't block on the SMART Handler pipeline's unresolved architecture questions.
+- **Narrow, well-defined write**: two fields, one direct write, no batching/reconciliation semantics to get wrong before the fuller pipeline exists.
+- **Best-effort, not silent**: a missing or unreadable M-SMART table doesn't fail `confirm()` — the Superblock write (the one thing every subsequent mount depends on) is what's fatal; the SMART write is a bonus that degrades gracefully.
+
+## Consequences
+
+- **Positive**: `confirm()` is fully testable today without any dependency on ADR-001/002's pipeline being built.
+- **Negative**: this is a genuine bypass of ADR-002's stated flush order — `mount_count`/`clean_unmount_flag` updates from `confirm()` never touch Cache SMART, B-SMART, or the WAL, so they're not covered by that ADR's crash-recovery guarantees.
+- **Mitigation**: only two fields are affected, both low-cost to lose on crash (a missed `mount_count` increment is a lost counter tick, not corrupted data); B-SMART is not updated by `confirm()` either, so M-SMART/B-SMART can drift on these two fields specifically until the full pipeline lands — flagged in the engine's README, to be resolved when ADR-001/002's architecture is actually implemented.
