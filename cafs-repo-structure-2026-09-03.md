@@ -69,6 +69,6 @@ Unchanged from the prior revision — **check.py**, **.reviewed-hashes**, **Make
 
 ## Root
 
-**LICENSE** now points at a **LICENSES/** folder (`BSD-3-Clause.txt`, `GPL-2.0.txt`) rather than inlining terms — cleaner for tooling (SPDX-style references, GitHub's license detection) that expects a canonical license file per license, not one combined document. *Note: this structure document assumes those two files exist under LICENSES/; they weren't part of this revision's inputs and should be added if they aren't already there — the top-level LICENSE file already references them, so a missing LICENSES/ folder is currently a dangling reference.*
+**LICENSE** now points at a **LICENSES/** folder (`BSD-3-Clause`, `GPL-2.0`) rather than inlining terms — cleaner for tooling (SPDX-style references, GitHub's license detection) that expects a canonical license file per license, not one combined document. *Note: this structure document assumes those two files exist under LICENSES/; they weren't part of this revision's inputs and should be added if they aren't already there — the top-level LICENSE file already references them, so a missing LICENSES/ folder is currently a dangling reference.*
 
 **.github/workflows/data-check.yml** replaces the placeholder `consistency.yml` name from the prior revision with what's actually implemented: three gated jobs (syntax/integrity -> static analysis -> engine build+test), the last of which now runs `cargo build`/`cargo test` against a real `.img`, not `make`.
