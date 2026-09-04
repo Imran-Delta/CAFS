@@ -1,0 +1,26 @@
+# ADR-011: I/O Engine — Rewritten in Rust, Superseding ADR-009
+
+**Status**: Accepted (2026-09-03)
+
+## Context
+
+ADR-009 evaluated Rust I/O crates against the wrong workload category — io_uring wrappers (`rio`, `safer-ring`), suited to high-throughput async I/O, not CAFS V1's synchronous, low-frequency mount lifecycle. Re-evaluated against the right category (safe synchronous syscall wrappers: `rustix`, `nix`) and the mature, official checksum crates now available (`blake3`, `crc32c`, `xxhash-rust`), the calculus changed enough to warrant a full rewrite rather than a going-forward-only policy.
+
+## Decision
+
+The I/O Engine is rewritten in Rust. The C+asm version is retired — its files should be deleted from `Src/FUSE/Linux/x86-64/I-O_Engine/`, along with the now-unnecessary `vendor/blake3/` (BLAKE3 is a normal Cargo dependency now, nothing is vendored).
+
+## Rationale
+
+- **Right-category crate survey found real, mature, permissively-licensed options** where the wrong-category survey hadn't: `rustix` (985M downloads, MIT/Apache-2.0/Apache-2.0-with-LLVM-exception) and the official `blake3`/`crc32c`/`xxhash-rust` crates, versus `rio`'s GPL-3.0 default license and `safer-ring`'s v0.0.1 immaturity.
+- **Concrete upgrades, not just a language change**: `blake3` brings automatic SIMD (the C engine was deliberately software-only); `crc32c` brings hardware acceleration via SSE4.2 (same C limitation fixed); `OwnedFd`'s `Drop` closes the file descriptor automatically — no leak even if a caller forgets to call `close()`, unlike the C version.
+- **A genuine, demonstrated compiler catch during the port**: the first compile attempt rejected simultaneous immutable (whole-`ctx`, for the fd) and mutable (`ctx.superblock`) borrows in `mount()` — an aliasing mistake the C version had no equivalent guard against. Real evidence for the stated thesis (Rust catches a category of bugs C doesn't), not just an assertion.
+- **Equally real evidence for the thesis's limit**: while porting `check()`, the pointer-checksum-algorithm-used value was computed, assigned to a local, and never wired into the result struct — compiled clean, no warning, because it's a logic gap, not a type or borrow error. Only the integration test caught it. This is the *same bug class* found in the *C* version's `pointer_checksum_algo_used` field during that engine's own testing. Direct, repeated evidence that compile-time guarantees and specification/logic correctness are different axes — the switch reduces one category of risk, not all of it, and testing remains load-bearing either way.
+- **Newtype safety, used concretely**: `ByteOffset` is a distinct type from a bare `u64`, specifically to make ADR-010's documented gap (an anchor slot index and a byte offset being interchangeable `uint64_t`s in the C version, `function_table_anchor_lba` holding the former while every sibling field holds the latter) a compile error if reintroduced, not a silent bug waiting to happen again.
+
+## Consequences
+
+- **Positive**: hardware-accelerated checksums, RAII fd management, a newtype that closes off a specific, already-documented bug class, and a test suite ported test-for-test (24 assertions worth of coverage preserved, not narrowed) confirming behavioral parity with the retired C version.
+- **Negative**: discards a working, tested C+asm implementation; the syscall layer's `unsafe` surface isn't zero (one ioctl, `BLKGETSIZE64`, needs it — see ADR-012) — memory safety is improved, not absolute.
+- **Negative**: local verification during this rewrite required pinning `blake3`/`tempfile` to older versions, because the sandbox's only available `rustc` (1.75.0, via `apt`) predates several transitive dependencies' move to the `edition2024` Cargo feature. Not a defect in the decision — a normal toolchain (`rustup`, or this repo's own CI via `dtolnay/rust-toolchain@stable`) doesn't hit it — but worth recording as an MSRV consideration for anyone building this outside CI on an older distribution's packaged Rust.
+- **Mitigation**: the C version's git history (if committed before deletion) remains the reference for behavioral parity; the integration test suite is the actual contract going forward, ported alongside the rewrite specifically so parity is checked, not assumed.

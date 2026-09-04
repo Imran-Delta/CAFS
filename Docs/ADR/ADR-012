@@ -1,0 +1,26 @@
+# ADR-012: I/O Engine — Syscall Foundation: rustix
+
+**Status**: Accepted (2026-09-03)
+
+## Context
+
+ADR-011 committed to Rust; a concrete syscall foundation still had to be picked between the two mature safe options found — `rustix` and `nix` — rather than an arbitrary choice made mid-rewrite.
+
+## Decision
+
+`rustix`, for all device I/O (`open`, `pread`/`pwrite`, `fdatasync`, and the one custom ioctl `BLKGETSIZE64` needs).
+
+## Rationale
+
+- **Architectural alignment with the project's own stated syscall philosophy**: rustix's own documentation describes doing direct syscalls via the `asm!` macro on supported platforms, bypassing libc entirely by default — the same "the kernel syscall is assembly" ethos the retired C engine's hand-written wrappers were built around, now safely wrapped and maintained by the Bytecode Alliance instead of hand-rolled.
+- **Directly comparable real-world precedent**: `libblkio` (a VIRTIO block-I/O library — a block-device-facing systems project of the same shape as this engine) migrated from `nix` to `rustix` specifically to simplify licensing. Not a generic popularity signal; a project solving a closely related problem made the same choice for a reason that transfers directly.
+- **I/O-safety typestate**: `rustix` is built around `OwnedFd`/`AsFd`, which is what makes `CafsCtx::close()`'s RAII fd-closing behavior (ADR-011) straightforward rather than something bolted on.
+- **Verified, not assumed, for the one gap in rustix's API**: it has no named wrapper for `BLKGETSIZE64` (only `BLKSSZGET`/`BLKPBSZGET`). Confirmed by reading rustix 1.1.4's actual source before committing to it, and by test-compiling and running the custom ioctl (via rustix's own generic `Getter<OPCODE, Output>` pattern) against both a real file and a symbolic non-block-device target, confirming it round-trips a real device's size correctly and fails with the semantically correct `ENOTTY` against something that isn't a block device.
+- **`nix` remains a reasonable alternative**, not a rejected option on technical grounds — MIT-only (simpler single license, where rustix is a triple: Apache-2.0, Apache-2.0 WITH LLVM-exception, or MIT), 55M downloads/month, used in 20K+ crates, with its own `ioctl_read!` macro that would have generated an equally usable `BLKGETSIZE64` wrapper (precedented in the `btrfs-uapi` crate). This decision is closer to a coin flip resolved by the `libblkio` precedent and asm-based syscall alignment than a case where `nix` had a real deficiency.
+
+## Consequences
+
+- **Positive**: the engine's entire device-I/O path is now one consistent library, verified end-to-end (open, read, write, sync, and the one ioctl) rather than assumed to work from documentation alone.
+- **Positive**: `unsafe` is isolated to a single, documented block (the `BLKGETSIZE64` ioctl) — everything else in the engine is safe Rust.
+- **Negative**: `nix` was not evaluated to the same depth (no equivalent test-compile against this project's actual ioctl need) — if `rustix` turns out to have a real gap later, that comparison hasn't actually been done yet, only reasoned about.
+- **Mitigation**: low switching cost if this needs revisiting — rustix's usage is confined to a handful of call sites (`mount.rs`, `block_io.rs`, `remount.rs`, `confirm.rs`), not spread throughout the codebase via a leaky abstraction.
