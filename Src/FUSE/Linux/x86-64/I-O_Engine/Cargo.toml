@@ -1,0 +1,44 @@
+[package]
+name = "cafs_io_engine"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "CAFS I/O Engine (V1): anchor mount lifecycle + generic block I/O. FUSE-only, no allocator, no filesystem semantics."
+
+[lib]
+name = "cafs_io"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mkfs_cafs"
+path = "src/bin/mkfs_cafs.rs"
+
+[dependencies]
+# Syscall foundation (ADR-012): direct-syscall backend where available,
+# I/O-safety typestate (OwnedFd/AsFd) throughout, no unsafe needed for
+# anything except the one ioctl rustix doesn't have a named wrapper for
+# (BLKGETSIZE64) — isolated to a single documented unsafe block.
+rustix = { version = "1", features = ["fs"] }
+
+# Official BLAKE3 crate: automatic SIMD + runtime CPU feature detection,
+# same authors as the C reference this engine used to vendor. Pinned to
+# 1.8.2 for local dev in this sandbox only (its apt-provided rustc 1.75
+# can't build 1.8.3+'s transitive deps, which moved to edition2024) —
+# see README's "MSRV note". A normal toolchain (rustup, or this repo's
+# own CI via dtolnay/rust-toolchain@stable) has no reason to need this
+# pin; unpin to "1" once building outside this sandbox.
+blake3 = "=1.8.2"
+
+# Hardware-accelerated (SSE4.2, runtime CPUID) with software fallback.
+crc32c = "0.6"
+
+# xxHash32. License: BSL-1.0 (Boost) — permissive, non-copyleft, but a
+# different license family than the MIT/Apache-2.0 used elsewhere here;
+# noted explicitly rather than lumped in as "just another MIT crate".
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
+
+[dev-dependencies]
+# Pinned for local dev in this sandbox only, same MSRV constraint as
+# blake3 above (newer tempfile pulls getrandom 0.3+/0.4+, which also
+# moved to edition2024). Unpin to "3" outside this sandbox.
+tempfile = "=3.15.0"

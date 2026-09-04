@@ -294,7 +294,7 @@ jobs:
           REPO_ROOT=$(git rev-parse --show-toplevel)
           errors=0
           for dir in $(find Src -name "*.c" -o -name "*.cpp" 2>/dev/null | xargs -n1 dirname | sort -u); do
-            extra_includes="-I$dir -I$REPO_ROOT/Src/vendor/blake3"
+            extra_includes="-I$dir -I$REPO_ROOT/vendor/blake3"
             for f in "$dir"/*.c "$dir"/*.cpp; do
               [ -f "$f" ] || continue
               echo "gcc -Wall -Wextra -std=c11 -D_GNU_SOURCE -fsyntax-only $extra_includes $f"
@@ -384,15 +384,14 @@ jobs:
           fetch-depth: 1
 
       - name: Install build toolchain
-        run: sudo apt-get update && sudo apt-get install -y build-essential
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build and test the I/O Engine (mkfs -> mount -> check -> remount -> confirm on a real .img)
         id: engine-test
         run: |
           cd Src/FUSE/Linux/x86-64/I-O_Engine
-          make clean
-          make all
-          make test
+          cargo build --release
+          cargo test --release
 
       - name: Upload build artifacts
         if: always()
@@ -400,8 +399,8 @@ jobs:
         with:
           name: io-engine-build-${{ github.sha }}
           path: |
-            Src/FUSE/Linux/x86-64/I-O_Engine/libcafs_io.a
-            Src/FUSE/Linux/x86-64/I-O_Engine/mkfs_cafs
+            Src/FUSE/Linux/x86-64/I-O_Engine/target/release/libcafs_io.rlib
+            Src/FUSE/Linux/x86-64/I-O_Engine/target/release/mkfs_cafs
           if-no-files-found: warn
           retention-days: 14
 
@@ -411,7 +410,7 @@ jobs:
           echo "## Stage 3: Engine Build & Image Test" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ steps.engine-test.outcome }}" == "success" ]; then
-            echo "I/O Engine built and \`make test\` (mkfs -> mount -> check -> remount -> confirm, plus the corruption/auto-repair path) passed against a real image." >> $GITHUB_STEP_SUMMARY
+            echo "I/O Engine built and \`cargo test\` (mkfs -> mount -> check -> remount -> confirm, plus the corruption/auto-repair path) passed against a real image." >> $GITHUB_STEP_SUMMARY
           else
             echo "I/O Engine build or test failed — see logs above." >> $GITHUB_STEP_SUMMARY
           fi
