@@ -21,8 +21,10 @@ fn superblock_checksum_ok(sb: &[u8; REAL_BLOCK_4K as usize]) -> bool {
 
 impl CafsCtx {
     pub fn check(&mut self) -> CafsResult<CheckResult> {
-        let mut result = CheckResult::default();
-        result.pointer_checksum_algo_used = Some(self.lba0_algo);
+        let result = CheckResult {
+            pointer_checksum_algo_used: Some(self.lba0_algo),
+            ..Default::default()
+        };
 
         if superblock_checksum_ok(&self.superblock) {
             result.superblock_ok = true;

@@ -32,16 +32,11 @@ use rustix::fd::OwnedFd;
 /// Snapshot per fs.info §5). This engine never reads a host-side
 /// config.fs file itself; the caller resolves args + local config
 /// into this struct before calling [`CafsCtx::remount`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MisalignedAction {
+    #[default]
     Copy,
     Reject,
-}
-
-impl Default for MisalignedAction {
-    fn default() -> Self {
-        MisalignedAction::Copy
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

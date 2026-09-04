@@ -50,7 +50,7 @@ pub(crate) fn write_raw(ctx: &CafsCtx, offset: ByteOffset, buf: &[u8]) -> CafsRe
 }
 
 fn is_aligned(offset: ByteOffset, len: usize) -> bool {
-    offset.0 % ALIGN == 0 && (len as u64) % ALIGN == 0
+    offset.0.is_multiple_of(ALIGN) && (len as u64).is_multiple_of(ALIGN)
 }
 
 impl CafsCtx {
