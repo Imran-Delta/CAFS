@@ -1,0 +1,26 @@
+# ADR-015: Process Architecture — Master/mntproc as Separate Supervised Processes, Housekeeping as Separate Children
+
+**Status**: Accepted (2026-09-04)
+
+## Context
+
+Researched against PostgreSQL's postmaster architecture (one coordinator, fixed background maintenance workers — checkpointer, background writer, WAL writer, autovacuum launcher — plus per-connection backends, all parent-child, all supervised). An earlier framing called the housekeeping tasks (defrag, balance, python/SMART) "coroutines" — corrected: they're dispatched as non-critical *asynchronous tasks*, important but not allowed to take the FUSE processor down if they fail. That correction settles the process-vs-thread question: a crashing thread can take its whole process with it; a crashing process is cleanly reaped by the kernel (`SIGCHLD` to the parent) with everything else untouched. The isolation this design needs only exists at the process boundary.
+
+## Decision
+
+Per mounted partition: one **master** process, parent of one **mntproc** (the FUSE request handler) and of one separate **child process per housekeeping task** (defrag, balance, python/SMART each their own child — not run inline inside master, mirroring how checkpointer/bgwriter/autovacuum-launcher are each separate from postmaster and from each other). Master supervises all of them.
+
+A housekeeping child's failure must not crash mntproc and must not force an fsck. Recovery from a housekeeping task's partial/failed work goes through the WAL's existing revert mechanism, not through filesystem-check.
+
+## Rationale
+
+- **Process, not thread, isolation** is what "failure shouldn't bring the FS down" actually requires — this is why coroutines-as-threads-inside-master was corrected.
+- **Per-task children, not one inline batch inside master**, gets task-vs-task isolation for free in addition to task-vs-mntproc isolation: defrag crashing doesn't take balance down either.
+- **fsck avoidance is the explicit design goal**, not a side effect — an extra fsck after every housekeeping hiccup is "honestly not preferred by anyone." The WAL is the mechanism already present in the design (per fs.info's checksum-failure and recovery sections) capable of reverting partial damage without a full consistency scan, so housekeeping-task failure is scoped to be a WAL-revertible event, not an fsck-triggering one.
+- **Supervision requires parent-child**, per the Postgres precedent (ADR-016 covers the separate question of preventing more than one master per partition).
+
+## Consequences
+
+- **Positive**: a housekeeping task can fail, restart, or be killed without affecting live FUSE I/O or requiring a filesystem-wide consistency check.
+- **Negative**: more processes to supervise than a thread-based design — master's supervision logic (detect a dead child, decide whether/how to restart it, decide when repeated failure means giving up and surfacing an error) is real code that has to exist and be correct, not a simplification deferred to "the OS handles it."
+- **Negative**: WAL-revertibility of housekeeping-task partial work is now a hard requirement, not an assumption — a housekeeping task whose partial state *can't* be cleanly reverted via WAL would violate this ADR's whole premise. Needs to be checked per task (defrag and balance both move data around; either could plausibly leave a state the WAL wasn't designed to revert if not built with this requirement in mind from the start).

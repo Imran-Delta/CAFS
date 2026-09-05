@@ -1,0 +1,24 @@
+# ADR-016: Partition Singleton Locking — flock() Keyed by volume_uuid
+
+**Status**: Accepted (2026-09-04)
+
+## Context
+
+An earlier proposal used "oldest process / lowest PID" to determine which process is master for a partition. Researched against PostgreSQL's actual mechanism: a data directory is protected by a lockfile (`postmaster.pid`), checked and validated at startup, with the OS's own advisory lock as a second line of defense against a stale file from a crashed instance — not PID comparison. PID-based election has two concrete failure modes on the intended target platform: PIDs get reused after wraparound, so "lowest PID" doesn't reliably mean "oldest" once the real oldest process exits; and under PID namespaces (any container runtime — Docker, Podman, systemd-nspawn), raw PID values aren't comparable across processes in different namespaces at all. Separately: no two partitions should ever handle each other's I/O — a `cp`/`mv` between two mounted volumes is not one partition reaching into another's data, the same way one NTFS volume never "handles" a second NTFS volume's partition.
+
+## Decision
+
+`flock()` on a lockfile keyed by the Superblock's `volume_uuid` — not by device path, not by mount point path, not by PID. Whoever holds the lock is master for that partition; the OS releases it automatically if the holder dies.
+
+## Rationale
+
+- **Structural guarantee, not enforced logic**: only one process can hold an exclusive `flock()` on a given file at a time — "one master per partition" falls out of the locking primitive itself rather than needing separate election code to get right.
+- **Automatic crash recovery**: the OS drops the lock when the holding process dies, so a crashed master doesn't need a heartbeat/liveness protocol for another process to safely determine it's gone and take over.
+- **`volume_uuid`, not device path**: device paths shift under controller renumbering (`/dev/sdb1` becoming `/dev/sdc1` across a reboot is common) — locking on the device path could let a partition acquire two different locks across two device enumerations, or fail to recognize it's the same partition it already holds a lock for. `volume_uuid` is stable by construction (it's the Superblock's own identity field) and correctly answers "is this the same partition" regardless of what the OS currently calls the device.
+- **Directly resolves the "partitions don't handle each other's I/O" requirement**: distinct `volume_uuid`s mean distinct lock paths, and a process only ever acquires the lock for the specific partition it's mounting — there's no shared namespace where one partition's master could accidentally acquire authority over another's.
+
+## Consequences
+
+- **Positive**: no election protocol to design, implement, or get wrong; correct behavior under process crashes, container/namespace boundaries, and device renumbering, all as a consequence of using the right primitive rather than three separate fixes.
+- **Negative**: requires a well-known, stable filesystem location to place these lockfiles (e.g. `/run/cafs/<volume_uuid>.lock`) that's writable by whatever's attempting the mount — a small new operational dependency (that directory existing and being writable) that PID comparison didn't have.
+- **Mitigation**: this is a standard, well-understood Unix pattern (single-instance daemons have used lockfile-based mutual exclusion for decades) — not a novel mechanism being introduced, just the correct application of an existing one.

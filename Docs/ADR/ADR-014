@@ -1,0 +1,26 @@
+# ADR-014: Two-Tier Deduplication — File-Level Primary, LBA-Level "CoW Extreme" Fallback
+
+**Status**: Accepted (2026-09-04)
+
+## Context
+
+ADR-013 separated the non-critical speed-index tables from the real dedup mechanism. That real mechanism needed its own decision: where it lives, and how it actually decides what's shareable.
+
+## Decision
+
+The authoritative dedup table lives in the Meta/User Pointer Table (`dedup_table_root_lba`, critical tier, matching the original Global Hash Table format: 8-byte hash + 8-byte location_id + 8-byte offset + 4-byte length + 4-byte refcount, entries with refcount > 1). Deduplication happens in two tiers:
+
+1. **File-level** (primary): whole-file content hash. If two files match, they share underlying storage.
+2. **LBA-level "CoW Extreme"** (fallback): when file-level content doesn't match, individual blocks/extents are still checked and shared at block granularity via a separate hash-of-LBA-contents structure, so two files that mostly differ but share some blocks still get partial storage savings.
+
+## Rationale
+
+- Whole-file dedup is cheap to check and covers the common case (identical files) with one hash comparison.
+- Falling back to block-level matching only when whole-file matching fails avoids paying block-level hashing cost for every file, while still catching partial-overlap cases whole-file hashing would miss entirely.
+- Keeping the authoritative table in the critical tier (Meta/User Table) is consistent with ADR-013's separation: dedup refcounts are correctness-bearing (a wrong refcount means either premature space reclamation of still-referenced data, or a permanent leak) — this cannot be a table the filesystem shrugs off losing.
+
+## Consequences
+
+- **Positive**: catches both the cheap common case and a meaningfully broader set of partial-match cases, at a cost proportional to how often the cheap case fails.
+- **Negative**: two hashing/lookup paths to build and keep correct instead of one; the block-level path's hash-of-LBA-contents structure needs its own consistency story (recomputed on every write to that LBA, or invalidated and lazily recomputed).
+- **Negative**: refcount correctness under concurrent writers is the same hard problem every CoW-with-dedup design has — not solved by this decision, just scoped to where it has to be solved (the critical-tier table, not the speed-index tables).

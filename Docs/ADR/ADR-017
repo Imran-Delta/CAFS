@@ -1,0 +1,30 @@
+# ADR-017: Allocator Mode Toggle — Balance / Performance / Safety, Independent Interfaces
+
+**Status**: Accepted (2026-09-04)
+
+## Context
+
+The Allocator's process architecture (library-linked vs. its own process vs. merged with the I/O Engine) was left open pending research. That research suggested each option's cost centers on cross-process coordination for concurrent access to allocator state, and proposed resolving it with one interface designed to work identically whether calls are local (performance) or IPC-routed (safety) — so the transport could change without the protocol changing. That specific proposal was considered and rejected: forcing one interface shape across all three modes would have constrained performance mode to fit inside whatever safety mode's IPC-oriented protocol needs, which defeats the point of a performance mode existing at all.
+
+## Decision
+
+Three config-toggled modes — **balance**, **performance**, **safety** — each free to have its own interface if it needs one:
+
+- **Safety mode**: sacrifices speed deliberately. Uses IPC and multiple processes specifically so a single critical crash doesn't break the drive for anyone currently writing data, and specifically avoids ever needing fsck.
+- **Performance mode**: gets to be genuinely fast — no protocol constraint inherited from safety mode's IPC design. If it needs a different interface than the other two modes to get that speed, it gets one.
+- **Balance mode**: the next concrete build priority (ahead of both other modes' implementations).
+
+Mode-specific code that differs from the shared baseline lives in its own subfolder under `Allocator/` (e.g. `Allocator/Performance/`), per the repo's shared-code-one-level-up convention applied recursively: shared allocator code sits at `Allocator/`, and each mode's divergent code sits one level below it, the same relationship `Src/` has to `Kernel/`/`FUSE/`.
+
+## Rationale
+
+- **Modularity over forced uniformity**: the repo's own stated design principle ("everything is a folder," shared code one level above its consumers) already implies mode-specific divergence is expected and structurally accounted for — a forced single interface would have fought that principle rather than used it.
+- **Safety mode's whole purpose is the crash/fsck guarantee**, which specifically justifies its performance cost (IPC, multiple processes) — that cost has no reason to also apply to performance mode, which has a different, opposite purpose.
+- **Balance-first sequencing** is the sensible default to actually build against: it's the mode most users will run, and building it first gives performance and safety mode real code to diverge *from* rather than three parallel designs built independently with no shared baseline at all.
+
+## Consequences
+
+- **Positive**: performance mode is not held back by safety mode's transport requirements; each mode can be evaluated and optimized on its own terms.
+- **Negative**: up to three allocator interfaces to maintain instead of one — a bug fix or behavior change discovered in one mode doesn't automatically apply to the others, and needs to be deliberately ported if it should.
+- **Negative**: no shared protocol means no "flip a config flag and the transport changes underneath the same calls" capability — switching a live system between modes (if that's ever wanted) is a heavier operation than a transport swap, closer to a reconfigure-and-restart.
+- **Mitigation**: balance mode being built first, with performance/safety as explicit divergences from it (living in their own subfolders, not parallel from-scratch trees), keeps the three from drifting into three unrelated implementations that happen to share a name.

@@ -1,0 +1,33 @@
+# ADR-013: Global Speed-Index Tables (Non-Critical, Function-Table-Referenced)
+
+**Status**: Accepted (2026-09-04)
+
+## Context
+
+An early proposal ("Global Hash Table") conflated a fast existence-check structure with the dedup table. They're different things with different criticality: dedup is authoritative data (correctness-critical), while a fast lookup index is a performance optimization that the filesystem must survive losing.
+
+## Decision
+
+Three separate tables, non-critical, living in blocks the Function Table points to (alongside M-SMART, WAL, scratch) — not in the Meta/User Pointer Table where critical structures live:
+
+1. **Hash table** — binary, purely existence-check ("does this hash exist?").
+2. **Filename table** — resolves a shared cross-table identifier to a filename.
+3. **LBA table** — resolves the same identifier to an (LBA range, size), and also carries permission data.
+
+All three are keyed off one shared identifier per logical file. If any or all three are missing or corrupt, the filesystem does not crash: the same information is reconstructed by walking the critical Meta/User Table structures directly (which already define which metadata owns which LBA ranges) — slower, but authoritative. These tables are a cache of that lookup, not a replacement for it.
+
+**Invariant**: the shared cross-table identifier must be inode-like — assigned once per logical file, stable across renames, shared across hardlinks, never derived from the filename or from content. If it's derived from either, the hardlink/rename correctness problems this design is meant to avoid come back through the identifier instead of through the table key.
+
+**Corollary**: permission data stored in the LBA table must also exist in the authoritative critical metadata structure (wherever the real inode-equivalent lives), with the LBA table acting as a fast auxiliary index over it — not as the sole location permissions are enforced from. If the LBA table is the only place permissions live, "table missing" means "permissions unenforceable," which can't be an acceptable failure mode for a security-relevant property.
+
+## Rationale
+
+- Separating existence-check/name-resolution/location+permission into three tables, rather than one table wearing multiple hats, avoids the collision hazard a single mixed-key table would have (a content hash colliding in value with a valid LBA, for instance).
+- Placing these under the Function Table (non-critical tier, per ADR-006) rather than the Meta/User Table (critical tier) is a deliberate criticality choice: losing them costs lookup speed, not correctness, provided the fallback path and the permission-duplication corollary both hold.
+
+## Consequences
+
+- **Positive**: a fast path for the common case (existence checks, name resolution, permission checks) without making the filesystem's correctness depend on that fast path being intact.
+- **Negative**: three tables to keep populated and consistent, not one; a bug that updates one but not the others is now possible in a way a single unified structure wouldn't allow.
+- **Negative**: the slow-path fallback (walking critical structures directly) needs to actually be built and kept behaviorally equivalent to the fast path — an easy piece to defer and then discover is missing when the fast path is corrupted for the first time in production.
+- **Mitigation**: the inode-like-identifier invariant and the permission-duplication corollary are both stated explicitly here so they're checked against, not rediscovered later.
