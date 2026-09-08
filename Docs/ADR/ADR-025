@@ -1,0 +1,24 @@
+# ADR-025: Compression — Chunk Size Default, Maximum, and Floor
+
+**Status**: Accepted (2026-09-07)
+
+## Context
+
+Transparent compression wasn't part of Job 1's original scope; raised mid-session with BTRFS's transparent compression as the reference model, initially proposing 64MiB–1GiB chunks. Researched against BTRFS's actual current implementation before committing to a number.
+
+## Decision
+
+The **compression chunk** — the amount of raw data fed to the compressor before writing, distinct from `block_size` (physical geometry) and from a storage extent (one file's contiguous run) — defaults to **128KiB**, matching BTRFS. Config-permitted maximum: **1GiB**, opt-in only, for storage-prioritized use cases explicitly accepting the read-amplification cost. Floor: tied to `block_size`, never below one physical block, since a smaller chunk has no purpose the block granularity doesn't already impose.
+
+A compressed extent requires **two** length fields — physical (compressed, on-disk) and logical (uncompressed) — where an uncompressed extent needs one. This is a structural change to the extent-list entry format (ADR-020) for any file using compression.
+
+## Rationale
+
+- BTRFS's 128KiB default is deliberately small, not arbitrary: it bounds decompression RAM usage and avoids forcing a full-chunk decompress to satisfy one small random read. That reasoning transfers directly and unchanged — there was no project-specific reason found to pick a different number.
+- The 1GiB ceiling is accepted as an explicit, informed tradeoff for a narrow use case (maximum ratio, read-latency-insensitive), not as a recommended value — large chunks and the existing `random` optimization hint are in direct tension.
+
+## Consequences
+
+- **Positive**: a production-validated default rather than an invented one.
+- **Negative**: extent-list entries need a compressed/uncompressed length pair for any compressed file — touches ADR-020's format.
+- **Negative**: no guard yet against combining a large chunk size with the `random` hint, which would defeat the hint's purpose — deferred to Job 2 (config validation rules).

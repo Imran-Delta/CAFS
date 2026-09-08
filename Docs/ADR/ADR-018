@@ -1,0 +1,33 @@
+# ADR-018: Identifier Table — Merged Filename/Extents/Permissions, Direct-Indexed
+
+**Status**: Accepted (2026-09-07)
+
+## Context
+
+ADR-013's original three-table speed-index design (Hash / Filename / LBA+permissions) put filename resolution and LBA+permission resolution in two separate non-critical tables, both keyed by the same shared identifier. Splitting them gained nothing — a row keyed by identifier can hold both without any collision or access-pattern cost — and a separate defect was found independently: no existing structure (Superblock, Function Table, Meta/User Pointer Table) held a pointer to *any* per-identifier metadata table at all. It was being used in worked examples without ever having a home.
+
+## Decision
+
+A single Identifier Table, critical tier, pointed to by a new field (`identifier_table_lba`) in the Meta/User Pointer Table — not the Function Table. Identifiers are assigned as a sequential counter, so the table is direct-indexed: `row_offset = identifier_table_lba + identifier × 40`, no search required. Fixed 40-byte row:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–7 | 8 | filename_blob_offset |
+| 8–15 | 8 | extent_list_offset |
+| 16–19 | 4 | extent_count |
+| 20–31 | 12 | unix_mode + uid + gid |
+| 32–39 | 8 | acl_blob_offset (0 = none) |
+
+Filenames, extent lists, and ACLs (all variable-length) live in a separate blob region, referenced by offset from the fixed row above.
+
+## Rationale
+
+- Direct indexing beats a search structure here specifically because identifiers are assigned sequentially, not sorted-but-arbitrary — this is the one case where array-offset math is strictly faster than any tree.
+- Separating the fixed-width row from variable-length blob content preserves O(1) row access regardless of filename length, extent count, or ACL size.
+- Placement in the Meta/User Pointer Table (not Function Table) is a criticality call, not a convenience one: this is load-bearing namespace data on the same footing as `btree_root_lba`, not a rebuildable cache.
+
+## Consequences
+
+- **Positive**: closes a real orphaned-structure defect (a table with no pointer to it); one table instead of two with no loss of function; O(1) lookup by identifier.
+- **Negative**: deleted files' slots either need reuse or the table only grows over the volume's life — compaction strategy not yet designed, deferred to Job 3.
+- **Negative**: no hard bound yet on blob-region growth per identifier beyond the existing `max_extents_per_file = 1024` cap on extent count.

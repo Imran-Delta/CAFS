@@ -1,0 +1,22 @@
+# ADR-020: Extent-List Storage Model — Contiguous Is Extent_Count = 1, Not a Separate Case
+
+**Status**: Accepted (2026-09-07)
+
+## Context
+
+Early file-topology discussion treated "contiguous" and "fragmented" as two different storage shapes, alongside a linked-list model and a B-tree model. Re-examining against what's actually already decided: `max_extents_per_file = 1024` in `config.fs` already assumes every file is described as a bounded array of extents, and nothing in `fs.info` implies a linked-list-per-block layout. A contiguous file is trivially expressible as an extent array with one entry.
+
+## Decision
+
+There is no separate "contiguous" storage type. Every file — one unbroken run or many — is described by the same mechanism: `extent_list_offset` + `extent_count` (ADR-018) pointing at an ordered array of `(start_lba, length)` pairs. A contiguous file has `extent_count = 1`. Fragmented files have more, read in stored order.
+
+## Rationale
+
+- One code path handles both cases; nothing needs to branch on "is this file contiguous."
+- Costs nothing extra for the common contiguous case — one 16-byte entry is exactly what would be needed to record `(start, length)` regardless.
+- A linked-list-per-block layout, occasionally used elsewhere for allocation-time simplicity, was considered and rejected: nothing in the existing spec implies it, and it doesn't fit the already-locked `max_extents_per_file` bound.
+
+## Consequences
+
+- **Positive**: uniform representation; a worked example (5-extent 60GiB file on a 200GiB volume, full cold-read trace) confirmed the mechanism holds for genuinely fragmented, large-scale cases.
+- **Negative**: `max_extents_per_file = 1024` is a hard ceiling under this model. A workload that fragments a single file beyond 1024 extents (heavy random-write CoW churn without defrag) has no fallback under this ADR — defrag becomes load-bearing for such files, not optional.

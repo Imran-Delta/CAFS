@@ -1,0 +1,21 @@
+# ADR-021: Zone Table Redefined — Free/Health Scoreboard, Not a Reverse-Ownership Index
+
+**Status**: Accepted (2026-09-07)
+
+## Context
+
+A reverse "who owns LBA X" lookup was initially proposed as an extension to the Zone Table, to answer how the filesystem prevents a write from landing in the middle of an existing file's data. ADR-022 (this set) establishes that no such reverse index is actually needed — which left the Zone Table's actual purpose undefined again, needing to be reconnected to what it was always meant to do.
+
+## Decision
+
+The Zone Table divides the drive into large fixed-size regions ("zones" — exact size not yet fixed, candidate range a few GiB). Per zone, it stores a free-space summary and a health indicator derived from SMART data. It carries **no** per-block ownership field. It is consumed by the allocator (choosing where new writes should land) and by the balance routine (deciding when to migrate data between zones).
+
+## Rationale
+
+- Directly matches the project's stated goal of health-aware allocation: the allocator needs a cheap way to ask "which zone is roomy *and* healthy" without scanning fine-grained free/used state across the whole drive.
+- Reverses a proposal made earlier in the same session (extending Zone Table with an owner field) once ADR-022 established that proposal solved a problem that doesn't exist under the allocator-as-gatekeeper model.
+
+## Consequences
+
+- **Positive**: stays small and cheap regardless of file count — scales with number of zones, not number of files or blocks.
+- **Negative**: zone size, exact per-zone field widths, and how "health" gets derived from SMART data are all still open — deferred to Job 3 (allocation strategy).
