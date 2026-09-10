@@ -1,10 +1,49 @@
 # =================================================================
-# CAFS CONFIGURATION PARAMETERS (v19 – format version 4)
+# CAFS CONFIGURATION PARAMETERS (v21 – format version 6)
 # =================================================================
 # This file contains all user- and administrator-facing settings.
 # For on-disk layout, binary structures, and atomic protocols,
 # see fs.info. The Config Snapshot in LBA1 is this file, verbatim,
 # minus [mount_hints] — see fs.info Section 5.
+#
+# CHANGES FROM v20 (format_version 5 -> 6 — B-tree byte layout
+# resolved, Superblock gains a namespace-structure selector field.
+# See ADR-034 through ADR-039 and JOB3-OVERVIEW):
+#   - [smart]: new section. report_interval_seconds governs ONLY the
+#     user-facing --type=smart health report; --type=avg/--type=trends
+#     feed the allocator directly and are not exposed here (ADR-038)
+#   - [scrub]: new section. full_drive_scan_preference, default
+#     "monthly" — piggyback checking (on blocks balance/defrag already
+#     touch) is always on and not a setting; this governs only the
+#     dedicated full-volume pass on top of that (ADR-035)
+#   - [hash_daemon]: new section. min/max interval bounds only — the
+#     live value is runtime state, not a config field (ADR-037)
+#   - Scheduling is deliberately NOT one unified preference type: see
+#     ADR-036 for why tier-enum / numeric-seconds / dynamic-runtime /
+#     idle-triggered are kept as four separate shapes
+#
+# CHANGES FROM v19 (format_version 4 -> 5 — new critical-tier
+# structures added: Identifier Table, Snapshot Table, per-block
+# refcount in place of the old free/used bit. See ADR-018, 021,
+# 029, 030 and STRUCTURE-OVERVIEW):
+#   - [cow]: clarified as a whole-partition toggle (ADR-031),
+#     replacing the previously undocumented default_mode integer
+#   - new [hash_table] section: the ADR-013/023 speed-index cache
+#     (off / file / lba), distinct from [dedup]/[dedup_table] below,
+#     which govern the authoritative critical-tier structure
+#   - new [snapshot] section (ADR-030): toggle, tiered retention,
+#     space cap
+#   - [data]: added compression_chunk_size / compression_chunk_max
+#     / compression_chunk_min (ADR-025); raw files are never
+#     eligible regardless of this section's settings (ADR-027)
+#   - [dedup]: removed skip_dedup_for_raw — this was a runtime bool
+#     implying raw+dedup could be enabled together. It can't: raw is
+#     a composite flag that structurally excludes dedup participation
+#     (ADR-027), not a separate togglable interaction
+#   - [optimization]: flags comment corrected to include sync and
+#     append_only, which examples already used but the declared list
+#     omitted; flags documented as two independent categories
+#     (structural / hint) rather than one list, per ADR-026
 #
 # CHANGES FROM v14:
 #   - format_version: 3 -> 4 (matches fs.info Superblock)
@@ -47,7 +86,7 @@
 # =================================================================
 
 [identity]
-format_version = 4
+format_version = 6
 volume_uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 uuid_sequence = 0
 config_generation = 0
@@ -125,6 +164,15 @@ min_fill_percent = 40
 compression_algo = "zstd"      # "none", "zstd", "lz4"
 compression_level = 3
 min_compression_ratio = 0.95
+
+# Compression chunk: amount of raw data fed to the compressor at once.
+# Distinct from [physical].block_size (physical geometry) and from a
+# storage extent (one file's contiguous run). See ADR-025.
+compression_chunk_size = "128KB"   # default, matches BTRFS precedent
+compression_chunk_max = "1GB"      # opt-in ceiling; read-amplification
+                                    # cost rises sharply above the default
+compression_chunk_min = 0          # 0 = floor to [physical].block_size
+
 max_extents_per_file = 1024
 max_file_size = 0              # 0 = unlimited (no enforced boundary)
 preallocation_hint = "never"
@@ -136,7 +184,17 @@ raw_mode_priority = true
 # =================================================================
 
 [cow]
-default_mode = 1
+# Whole-partition toggle (ADR-031). Not BTRFS's default appeal here —
+# an optional feature, off by default. Safe to change during usage:
+# this sets the default for newly-created files/extents only, never
+# retroactive (ADR-032). Disabling this also disables [snapshot] below
+# — snapshots have no mechanism to retain anything without CoW.
+enabled = false
+
+# Independent of the toggle above: a block whose refcount is currently
+# above 1 (shared, via dedup or a snapshot hold) is always force-CoW'd
+# on write, regardless of this setting. Not optional — writing a
+# shared block in place would corrupt every other reference to it.
 
 # =================================================================
 # SECTION: WAL (CRASH-CRITICAL – STORED IN LBA2)
@@ -204,7 +262,58 @@ verbose_logging = true
 cooldown_seconds = 120         # 2 minutes; prevents rapid toggling
 
 # =================================================================
+# SECTION: SMART (RUNTIME ONLY – NOT IN LBA2)
+# =================================================================
+# Governs only the human-facing health report (smart_handler.py
+# --type=smart). --type=avg (hourly aggregator) and --type=trends
+# (the allocator's health/degradation signal) feed the allocator
+# directly and are NOT exposed here — their cadence is internal to
+# the filesystem's own cycle, not a user setting (ADR-038).
+# =================================================================
+
+[smart]
+# Ceiling: must stay <= 3600. Tied to --type=avg's hourly bucket
+# boundary (ADR-003) — a longer interval risks reading a health
+# score computed against a bucket that already rolled over.
+report_interval_seconds = 3600
+
+# =================================================================
+# SECTION: SCRUB (RUNTIME ONLY – NOT IN LBA2)
+# =================================================================
+# Piggyback checking (verifying the checksum trailer on blocks
+# balance/defrag already touch) is always on and not a setting here
+# — it costs nothing beyond CPU on I/O that was happening anyway.
+# This section governs only the dedicated full-volume pass on top
+# of that, which exists specifically to cover cold data the
+# piggyback approach would never reach (ADR-035).
+# =================================================================
+
+[scrub]
+# off / hourly / daily / weekly / monthly / yearly — shared tier
+# type, same as [snapshot]'s retention tiers (ADR-036).
+full_drive_scan_preference = "monthly"
+
+# =================================================================
+# SECTION: HASH DAEMON (RUNTIME ONLY – NOT IN LBA2)
+# =================================================================
+# Bounds only — the live interval is runtime state, floating
+# between these based on load and priority-elevation requests, not
+# a fixed value read from this file (ADR-037).
+# =================================================================
+
+[hash_daemon]
+hash_daemon_min_interval_seconds = 0.25
+hash_daemon_max_interval_seconds = 15.0
+
+# =================================================================
 # SECTION: DEDUP (MOSTLY RUNTIME - algo is CRASH-CRITICAL, see below)
+# =================================================================
+# Governs the authoritative, critical-tier Dedup Table (ADR-014,
+# bucket layout in [dedup_table] below). For the non-critical
+# speed-index cache over this table, see [hash_table].
+# raw files never participate — this is structural (ADR-027), not a
+# separate toggle here (the old skip_dedup_for_raw bool implied it
+# could be turned off independently, which isn't actually possible).
 # =================================================================
 
 [dedup]
@@ -213,7 +322,28 @@ algo = "blake3"                        # CRASH-CRITICAL (in LBA2) - immutable, f
 min_file_size_for_dedup = "64KB"       # RUNTIME ONLY (not in LBA2)
 scan_interval_seconds = 3600           # RUNTIME ONLY (not in LBA2)
 max_ram_table_mb = 512                 # RUNTIME ONLY (not in LBA2)
-skip_dedup_for_raw = true              # RUNTIME ONLY (not in LBA2)
+
+# =================================================================
+# SECTION: HASH TABLE (RUNTIME ONLY – NOT IN LBA2)
+# =================================================================
+# Non-critical speed-index cache (ADR-013, redesigned ADR-023).
+# Existence-check only, over the authoritative [dedup] table above.
+# Losing it costs lookup speed, never correctness — the fallback is
+# walking the Dedup Table directly.
+# =================================================================
+
+[hash_table]
+# "off" / "file" (whole-file hash) / "lba" (per-block hash).
+# Mutually exclusive: "lba" mode's detection coverage is a strict
+# superset of "file" mode's, so running both is never useful.
+mode = "off"
+
+# Fixed at 256 bits, unfolded. Unlike a corruption checksum (where a
+# collision between two unrelated blocks is harmless, since it's
+# never compared cross-block), a collision here risks treating two
+# different pieces of data as share-candidates — correctness-adjacent,
+# not tolerable, so this width is never reduced. Not configurable.
+# width_bits = 256   (informational — not a real toggle, see ADR-023)
 
 # =================================================================
 # SECTION: DEFRAG (RUNTIME ONLY – NOT IN LBA2)
@@ -284,6 +414,43 @@ checkpoint_interval_blocks = 1000
 [relocation_log]
 max_intents = 1000
 abort_on_log_corruption = false
+
+# =================================================================
+# SECTION: SNAPSHOT (CRASH-CRITICAL – STORED IN LBA2)
+# =================================================================
+# Whole-volume only for V1 — no subvolume concept (ADR-030). Requires
+# [cow].enabled = true; there is nothing for a snapshot to retain
+# without it. Layered policy, validated against real-world precedent
+# (Snapper) rather than a single knob — all four axes are independent.
+# =================================================================
+
+[snapshot]
+enabled = false
+
+# Automatic schedule, tiered retention count per tier (0 = disabled
+# for that tier). Pruned oldest-first within each tier.
+timeline_enabled = false
+limit_hourly = 0
+limit_daily = 0
+limit_weekly = 0
+limit_monthly = 0
+limit_yearly = 0
+
+# Space-based cap, independent of count/age. Fraction of the volume
+# snapshots may consume in total before oldest-first pruning kicks
+# in regardless of the timeline limits above. Reads free-space state
+# from the Zone Table, not separate accounting.
+space_limit_fraction = 0.5
+
+# Policy when a volume-wide snapshot encounters a raw file (ADR-027),
+# which cannot be protected (no CoW, nothing for the snapshot to
+# retain). "skip" silently omits it (dangerous default — a later
+# restore may assume protection that was never there), "warn" skips
+# and logs, "block" refuses to take the snapshot at all.
+raw_file_policy = "warn"     # OPEN — not yet decided, provisional
+
+# Manual, on-demand snapshots are always available when enabled = true,
+# regardless of timeline_enabled — no separate flag needed for this.
 
 # =================================================================
 # SECTION: DEDUP TABLE (CRASH-CRITICAL – STORED IN LBA2)
@@ -429,8 +596,32 @@ delayed_allocation_conflict_default = "off"   # "on" or "off"
 # =================================================================
 
 [optimization]
-# Default flags for new directories
-# Flags: hash, extent, btree, sequential, random, journal, read, write, raw
+# Two independent categories (ADR-026), not one flat list — the
+# previous "Flags:" comment omitted sync/append_only despite examples
+# below already using both.
+#
+# Structural (mutually exclusive, picks the on-disk storage shape,
+# ADR-018/019/020): extent, btree
+#
+# Hint (freely combinable, runtime behavior only, no shape change):
+# sequential, random, journal, read, write, raw, hash, sync,
+# append_only
+#
+# "hash" is a hint, not structural — it's the per-file/per-directory
+# participation switch for [hash_table] above, which is why it
+# legitimately combines with either extent or btree in the examples
+# below rather than being a third structural option.
+#
+# "raw" is a composite (ADR-027): setting it forces no-CoW, no-hash,
+# not-compression-eligible, and full upfront allocation as one bundle
+# — it is not an independently combinable peer of the other hints,
+# and the invalid combinations (raw+hash, raw+compression, raw+
+# snapshot-protection) can't be expressed rather than needing
+# validation against them.
+#
+# "append_only" is the honest, narrow POSIX meaning only (write-
+# position gate) — the retention behavior originally wanted under
+# this name is provided by [snapshot] above instead (ADR-030).
 dir_default_flags = "hash|extent"
 
 # Default flags for new files

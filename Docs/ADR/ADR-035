@@ -1,0 +1,25 @@
+# ADR-035: Zone Table's Second Responsibility — Integrity Signal Aggregation
+
+**Status**: Accepted (2026-09-09)
+
+## Context
+
+Raised as "should Zone Table also handle integrity checking." Every block already carries a mandatory 16-byte checksum trailer (Section 15a) regardless of this decision — the open question was whether *verifying* it proactively (rather than only incidentally, when something happens to read a block for an unrelated reason) needed new infrastructure, and if so, where it lives and on what schedule.
+
+## Decision
+
+Zone Table's per-zone health field (ADR-021, currently fed by SMART) gains a second input: a **scrub**, piggybacked onto blocks that balance/defrag already touch for their own reasons, rather than a dedicated process competing for its own I/O budget. A checksum failure found this way feeds the same health field SMART already populates — one number, two sources, not a second parallel "is this zone trustworthy" signal living elsewhere.
+
+A dedicated, opt-in full-volume pass exists on top of the piggyback baseline, specifically to cover cold data the piggyback approach would never reach (balance/defrag have no reason to touch a file nobody's rewriting or fragmenting): `[scrub].full_drive_scan_preference`, default **on**, tier **monthly** — using the shared cadence-tier type (ADR-036).
+
+## Rationale
+
+- No new structure or process needed: detection is free (the checksum trailer already exists unconditionally; a scrub is just a proactive *read* of something already there), and repair is bounded by ADR-006 regardless (Superblock/SMART have a real backup to repair from; everything else can be flagged, not fixed, same as any other checksum failure).
+- Piggybacking avoids a dedicated scan competing with ordinary I/O for bandwidth, at the cost of opportunistic (not guaranteed) coverage — which is exactly the gap the monthly full-pass exists to close.
+- Default-on for the full pass, not default-off: there's no storage tradeoff to weigh (detection has no space cost), only a scheduling one, and cold data going unchecked indefinitely is arguably the scenario most worth catching.
+
+## Consequences
+
+- **Positive**: zero new on-disk structures; reuses an existing field for a second, complementary purpose rather than duplicating it.
+- **Positive**: default-on monthly full-pass closes the one real gap (cold data) the free piggyback approach leaves open.
+- **Negative**: a corruption found via scrub is detected, not repaired, for every structure except Superblock and SMART — same limit ADR-006 already accepted, now surfaced through a new detection path rather than a new limitation.

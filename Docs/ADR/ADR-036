@@ -1,0 +1,31 @@
+# ADR-036: Scheduling/Preference System — Four Distinct Shapes, Not One Unified Type
+
+**Status**: Accepted (2026-09-09)
+
+## Context
+
+Multiple routine handlers (Hash Daemon, SMART Handler, defrag/balance, scrub) each have a genuinely different scheduling need, raised together as "a variable system for more toggles." Tempting to build one shared preference type covering all of them, following the same instinct that generalized snapshot retention's tier system a few turns earlier — considered and rejected once the Hash Daemon's actual requirement (sub-second, runtime-adjustable) was examined next to the others.
+
+## Decision
+
+Four distinct shapes, each kept in its own lane rather than forced into a shared type:
+
+| Shape | Used by | Mechanism |
+|---|---|---|
+| Coarse named tiers (`off`/`hourly`/`daily`/`weekly`/`monthly`/`yearly`) | Snapshot retention (ADR-030), full-drive scan (ADR-035) | Shared enum type |
+| Fixed numeric seconds | `--type=smart`'s user-facing cadence (ADR-038) | Plain config field, capped, deliberately not part of the tier enum |
+| Dynamic, runtime-adjustable, sub-second | Hash Daemon (ADR-037) | Not a config value — runtime state, bounded by config min/max |
+| Condition-triggered + starvation ceiling | Defrag/balance | Already-existing `[idle_detection]` / `[background].priority_order` — unchanged |
+
+This **corrects a suggestion made earlier the same session** (folding `[dedup].scan_interval_seconds`-style fields into the tier enum) — seeing the Hash Daemon's requirement made clear that a named-tier enum can't express "0.25 seconds" any better than it can express "every 3600 seconds," and stretching one type to cover both would produce a worse fit than two honestly-scoped types.
+
+## Rationale
+
+- Each shape corresponds to a genuinely different *kind* of question — "which infrequent tier" (a human preference), "how many seconds" (a fixed operational cadence), "what's the current interval" (live system state), "is a condition currently true, with a backstop" (event-driven, not time-driven) — and a type that tried to answer all four would either be too coarse for some or too permissive for others.
+- Reuses what already exists rather than inventing redundantly: the idle-triggered shape was already built (`[idle_detection]`), the tier enum was already built (this session, snapshot retention) — only the numeric-seconds and dynamic-runtime shapes needed anything new, and both are narrow, single-purpose additions.
+
+## Consequences
+
+- **Positive**: each scheduling field reads as exactly what it is, rather than a generic "preference" value whose actual meaning depends on which feature it's attached to.
+- **Positive**: corrects a real, if minor, mistake before it propagated further — the scan_interval_seconds-folding suggestion was never implemented, so nothing needs unwinding.
+- **Negative**: four shapes means four things to document and explain, instead of one — a genuine cost, accepted because the alternative (one shape, badly fitting three of the four cases) is worse.

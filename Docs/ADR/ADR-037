@@ -1,0 +1,30 @@
+# ADR-037: Hash Daemon — Dynamic Interval via Timeout-Based Socket Wait
+
+**Status**: Accepted (2026-09-09)
+
+## Context
+
+The Hash Daemon (Python, socket-based, feeding the Hash Table per ADR-023) needs to run near-continuously at a low sleep interval, with the ability to snap to a much tighter interval (0.25–0.5s, from a baseline of 1–15s) during priority elevation. `time.sleep(N)` was the first instinct and was found unworkable: it blocks for the full duration of `N` with nothing able to shorten an in-progress call, so a priority-elevation request arriving mid-sleep would have to wait out whatever sleep was already running before taking effect.
+
+## Decision
+
+The daemon's main loop blocks on its own socket **with a timeout**, using `selectors` (or `asyncio` if concurrent request handling becomes a real need later) rather than `time.sleep()`:
+
+- Timeout expiry triggers the periodic hash-building work.
+- Socket activity (an incoming request, or a priority-elevation control message) triggers request handling instead.
+- The current interval is re-read fresh on every loop iteration, so a change takes effect on the next pass rather than after whatever wait was already in progress.
+
+A priority-elevation request arrives as a message on the same socket the daemon already listens on — no second signaling channel needed, since the socket wait already wakes immediately on any activity.
+
+`config.fs` gains bounds, not the live value itself: `hash_daemon_min_interval_seconds` / `hash_daemon_max_interval_seconds`. The actual current interval is runtime state that floats between them based on load and elevation requests, not a fixed setting read once at startup.
+
+## Rationale
+
+- The daemon already needed to listen on a socket for its actual job (answering hash queries) — using that same wait for scheduling means one mechanism does both jobs, rather than a separate sleep loop plus separate socket-polling logic running alongside it.
+- Re-reading the interval every loop iteration, rather than capturing it once, is what makes the change "take effect on the next pass" true rather than aspirational — a value captured once at loop start and never re-checked would have the same staleness problem as `time.sleep()`, just with a different root cause.
+
+## Consequences
+
+- **Positive**: near-instant responsiveness to priority elevation (bounded by however fast the control message propagates, not by whatever interval happened to be in progress).
+- **Positive**: no new dependency — `selectors` is standard library, consistent with ADR-004's no-new-dependency embedded-Python approach.
+- **Negative**: the live interval is genuinely runtime state, not a value visible in `config.fs` — anything wanting to observe or log the daemon's current interval needs its own mechanism (not decided here).

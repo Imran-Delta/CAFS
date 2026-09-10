@@ -1,0 +1,729 @@
+{
+  "adrs": [
+    {
+      "id": "ADR-001",
+      "title": "SMART Handler — Python vs. C",
+      "status": "Accepted",
+      "date": "2026-08-31",
+      "context": "The CAFS SMART system requires periodic analysis of drive health counters to provide health scores, trend detection, and recommendations to the Allocator. The analysis involves mathematical computations (error ratios, variance, trend detection) that are not time-critical. Two implementation paths were considered: (1) Pure C: all logic in C, integrated directly into the mntproc. (2) Python: logic in a Python script called by the mntproc.",
+      "decision": "The SMART Handler will be implemented in Python and called by the C mntproc via stdin/stdout pipes.",
+      "rationale": [
+        "Iteration speed: Python allows rapid experimentation with health formulas without recompiling the entire filesystem.",
+        "Reduced complexity: the C code remains focused on I/O, locking, and crash-safe flush coordination.",
+        "Development velocity: Python's native JSON support, math libraries, and debugging tools reduce development overhead.",
+        "Separation of concerns: C owns the critical path (I/O, locking, persistence). Python owns analytics."
+      ],
+      "consequences": [
+        "Positive: faster development cycle; C code stays lean.",
+        "Negative: Python interpreter adds ~15MB to binary size (acceptable).",
+        "Negative: Python call adds process spawn overhead (every 60 seconds — acceptable).",
+        "Mitigation: embedded Python interpreter is optional at compile time (--exclude=pyi)."
+      ]
+    },
+    {
+      "id": "ADR-002",
+      "title": "SMART Flush — Crash-Safe Order",
+      "status": "Accepted",
+      "date": "2026-08-31",
+      "context": "SMART counters are updated on every I/O. They must be persisted to disk in a crash-safe manner to avoid losing health data during power failure. The flush path must guarantee that: no data is lost beyond the flush window; the system can recover on mount; the WAL provides atomicity.",
+      "decision": "Flush order: V-SMART -> Cache SMART -> B-SMART -> WAL -> M-SMART.\n1. Lock V-SMART (RAM)\n2. Read diffs\n3. Clear V-SMART\n4. Unlock V-SMART\n5. Build ANCHOR_DIFF WAL entry\n6. Write Cache SMART -> fsync()\n7. Write B-SMART -> fsync()\n8. Append WAL entry -> fsync()\n9. Mark WAL entry as committed",
+      "rationale": [
+        "WAL is the source of truth: M-SMART is updated via WAL replay, guaranteeing atomicity.",
+        "Redundancy: B-SMART provides a backup if M-SMART is corrupt.",
+        "Recovery: on mount, the system checks M-SMART -> B-SMART -> Cache SMART -> WAL."
+      ],
+      "consequences": [
+        "Positive: crash-safe; mount recovery is deterministic.",
+        "Positive: no data loss beyond the 60-second flush window.",
+        "Negative: extra write to Cache SMART adds overhead (but flush runs every 60 seconds).",
+        "Mitigation: flush threshold (1024 updates) triggers early flush under heavy load."
+      ]
+    },
+    {
+      "id": "ADR-003",
+      "title": "SMART Bucket System — Sufficient Statistics",
+      "status": "Accepted",
+      "date": "2026-08-31",
+      "context": "To detect trends (degrading vs. stable health), the system needs historical context. Storing every SMART sample is infeasible (too much data). A simple average loses variance, min, max, and distribution information. A method was needed to compress historical data without losing mathematical accuracy for aggregate statistics.",
+      "decision": "Store buckets using sufficient statistics: (count, sum, sum_sq, min, max) for each health-relevant metric. Each bucket represents a time window (default: 1 hour). The system maintains up to 24 buckets (23 full + 1 partial), giving 24 hours of history.",
+      "rationale": [
+        "Mathematical accuracy: average, variance, min, max can be perfectly reconstructed across any number of buckets.",
+        "Compression: 24 buckets x ~7 metrics x 5 stats = ~2KB of memory.",
+        "No data loss for aggregation: combining buckets is a simple sum of counts, sums, sum_sq, min, max."
+      ],
+      "consequences": [
+        "Positive: low memory footprint (~2KB for 24 buckets).",
+        "Positive: variance and trend detection are possible.",
+        "Negative: loss of point-in-time auditing (can't ask \"what was the exact value at 2:15 AM?\").",
+        "Mitigation: point-in-time auditing is not required for CAFS's health monitoring."
+      ]
+    },
+    {
+      "id": "ADR-004",
+      "title": "Python Integration — Embedded Interpreter",
+      "status": "Accepted",
+      "date": "2026-08-31",
+      "context": "The SMART Handler is implemented in Python. The system must support Python execution on all target platforms (Linux x86_64, Linux i686, Windows x86_64, Windows i686) without requiring the user to install Python. Two approaches were considered: (1) System Python: rely on python3 being installed on the system. (2) Embedded Python: bundle the Python interpreter into the CAFS binary.",
+      "decision": "Embed Python interpreter into the CAFS binary. Provide a compile-time option (--exclude=pyi) to use system Python instead.",
+      "rationale": [
+        "No external dependencies: user doesn't need to install Python.",
+        "Works out-of-the-box: all platforms supported.",
+        "Optional fallback: --exclude=pyi allows system Python for users who want smaller binaries."
+      ],
+      "consequences": [
+        "Positive: no Python installation required.",
+        "Positive: cross-platform compatibility guaranteed.",
+        "Negative: binary size increases by ~15MB (acceptable).",
+        "Mitigation: --exclude=pyi flag reduces binary size to ~2MB for users who don't need Python."
+      ]
+    },
+    {
+      "id": "ADR-005",
+      "title": "SMART Tables — Hierarchy and Redundancy",
+      "status": "Accepted",
+      "date": "2026-08-31",
+      "context": "SMART counters are written by the I/O Engine on every I/O. They must be stored persistently, with redundancy and crash recovery.",
+      "decision": "Four SMART tables in a hierarchy: V-SMART (RAM, volatile — I/O Engine increments on every I/O), Cache SMART (on-disk staging — batch accumulation before final flush), B-SMART (on-disk backup — redundant copy at end of drive), M-SMART (on-disk main — authoritative source of truth).",
+      "rationale": [
+        "Redundancy: B-SMART provides fallback if M-SMART is corrupt.",
+        "Crash recovery: recovery checks M -> B -> Cache -> WAL.",
+        "Performance: V-SMART is RAM-based for fast I/O increments.",
+        "Batch efficiency: Cache SMART allows batch accumulation before flushing to B-SMART/M-SMART."
+      ],
+      "consequences": [
+        "Positive: crash-safe; redundancy prevents data loss.",
+        "Positive: performance (V-SMART is RAM-based).",
+        "Negative: four tables increase complexity.",
+        "Mitigation: the hierarchy is well-defined and documented in fs.info."
+      ]
+    },
+    {
+      "id": "ADR-006",
+      "title": "I/O Engine — Anchor Redundancy Scope (Superblock + SMART Only)",
+      "status": "Accepted",
+      "date": "2026-09-03",
+      "context": "fs.info's original anchor design (Sec.12) mirrors all six LBA0-5 pointer blocks at the end of the device, giving every anchor real structure — Superblock, Config Snapshot, Parity Block, Meta/User Pointer Table, Function Table — a distinct backup copy. Every anchor write potentially touches five backup structures in addition to the primary, and keeping them in sync adds torn-write surface without a correspondingly large safety gain: most of those structures are either reconstructable another way (Config Snapshot, via Parity XOR against Superblock) or hold pointers/metadata whose loss doesn't prevent mounting (Function Table, Meta/User Table).",
+      "decision": "End-of-device redundancy is kept only for the Superblock and the SMART tables (M-SMART/B-SMART). Config Snapshot, Parity Block, Function Table, and Meta/User Pointer Table have exactly one on-disk copy each — no distinct backup content, no end-of-device mirror of their own bytes. The end-of-device anchor region (LBA0-5 mirrored) still exists as a structural pointer-recovery mechanism: LBA0 and LBA3 at the tail point back to the same single Superblock and same single Meta/User Table as the head copies; only Superblock (LBA0) is cross-linked with a genuine second copy (Superblock Backup), reachable identically from either end. LBA1/2/4 fallback pointer fields are unused — there is no second copy for them to reference.",
+      "rationale": [
+        "Write amplification: every anchor update under the full-mirror design touched up to 6 structures; under this design, at most 2 (Superblock + its backup).",
+        "Torn-write surface: fewer structures to keep synchronized means fewer partial-update states a crash can leave behind.",
+        "Selective value: Config Snapshot stays indirectly recoverable via Parity XOR Superblock even with no direct backup. Function Table and Meta/User Table hold pointers/metadata, not data the filesystem can't function without — losing either costs discoverability (WAL, SMART, Zone Table locations), not the ability to mount.",
+        "Superblock and SMART are different: Superblock gates every mount (nothing proceeds without it); SMART is the ongoing health signal the Allocator consumes continuously. Both justify the redundancy cost the others don't."
+      ],
+      "consequences": [
+        "Positive: significantly less write amplification per anchor update; smaller crash-window.",
+        "Positive: matches what's implemented in the I/O Engine V1 today, exactly (check() only ever repairs Superblock; there's no \"Backup Parity Block\" concept in the codebase).",
+        "Negative: Function Table and Meta/User Table now have zero redundancy — a checksum failure on either is unrecoverable data loss for that structure specifically.",
+        "Mitigation: consistent with the project's existing \"won't die easily\" floor — the filesystem stays mountable and metadata-consistent even when some data is unrecoverable; this just extends that floor to two more structures that were never load-bearing for mount itself.",
+        "Amendment (2026-09-06): fs.info Sec.12/Sec.17b, which described distinct Config Snapshot Backup / Meta-User Table Backup / Function Table Backup / Backup Parity Block structures, contradicted this ADR and were never authoritative. Corrected: the end-of-device anchor mirror is a pointer-recovery structure only, not a second copy of the real structures it points to (except Superblock, per the cross-linking above)."
+      ]
+    },
+    {
+      "id": "ADR-007",
+      "title": "I/O Engine — V1 Scope: Superblock-Only Verification and Repair",
+      "status": "Accepted",
+      "date": "2026-09-03",
+      "context": "The full mount pipeline (mount -> check -> remount -> confirm) needs to exist before any of it can be tested against real hardware or even a real image file. Building complete verification and auto-repair logic for every anchor structure (Config Snapshot, Parity, Function Table) before a single read/write path has been proven working risks a large amount of untested code accumulating at once.",
+      "decision": "For V1, check() verifies and — when foreseeable and safe (mount is writable, a valid backup exists) — repairs only the Superblock. Config Snapshot, Parity Block, and Function Table are read at mount time but their checksums are neither verified nor acted on.",
+      "rationale": [
+        "Proof of concept first: get mount/check/remount/confirm and raw read/write working end to end against a real image before adding verification breadth.",
+        "Superblock is the one structure that's load-bearing for every other step: function_table_anchor_lba, checksum algorithm IDs, and config discovery all originate from it. Nothing else in the pipeline can proceed meaningfully if it's wrong.",
+        "The other three don't gate anything yet: Config Snapshot parsing, Parity reconstruction, and Function Table's WAL/SMART pointers aren't consumed by any code path this version actually exercises."
+      ],
+      "consequences": [
+        "Positive: a small, fully tested, fully working core (24/24 assertions passing against mkfs_cafs-produced images, including the corruption/auto-repair path) exists to build on.",
+        "Negative: a corrupted Config Snapshot, Parity Block, or Function Table currently goes undetected — check() reports overall status based on Superblock alone.",
+        "Mitigation: explicitly documented as a scope cut in the engine's README, not a silent gap; extending check() to the other three structures (verify-only for Function Table/Meta Table, XOR-reconstruct for Config Snapshot) is described there as known future work."
+      ]
+    },
+    {
+      "id": "ADR-008",
+      "title": "I/O Engine — confirm() Write Path Bypasses the Full SMART Flush Pipeline",
+      "status": "Accepted",
+      "date": "2026-09-03",
+      "context": "ADR-002 defines the full crash-safe SMART flush order: V-SMART -> Cache SMART -> B-SMART -> WAL -> M-SMART, coordinated by the SMART Handler (ADR-001) and reconciled via smart_handler.py. That pipeline depends on the C-process architecture and IPC protocol, both still open per the project roadmap. The I/O Engine's confirm() stage needs to mark a mount as active (Superblock last_mount_time, SMART mount_count/clean_unmount_flag) today, independent of when that fuller pipeline gets built.",
+      "decision": "confirm() writes last_mount_time directly to the Superblock, and — best-effort, if a usable M-SMART location was found at mount — increments mount_count and sets clean_unmount_flag = 0 directly on M-SMART. It does not go through V-SMART, Cache SMART, B-SMART, or the WAL.",
+      "rationale": [
+        "Decoupling: the I/O Engine's own mount lifecycle shouldn't block on the SMART Handler pipeline's unresolved architecture questions.",
+        "Narrow, well-defined write: two fields, one direct write, no batching/reconciliation semantics to get wrong before the fuller pipeline exists.",
+        "Best-effort, not silent: a missing or unreadable M-SMART table doesn't fail confirm() — the Superblock write (the one thing every subsequent mount depends on) is what's fatal; the SMART write is a bonus that degrades gracefully."
+      ],
+      "consequences": [
+        "Positive: confirm() is fully testable today without any dependency on ADR-001/002's pipeline being built.",
+        "Negative: this is a genuine bypass of ADR-002's stated flush order — mount_count/clean_unmount_flag updates from confirm() never touch Cache SMART, B-SMART, or the WAL, so they're not covered by that ADR's crash-recovery guarantees.",
+        "Mitigation: only two fields are affected, both low-cost to lose on crash (a missed mount_count increment is a lost counter tick, not corrupted data); B-SMART is not updated by confirm() either, so M-SMART/B-SMART can drift on these two fields specifically until the full pipeline lands — flagged in the engine's README, to be resolved when ADR-001/002's architecture is actually implemented."
+      ]
+    },
+    {
+      "id": "ADR-009",
+      "title": "I/O Engine — Language and Toolchain: Assembly + C, Not Rust, for V1",
+      "status": "Superseded by ADR-011",
+      "date": "2026-09-03",
+      "context": "Two toolchains were on the table for the I/O Engine: (1) hand-written x86-64 assembly for the raw device syscalls plus C for everything else, or (2) Rust, for its compile-time memory-safety guarantees. A survey of existing Rust I/O crates (rio, safer-ring, io-engine, lio, and the foundational io-uring) was done specifically to check whether an existing, mature crate could shortcut this decision.",
+      "decision": "V1 stays Assembly (raw syscalls: openat, pread64, pwrite64, fdatasync, close, ioctl) + C, matching the repo-wide BSD-3-Clause license. Rust remains under consideration for a future version, not adopted now.",
+      "rationale": [
+        "Crate survey didn't find a clear win: rio is GPL-3.0 by default (MIT/Apache-2.0 only via paid GitHub Sponsors) — incompatible with BSD-3-Clause without paying for the exception. safer-ring is v0.0.1, 362 all-time downloads, single-maintainer — essentially unproven. io-engine and lio are legitimate and permissively licensed but small; neither removes enough risk to justify a mid-flight language switch.",
+        "Memory safety and specification correctness are different axes: Rust's compile-time guarantees rule out a category of bugs (use-after-free, data races) but do nothing to catch a wrong byte offset, wrong checksum algorithm, or misread field width against fs.info — the actual source of every bug found while building this engine (e.g. the O_DIRECT/_GNU_SOURCE CI-lint mismatch, the pointer_checksum_algo_used field that was declared but never populated) was specification/logic, not memory safety. A rewrite wouldn't have prevented either.",
+        "Working, tested code already exists: the C+asm engine passes 24/24 assertions against a real image (mkfs_cafs -> mount -> check -> remount -> confirm, plus corruption/auto-repair), including from a from-scratch checkout. Restarting in Rust discards that."
+      ],
+      "consequences": [
+        "Positive: no license entanglement; matches the existing BSD-3-Clause repo without exception beyond the already-disclosed vendored BLAKE3.",
+        "Negative: forgoes Rust's memory-safety guarantees for this component — a real, non-zero cost for hand-written syscall wrappers and manual buffer arithmetic.",
+        "Mitigation: kept narrow in scope (six syscall wrappers, no complex ownership patterns) and covered by a real test suite exercised on every change; revisit if a Rust I/O crate matures (permissive license, real adoption, security audit) or if this component's complexity grows enough that manual memory management risk outweighs the switching cost.",
+        "Superseded: ADR-011 reversed this decision one day later on 2026-09-03, after re-evaluating against a different, more applicable category of Rust crates."
+      ]
+    },
+    {
+      "id": "ADR-010",
+      "title": "I/O Engine — Resolved fs.info Ambiguities for V1",
+      "status": "Accepted",
+      "date": "2026-09-03",
+      "context": "Building the I/O Engine against fs.info surfaced several places where the spec doesn't fully define behavior needed for a working implementation: no stated addressing unit for \"LBA,\" an invalid hex literal for the pointer-block magic, no stated bootstrap procedure for discovering the pointer-block checksum algorithm before anything has been verified yet, and an inconsistent use of \"LBA\" to mean two different things in different fields.",
+      "decision": "Four resolutions, all implemented in cafs_io_layout.h and cited there: (1) LBA addressing unit: raw byte offset from device start, applied uniformly to real_lba/fallback_real_lba fields too. (2) Pointer block magic (fs.info writes 0xCAFSPTR, not valid hex — P/T/R aren't hex digits): the literal 8-byte ASCII string \"CAFSPTR\\0\", compared byte-for-byte rather than parsed as an integer. (3) Pointer-block checksum algorithm bootstrap: try CRC32C, then XXHASH32, accept whichever matches. Both are the only two legal IDs per Sec.3.3; a false match between two different 4-byte algorithms on corrupted data is not a realistic risk. (4) function_table_anchor_lba = 4: this field holds the anchor slot index (0-5), not a byte offset — inconsistent with every other real_lba-style field in the format, which are byte offsets. mkfs_cafs writes literal 4; nothing currently reads it back to cross-check, consistent with the Superblock-only check policy (ADR-007).",
+      "rationale": [
+        "Each of these blocks a specific, concrete piece of code (anchor offset math, magic comparison, first-ever checksum verification, Superblock field layout) — a decision had to be made one way or another to write anything at all. Recorded here rather than left as an undocumented implementation detail, so a fuller spec pass on fs.info can confirm or override each one deliberately."
+      ],
+      "consequences": [
+        "Positive: unblocks implementation without waiting on a full spec revision; each choice is narrow and independently reversible.",
+        "Negative: fs.info itself remains unfixed — a future reader of fs.info alone (without this ADR) will still hit the same ambiguities.",
+        "Mitigation: fs.info should get a follow-up pass incorporating these four resolutions directly, closing this ADR out as \"merged into the spec\" rather than leaving it as a permanent patch on top."
+      ]
+    },
+    {
+      "id": "ADR-011",
+      "title": "I/O Engine — Rewritten in Rust, Superseding ADR-009",
+      "status": "Accepted",
+      "date": "2026-09-03",
+      "context": "ADR-009 evaluated Rust I/O crates against the wrong workload category — io_uring wrappers (rio, safer-ring), suited to high-throughput async I/O, not CAFS V1's synchronous, low-frequency mount lifecycle. Re-evaluated against the right category (safe synchronous syscall wrappers: rustix, nix) and the mature, official checksum crates now available (blake3, crc32c, xxhash-rust), the calculus changed enough to warrant a full rewrite rather than a going-forward-only policy.",
+      "decision": "The I/O Engine is rewritten in Rust. The C+asm version is retired — its files should be deleted from Src/FUSE/Linux/x86-64/I-O_Engine/, along with the now-unnecessary vendor/blake3/ (BLAKE3 is a normal Cargo dependency now, nothing is vendored).",
+      "rationale": [
+        "Right-category crate survey found real, mature, permissively-licensed options where the wrong-category survey hadn't: rustix (985M downloads, MIT/Apache-2.0/Apache-2.0-with-LLVM-exception) and the official blake3/crc32c/xxhash-rust crates, versus rio's GPL-3.0 default license and safer-ring's v0.0.1 immaturity.",
+        "Concrete upgrades, not just a language change: blake3 brings automatic SIMD (the C engine was deliberately software-only); crc32c brings hardware acceleration via SSE4.2 (same C limitation fixed); OwnedFd's Drop closes the file descriptor automatically — no leak even if a caller forgets to call close(), unlike the C version.",
+        "A genuine, demonstrated compiler catch during the port: the first compile attempt rejected simultaneous immutable (whole-ctx, for the fd) and mutable (ctx.superblock) borrows in mount() — an aliasing mistake the C version had no equivalent guard against. Real evidence for the stated thesis (Rust catches a category of bugs C doesn't), not just an assertion.",
+        "Equally real evidence for the thesis's limit: while porting check(), the pointer-checksum-algorithm-used value was computed, assigned to a local, and never wired into the result struct — compiled clean, no warning, because it's a logic gap, not a type or borrow error. Only the integration test caught it. This is the same bug class found in the C version's pointer_checksum_algo_used field during that engine's own testing. Direct, repeated evidence that compile-time guarantees and specification/logic correctness are different axes — the switch reduces one category of risk, not all of it, and testing remains load-bearing either way.",
+        "Newtype safety, used concretely: ByteOffset is a distinct type from a bare u64, specifically to make ADR-010's documented gap (an anchor slot index and a byte offset being interchangeable uint64_t's in the C version, function_table_anchor_lba holding the former while every sibling field holds the latter) a compile error if reintroduced, not a silent bug waiting to happen again."
+      ],
+      "consequences": [
+        "Positive: hardware-accelerated checksums, RAII fd management, a newtype that closes off a specific, already-documented bug class, and a test suite ported test-for-test (24 assertions worth of coverage preserved, not narrowed) confirming behavioral parity with the retired C version.",
+        "Negative: discards a working, tested C+asm implementation; the syscall layer's unsafe surface isn't zero (one ioctl, BLKGETSIZE64, needs it — see ADR-012) — memory safety is improved, not absolute.",
+        "Negative: local verification during this rewrite required pinning blake3/tempfile to older versions, because the sandbox's only available rustc (1.75.0, via apt) predates several transitive dependencies' move to the edition2024 Cargo feature. Not a defect in the decision — a normal toolchain (rustup, or this repo's own CI via dtolnay/rust-toolchain@stable) doesn't hit it — but worth recording as an MSRV consideration for anyone building this outside CI on an older distribution's packaged Rust.",
+        "Mitigation: the C version's git history (if committed before deletion) remains the reference for behavioral parity; the integration test suite is the actual contract going forward, ported alongside the rewrite specifically so parity is checked, not assumed."
+      ]
+    },
+    {
+      "id": "ADR-012",
+      "title": "I/O Engine — Syscall Foundation: rustix",
+      "status": "Accepted",
+      "date": "2026-09-03",
+      "context": "ADR-011 committed to Rust; a concrete syscall foundation still had to be picked between the two mature safe options found — rustix and nix — rather than an arbitrary choice made mid-rewrite.",
+      "decision": "rustix, for all device I/O (open, pread/pwrite, fdatasync, and the one custom ioctl BLKGETSIZE64 needs).",
+      "rationale": [
+        "Architectural alignment with the project's own stated syscall philosophy: rustix's own documentation describes doing direct syscalls via the asm! macro on supported platforms, bypassing libc entirely by default — the same \"the kernel syscall is assembly\" ethos the retired C engine's hand-written wrappers were built around, now safely wrapped and maintained by the Bytecode Alliance instead of hand-rolled.",
+        "Directly comparable real-world precedent: libblkio (a VIRTIO block-I/O library — a block-device-facing systems project of the same shape as this engine) migrated from nix to rustix specifically to simplify licensing. Not a generic popularity signal; a project solving a closely related problem made the same choice for a reason that transfers directly.",
+        "I/O-safety typestate: rustix is built around OwnedFd/AsFd, which is what makes CafsCtx::close()'s RAII fd-closing behavior (ADR-011) straightforward rather than something bolted on.",
+        "Verified, not assumed, for the one gap in rustix's API: it has no named wrapper for BLKGETSIZE64 (only BLKSSZGET/BLKPBSZGET). Confirmed by reading rustix 1.1.4's actual source before committing to it, and by test-compiling and running the custom ioctl (via rustix's own generic Getter<OPCODE, Output> pattern) against both a real file and a symbolic non-block-device target, confirming it round-trips a real device's size correctly and fails with the semantically correct ENOTTY against something that isn't a block device.",
+        "nix remains a reasonable alternative, not a rejected option on technical grounds — MIT-only (simpler single license, where rustix is a triple: Apache-2.0, Apache-2.0 WITH LLVM-exception, or MIT), 55M downloads/month, used in 20K+ crates, with its own ioctl_read! macro that would have generated an equally usable BLKGETSIZE64 wrapper (precedented in the btrfs-uapi crate). This decision is closer to a coin flip resolved by the libblkio precedent and asm-based syscall alignment than a case where nix had a real deficiency."
+      ],
+      "consequences": [
+        "Positive: the engine's entire device-I/O path is now one consistent library, verified end-to-end (open, read, write, sync, and the one ioctl) rather than assumed to work from documentation alone.",
+        "Positive: unsafe is isolated to a single, documented block (the BLKGETSIZE64 ioctl) — everything else in the engine is safe Rust.",
+        "Negative: nix was not evaluated to the same depth (no equivalent test-compile against this project's actual ioctl need) — if rustix turns out to have a real gap later, that comparison hasn't actually been done yet, only reasoned about.",
+        "Mitigation: low switching cost if this needs revisiting — rustix's usage is confined to a handful of call sites (mount.rs, block_io.rs, remount.rs, confirm.rs), not spread throughout the codebase via a leaky abstraction."
+      ]
+    },
+    {
+      "id": "ADR-013",
+      "title": "Global Speed-Index Tables (Non-Critical, Function-Table-Referenced)",
+      "status": "Amended (2026-09-06 session)",
+      "date": "2026-09-04",
+      "context": "An early proposal (\"Global Hash Table\") conflated a fast existence-check structure with the dedup table. They're different things with different criticality: dedup is authoritative data (correctness-critical), while a fast lookup index is a performance optimization that the filesystem must survive losing.",
+      "decision": "One non-critical table, living in a block the Function Table points to (hash_table_lba): a Hash Table, binary, purely existence-check (\"does this hash exist?\"), keyed by a content hash (whole-file or per-LBA, config-selectable, mutually exclusive — see amendment) with the shared cross-table identifier as its value. Filename and LBA-range/permission data, originally proposed as two further non-critical tables here, were folded into the Identifier Table instead (see amendment) since both are already keyed by the same identifier and gain nothing from being split out.",
+      "rationale": [
+        "Separating existence-check from name/location+permission avoids the collision hazard a single mixed-key table would have (a content hash colliding in value with a valid LBA, for instance).",
+        "Placing the Hash Table under the Function Table (non-critical tier, per ADR-006) rather than the Meta/User Table (critical tier) is a deliberate criticality choice: losing it costs lookup speed, not correctness, provided the fallback path (walking the authoritative Dedup Table / Identifier Table directly) holds."
+      ],
+      "consequences": [
+        "Positive: a fast path for the common case (dedup/CoW existence checks) without making the filesystem's correctness depend on that fast path being intact.",
+        "Negative: the slow-path fallback (walking critical structures directly) needs to actually be built and kept behaviorally equivalent to the fast path.",
+        "Amendment (2026-09-06 session): the original three-table design (Hash / Filename / LBA) is superseded. Filename and LBA+permission data move to a new Identifier Table entry in the Meta/User Pointer Table (critical tier — this is load-bearing namespace data, not a speed cache, and belongs alongside btree_root_lba). Only the Hash Table remains under the Function Table. The Hash Table is config-toggleable: off, whole-file-hash, or per-LBA-hash (mutually exclusive — LBA-hash mode's detection coverage is a strict superset of file-hash mode's, so there is no reason to run both). Hash width is 256-bit (32 bytes), unfolded — unlike the corruption checksum, a collision here is a correctness issue (two different files treated as identical), not a tolerable non-event, so it is never truncated. Disabling the Hash Table entirely costs only time-to-reclaim (duplicate data persists until the background dedup routine finds it); it was never load-bearing.",
+        "Reconfirmed invariant: the shared cross-table identifier must be inode-like — assigned once per logical file, stable across renames, shared across hardlinks, never derived from filename or content."
+      ]
+    },
+    {
+      "id": "ADR-014",
+      "title": "Two-Tier Deduplication — File-Level Primary, LBA-Level \"CoW Extreme\" Fallback",
+      "status": "Accepted",
+      "date": "2026-09-04",
+      "context": "ADR-013 separated the non-critical speed-index table(s) from the real dedup mechanism. That real mechanism needed its own decision: where it lives, and how it actually decides what's shareable.",
+      "decision": "The authoritative dedup table lives in the Meta/User Pointer Table (dedup_table_root_lba, critical tier): 8-byte hash + 8-byte location_id + 8-byte offset + 4-byte length + 4-byte refcount, entries with refcount > 1. Deduplication happens in two tiers: (1) File-level (primary): whole-file content hash. If two files match, they share underlying storage. (2) LBA-level \"CoW Extreme\" (fallback): when file-level content doesn't match, individual blocks/extents are still checked and shared at block granularity via a separate hash-of-LBA-contents structure, so two files that mostly differ but share some blocks still get partial storage savings.",
+      "rationale": [
+        "Whole-file dedup is cheap to check and covers the common case (identical files) with one hash comparison.",
+        "Falling back to block-level matching only when whole-file matching fails avoids paying block-level hashing cost for every file, while still catching partial-overlap cases whole-file hashing would miss entirely.",
+        "Keeping the authoritative table in the critical tier (Meta/User Table) is consistent with ADR-013's separation: dedup refcounts are correctness-bearing (a wrong refcount means either premature space reclamation of still-referenced data, or a permanent leak) — this cannot be a table the filesystem shrugs off losing."
+      ],
+      "consequences": [
+        "Positive: catches both the cheap common case and a meaningfully broader set of partial-match cases, at a cost proportional to how often the cheap case fails.",
+        "Negative: two hashing/lookup paths to build and keep correct instead of one; the block-level path's hash-of-LBA-contents structure needs its own consistency story (recomputed on every write to that LBA, or invalidated and lazily recomputed).",
+        "Negative: refcount correctness under concurrent writers is the same hard problem every CoW-with-dedup design has — not solved by this decision, just scoped to where it has to be solved (the critical-tier table, not the speed-index tables).",
+        "Open (2026-09-06 session): dedup hash collision insurance policy — verify newly-written data asynchronously (at FS block-size granularity, after mount, on first read/write) before a hash match is trusted enough to actually collapse two blocks into one shared copy; a background hash-daemon (started immediately at mount, normally low priority, schedulable at elevated/exclusive priority to catch up faster, with a supervised-process fallback per ADR-015 if it fails) builds/maintains the hash index. Data is always written safely first; sharing only happens after verification confirms the match."
+      ]
+    },
+    {
+      "id": "ADR-015",
+      "title": "Process Architecture — Master/mntproc as Separate Supervised Processes, Housekeeping as Separate Children",
+      "status": "Accepted",
+      "date": "2026-09-04",
+      "context": "Researched against PostgreSQL's postmaster architecture (one coordinator, fixed background maintenance workers — checkpointer, background writer, WAL writer, autovacuum launcher — plus per-connection backends, all parent-child, all supervised). An earlier framing called the housekeeping tasks (defrag, balance, python/SMART) \"coroutines\" — corrected: they're dispatched as non-critical asynchronous tasks, important but not allowed to take the FUSE processor down if they fail. That correction settles the process-vs-thread question: a crashing thread can take its whole process with it; a crashing process is cleanly reaped by the kernel (SIGCHLD to the parent) with everything else untouched. The isolation this design needs only exists at the process boundary.",
+      "decision": "Per mounted partition: one master process, parent of one mntproc (the FUSE request handler) and of one separate child process per housekeeping task (defrag, balance, python/SMART each their own child — not run inline inside master, mirroring how checkpointer/bgwriter/autovacuum-launcher are each separate from postmaster and from each other). Master supervises all of them. A housekeeping child's failure must not crash mntproc and must not force an fsck. Recovery from a housekeeping task's partial/failed work goes through the WAL's existing revert mechanism, not through filesystem-check.",
+      "rationale": [
+        "Process, not thread, isolation is what \"failure shouldn't bring the FS down\" actually requires — this is why coroutines-as-threads-inside-master was corrected.",
+        "Per-task children, not one inline batch inside master, gets task-vs-task isolation for free in addition to task-vs-mntproc isolation: defrag crashing doesn't take balance down either.",
+        "fsck avoidance is the explicit design goal, not a side effect — an extra fsck after every housekeeping hiccup is \"honestly not preferred by anyone.\" The WAL is the mechanism already present in the design (per fs.info's checksum-failure and recovery sections) capable of reverting partial damage without a full consistency scan, so housekeeping-task failure is scoped to be a WAL-revertible event, not an fsck-triggering one.",
+        "Supervision requires parent-child, per the Postgres precedent (ADR-016 covers the separate question of preventing more than one master per partition)."
+      ],
+      "consequences": [
+        "Positive: a housekeeping task can fail, restart, or be killed without affecting live FUSE I/O or requiring a filesystem-wide consistency check.",
+        "Negative: more processes to supervise than a thread-based design — master's supervision logic (detect a dead child, decide whether/how to restart it, decide when repeated failure means giving up and surfacing an error) is real code that has to exist and be correct, not a simplification deferred to \"the OS handles it.\"",
+        "Negative: WAL-revertibility of housekeeping-task partial work is now a hard requirement, not an assumption — a housekeeping task whose partial state can't be cleanly reverted via WAL would violate this ADR's whole premise. Needs to be checked per task (defrag and balance both move data around; either could plausibly leave a state the WAL wasn't designed to revert if not built with this requirement in mind from the start)."
+      ]
+    },
+    {
+      "id": "ADR-016",
+      "title": "Partition Singleton Locking — flock() Keyed by volume_uuid",
+      "status": "Accepted",
+      "date": "2026-09-04",
+      "context": "An earlier proposal used \"oldest process / lowest PID\" to determine which process is master for a partition. Researched against PostgreSQL's actual mechanism: a data directory is protected by a lockfile (postmaster.pid), checked and validated at startup, with the OS's own advisory lock as a second line of defense against a stale file from a crashed instance — not PID comparison. PID-based election has two concrete failure modes on the intended target platform: PIDs get reused after wraparound, so \"lowest PID\" doesn't reliably mean \"oldest\" once the real oldest process exits; and under PID namespaces (any container runtime — Docker, Podman, systemd-nspawn), raw PID values aren't comparable across processes in different namespaces at all. Separately: no two partitions should ever handle each other's I/O — a cp/mv between two mounted volumes is not one partition reaching into another's data, the same way one NTFS volume never \"handles\" a second NTFS volume's partition.",
+      "decision": "flock() on a lockfile keyed by the Superblock's volume_uuid — not by device path, not by mount point path, not by PID. Whoever holds the lock is master for that partition; the OS releases it automatically if the holder dies.",
+      "rationale": [
+        "Structural guarantee, not enforced logic: only one process can hold an exclusive flock() on a given file at a time — \"one master per partition\" falls out of the locking primitive itself rather than needing separate election code to get right.",
+        "Automatic crash recovery: the OS drops the lock when the holding process dies, so a crashed master doesn't need a heartbeat/liveness protocol for another process to safely determine it's gone and take over.",
+        "volume_uuid, not device path: device paths shift under controller renumbering (/dev/sdb1 becoming /dev/sdc1 across a reboot is common) — locking on the device path could let a partition acquire two different locks across two device enumerations, or fail to recognize it's the same partition it already holds a lock for. volume_uuid is stable by construction (it's the Superblock's own identity field) and correctly answers \"is this the same partition\" regardless of what the OS currently calls the device.",
+        "Directly resolves the \"partitions don't handle each other's I/O\" requirement: distinct volume_uuids mean distinct lock paths, and a process only ever acquires the lock for the specific partition it's mounting — there's no shared namespace where one partition's master could accidentally acquire authority over another's."
+      ],
+      "consequences": [
+        "Positive: no election protocol to design, implement, or get wrong; correct behavior under process crashes, container/namespace boundaries, and device renumbering, all as a consequence of using the right primitive rather than three separate fixes.",
+        "Negative: requires a well-known, stable filesystem location to place these lockfiles (e.g. /run/cafs/<volume_uuid>.lock) that's writable by whatever's attempting the mount — a small new operational dependency (that directory existing and being writable) that PID comparison didn't have.",
+        "Mitigation: this is a standard, well-understood Unix pattern (single-instance daemons have used lockfile-based mutual exclusion for decades) — not a novel mechanism being introduced, just the correct application of an existing one."
+      ]
+    },
+    {
+      "id": "ADR-017",
+      "title": "Allocator Mode Toggle — Balance / Performance / Safety, Independent Interfaces",
+      "status": "Accepted",
+      "date": "2026-09-04",
+      "context": "The Allocator's process architecture (library-linked vs. its own process vs. merged with the I/O Engine) was left open pending research. That research suggested each option's cost centers on cross-process coordination for concurrent access to allocator state, and proposed resolving it with one interface designed to work identically whether calls are local (performance) or IPC-routed (safety) — so the transport could change without the protocol changing. That specific proposal was considered and rejected: forcing one interface shape across all three modes would have constrained performance mode to fit inside whatever safety mode's IPC-oriented protocol needs, which defeats the point of a performance mode existing at all.",
+      "decision": "Three config-toggled modes — balance, performance, safety — each free to have its own interface if it needs one. Safety mode: sacrifices speed deliberately, uses IPC and multiple processes specifically so a single critical crash doesn't break the drive for anyone currently writing data, and specifically avoids ever needing fsck. Performance mode: gets to be genuinely fast — no protocol constraint inherited from safety mode's IPC design; gets its own interface if that's what speed requires. Balance mode: the next concrete build priority (ahead of both other modes' implementations). Mode-specific code lives in its own subfolder under Allocator/ (e.g. Allocator/Performance/), per the repo's shared-code-one-level-up convention applied recursively: shared allocator code sits at Allocator/, and each mode's divergent code sits one level below it.",
+      "rationale": [
+        "Modularity over forced uniformity: the repo's own stated design principle (\"everything is a folder,\" shared code one level above its consumers) already implies mode-specific divergence is expected and structurally accounted for — a forced single interface would have fought that principle rather than used it.",
+        "Safety mode's whole purpose is the crash/fsck guarantee, which specifically justifies its performance cost (IPC, multiple processes) — that cost has no reason to also apply to performance mode, which has a different, opposite purpose.",
+        "Balance-first sequencing is the sensible default to actually build against: it's the mode most users will run, and building it first gives performance and safety mode real code to diverge from rather than three parallel designs built independently with no shared baseline at all."
+      ],
+      "consequences": [
+        "Positive: performance mode is not held back by safety mode's transport requirements; each mode can be evaluated and optimized on its own terms.",
+        "Negative: up to three allocator interfaces to maintain instead of one — a bug fix or behavior change discovered in one mode doesn't automatically apply to the others, and needs to be deliberately ported if it should.",
+        "Negative: no shared protocol means no \"flip a config flag and the transport changes underneath the same calls\" capability — switching a live system between modes (if that's ever wanted) is a heavier operation than a transport swap, closer to a reconfigure-and-restart.",
+        "Mitigation: balance mode being built first, with performance/safety as explicit divergences from it (living in their own subfolders, not parallel from-scratch trees), keeps the three from drifting into three unrelated implementations that happen to share a name."
+      ]
+    },
+    {
+      "id": "ADR-018",
+      "title": "Identifier Table — Merged Filename/Extents/Permissions, Direct-Indexed",
+      "status": "Accepted",
+      "date": "2026-09-07",
+      "context": "ADR-013's original three-table speed-index design (Hash / Filename / LBA+permissions) put filename resolution and LBA+permission resolution in two separate non-critical tables, both keyed by the same shared identifier. Splitting them gained nothing — a row keyed by identifier can hold both without any collision or access-pattern cost — and a separate defect was found independently: no existing structure (Superblock, Function Table, Meta/User Pointer Table) held a pointer to *any* per-identifier metadata table at all. It was being used in worked examples without ever having a home.",
+      "decision": "A single Identifier Table, critical tier, pointed to by a new field (`identifier_table_lba`) in the Meta/User Pointer Table — not the Function Table. Identifiers are assigned as a sequential counter, so the table is direct-indexed: `row_offset = identifier_table_lba + identifier × 40`, no search required. Fixed 40-byte row:\n\n| Offset | Size | Field |\n|---|---|---|\n| 0–7 | 8 | filename_blob_offset |\n| 8–15 | 8 | extent_list_offset |\n| 16–19 | 4 | extent_count |\n| 20–31 | 12 | unix_mode + uid + gid |\n| 32–39 | 8 | acl_blob_offset (0 = none) |\n\nFilenames, extent lists, and ACLs (all variable-length) live in a separate blob region, referenced by offset from the fixed row above.",
+      "rationale": [
+        "Direct indexing beats a search structure here specifically because identifiers are assigned sequentially, not sorted-but-arbitrary — this is the one case where array-offset math is strictly faster than any tree.",
+        "Separating the fixed-width row from variable-length blob content preserves O(1) row access regardless of filename length, extent count, or ACL size.",
+        "Placement in the Meta/User Pointer Table (not Function Table) is a criticality call, not a convenience one: this is load-bearing namespace data on the same footing as `btree_root_lba`, not a rebuildable cache."
+      ],
+      "consequences": [
+        "**Positive**: closes a real orphaned-structure defect (a table with no pointer to it); one table instead of two with no loss of function; O(1) lookup by identifier.",
+        "**Negative**: deleted files' slots either need reuse or the table only grows over the volume's life — compaction strategy not yet designed, deferred to Job 3.",
+        "**Negative**: no hard bound yet on blob-region growth per identifier beyond the existing `max_extents_per_file = 1024` cap on extent count."
+      ]
+    },
+    {
+      "id": "ADR-019",
+      "title": "B-Tree Namespace Resolution (Path → Identifier)",
+      "status": "Accepted, partial",
+      "date": "2026-09-07",
+      "context": "`config.fs` already has a `[btree]` section (`btree_cache_size_mb`) and the Meta/User Pointer Table already has a `btree_root_lba` field, but nothing formally states what the B-tree is *for* or how a path lookup actually walks it end to end. This surfaced as a real blocker: without a concrete mental model of the walk, no other structural decision in Job 1 could be confidently confirmed.",
+      "decision": "The B-tree is the authoritative namespace structure — it maps a hierarchical path to an identifier (ADR-018), one path component at a time. Root pointed to by the existing `btree_root_lba` field. A lookup descends: at each node, the path component is compared against that node's sorted keys, selecting exactly one child to descend into; this repeats until a leaf is reached, and the leaf holds the identifier. Each level read is one disk read; branching factor determines how many levels a given file count needs.\n\nExact node byte layout — key encoding, branching factor, and its relationship to `block_size` — is **not** decided by this ADR and remains open.",
+      "rationale": [
+        "A B-tree's branching factor keeps depth (and therefore disk reads per lookup) low even as file count grows into the millions — a flat scan or linked structure doesn't have this property.",
+        "This formalizes an assumption that was already implied by two existing fields (`[btree]`, `btree_root_lba`) but never written down as the actual mechanism.",
+        "Worked examples (a 7-name toy tree, and a full cold-read trace for a 60GiB file on a 200GiB volume) were built and walked against this model before it was accepted, confirming it's internally consistent with everything else decided in Job 1."
+      ],
+      "consequences": [
+        "**Positive**: closes the \"how is a file found\" documentation gap explicitly and demonstrably (not just asserted).",
+        "**Negative**: this ADR documents the *mechanism*, not the *byte layout* — key encoding, branching factor, and node size relative to `block_size` are still fully open. A follow-up ADR is required once those are settled; until then, no code can be written against this table."
+      ]
+    },
+    {
+      "id": "ADR-020",
+      "title": "Extent-List Storage Model — Contiguous Is Extent_Count = 1, Not a Separate Case",
+      "status": "Accepted",
+      "date": "2026-09-07",
+      "context": "Early file-topology discussion treated \"contiguous\" and \"fragmented\" as two different storage shapes, alongside a linked-list model and a B-tree model. Re-examining against what's actually already decided: `max_extents_per_file = 1024` in `config.fs` already assumes every file is described as a bounded array of extents, and nothing in `fs.info` implies a linked-list-per-block layout. A contiguous file is trivially expressible as an extent array with one entry.",
+      "decision": "There is no separate \"contiguous\" storage type. Every file — one unbroken run or many — is described by the same mechanism: `extent_list_offset` + `extent_count` (ADR-018) pointing at an ordered array of `(start_lba, length)` pairs. A contiguous file has `extent_count = 1`. Fragmented files have more, read in stored order.",
+      "rationale": [
+        "One code path handles both cases; nothing needs to branch on \"is this file contiguous.\"",
+        "Costs nothing extra for the common contiguous case — one 16-byte entry is exactly what would be needed to record `(start, length)` regardless.",
+        "A linked-list-per-block layout, occasionally used elsewhere for allocation-time simplicity, was considered and rejected: nothing in the existing spec implies it, and it doesn't fit the already-locked `max_extents_per_file` bound."
+      ],
+      "consequences": [
+        "**Positive**: uniform representation; a worked example (5-extent 60GiB file on a 200GiB volume, full cold-read trace) confirmed the mechanism holds for genuinely fragmented, large-scale cases.",
+        "**Negative**: `max_extents_per_file = 1024` is a hard ceiling under this model. A workload that fragments a single file beyond 1024 extents (heavy random-write CoW churn without defrag) has no fallback under this ADR — defrag becomes load-bearing for such files, not optional."
+      ]
+    },
+    {
+      "id": "ADR-021",
+      "title": "Zone Table Redefined — Free/Health Scoreboard, Not a Reverse-Ownership Index",
+      "status": "Accepted",
+      "date": "2026-09-07",
+      "context": "A reverse \"who owns LBA X\" lookup was initially proposed as an extension to the Zone Table, to answer how the filesystem prevents a write from landing in the middle of an existing file's data. ADR-022 (this set) establishes that no such reverse index is actually needed — which left the Zone Table's actual purpose undefined again, needing to be reconnected to what it was always meant to do.",
+      "decision": "The Zone Table divides the drive into large fixed-size regions (\"zones\" — exact size not yet fixed, candidate range a few GiB). Per zone, it stores a free-space summary and a health indicator derived from SMART data. It carries **no** per-block ownership field. It is consumed by the allocator (choosing where new writes should land) and by the balance routine (deciding when to migrate data between zones).",
+      "rationale": [
+        "Directly matches the project's stated goal of health-aware allocation: the allocator needs a cheap way to ask \"which zone is roomy *and* healthy\" without scanning fine-grained free/used state across the whole drive.",
+        "Reverses a proposal made earlier in the same session (extending Zone Table with an owner field) once ADR-022 established that proposal solved a problem that doesn't exist under the allocator-as-gatekeeper model."
+      ],
+      "consequences": [
+        "**Positive**: stays small and cheap regardless of file count — scales with number of zones, not number of files or blocks.",
+        "**Negative**: zone size, exact per-zone field widths, and how \"health\" gets derived from SMART data are all still open — deferred to Job 3 (allocation strategy)."
+      ]
+    },
+    {
+      "id": "ADR-022",
+      "title": "Allocator as Sole Gatekeeper — No LBA→Owner Index",
+      "status": "Accepted",
+      "date": "2026-09-07",
+      "context": "Raised directly: \"LBA X to Y is a file — who says that, and what stops I/O from accidentally writing into the middle of it?\" The first proposed answer was a dedicated reverse LBA-to-owner lookup structure. Re-examined: every write already has to obtain a free block from the allocator before it can happen at all; the allocator's own free/used tracking is what prevents two writers from ever being handed the same block while it's in use. A reverse-lookup table would only ever be answering a question the write path is already structurally prevented from needing to ask.",
+      "decision": "There is no LBA-to-owner reverse-lookup structure anywhere in the design. Write-collision protection comes entirely from the allocator refusing to hand out any block its free/used tracking (Zone Table, ADR-021, plus finer per-block tracking within a zone) marks as in use. The one place a \"does this specific LBA's content already exist elsewhere\" question genuinely arises — the LBA-level dedup fallback (ADR-014, \"CoW Extreme\") — is already answered by the hash-keyed dedup mechanism itself, checked by content hash, never by LBA.",
+      "rationale": [
+        "Directly corrects a proposal made earlier in this same session that solved a problem this design doesn't have.",
+        "Every filesystem's allocator already needs free/used tracking regardless of any indexing decision — this ADR adds no new structure, it removes one that would have been redundant with what the allocator was always going to need anyway.",
+        "Avoids the storage cost a genuine reverse index would have carried — one entry per block on a large drive, versus the Zone Table's one entry per zone."
+      ],
+      "consequences": [
+        "**Positive**: removes an entire structure and its consistency-maintenance burden before it was ever built.",
+        "**Negative**: correctness here depends entirely on the allocator's free/used tracking being right, with no independent second structure cross-checking it — mitigated by `fsck`-level consistency checking, not by a standing index."
+      ]
+    },
+    {
+      "id": "ADR-023",
+      "title": "Hash Table Redesign — Toggleable, 256-Bit, Non-Critical (Amends ADR-013)",
+      "status": "Accepted",
+      "date": "2026-09-07",
+      "context": "ADR-013 established the Hash Table as a non-critical, always-on existence-check cache for dedup/CoW. Further discussion clarified it hashes **user data content only**, never metadata, and — since the authoritative Dedup Table (ADR-014) already provides a correctness fallback, and the background dedup routine finds duplicates on its own regardless — it was recognized as a pure speed optimization, never load-bearing. That opened the question of whether it should be configurable, and at what granularity.",
+      "decision": "Config-toggleable per volume, three mutually exclusive states: **off** / **whole-file-hash** / **per-LBA-hash**. LBA-hash mode's detection coverage is a strict superset of whole-file-hash mode's (block-level hashing catches whole-file duplicates as a natural special case, plus partial cross-file overlap that whole-file hashing misses entirely) — so the two are never run together. Hash width fixed at **256 bits (32 bytes)**, stored in full, never folded down to the 16-byte checksum-trailer width used for corruption detection.",
+      "rationale": [
+        "The toggle lets a volume skip indexing cost entirely where the background dedup routine is considered sufficient, with the only cost of doing so being *when* space gets reclaimed, not *whether* it's correct.",
+        "256 bits keeps collision probability roughly 2^128 away from any realistic file/block count — far beyond what any volume will ever approach. 512 bits was considered and rejected: it would double storage for no meaningful gain at that scale.",
+        "Unlike the corruption checksum (where a collision between two unrelated blocks is a harmless non-event, since it's never compared cross-block), a collision in this table risks treating two genuinely different pieces of data as share-candidates — a correctness-adjacent risk, which is why the width is never reduced here even though it is elsewhere."
+      ],
+      "consequences": [
+        "**Positive**: configurable cost/benefit tradeoff per volume; disabling it costs only time-to-reclaim space, never correctness.",
+        "**Negative**: needs its own config section, not yet specified — distinct from `[dedup_table]`, which governs the authoritative table, not this cache.",
+        "**Interacts with ADR-026**: the per-file/per-directory `hash` optimization flag is the fine-grained on/off switch layered on top of this volume-level toggle — a volume can have LBA-hash mode enabled while individual files opt out via the flag, and vice versa is not meaningful (a file can't opt in if the volume-level toggle is off)."
+      ]
+    },
+    {
+      "id": "ADR-024",
+      "title": "Dual Permissions V1 — MS-DTYP Security Descriptors via WinFsp, Not Native NTFS",
+      "status": "Accepted",
+      "date": "2026-09-07",
+      "context": "Dual Unix + Windows permission support was requested for V1, not deferred. The obstacle: the real on-disk NTFS permission format is unpublished, and reverse-engineering it risks real IP exposure. Researched for a legally clean path with actual precedent, rather than guessing.",
+      "decision": "`acl_blob_offset` (ADR-018) stores an opaque self-relative `SECURITY_DESCRIPTOR` blob. The format is **MS-DTYP** — a specification Microsoft publishes openly under its Open Specification Promise, with an explicit patent non-assert covenant for implementers. This is *not* the native NTFS on-disk format, which stays untouched and unimplemented — it's the same wire-level `SECURITY_DESCRIPTOR`/ACL/ACE/SID structure already sitting at WinFsp's own API boundary. CAFS stores what WinFsp hands it directly; no translation layer is built.",
+      "rationale": [
+        "Real production prior art exists doing exactly this: Samba's `vfs_acl_xattr`/`nfs4acl_xattr` modules and ZFS's native ACL support both store Windows-compatible permission semantics this way, serving real Windows clients today, without touching NTFS internals.",
+        "Using WinFsp's own native structure format specifically avoids building a translator at all — the Windows-facing API already speaks this format, so storing it verbatim is the path of least new code, not just the safest legally."
+      ],
+      "consequences": [
+        "**Positive**: legally clear, production-precedented, satisfies the V1 dual-permission requirement in full rather than deferring Windows support to a later version.",
+        "**Negative**: Unix-side tooling and any code not going through WinFsp needs its own handling for when `acl_blob_offset` is populated versus relying on the inline `unix_mode`/`uid`/`gid` fields alone.",
+        "**Open**: exact `SECURITY_DESCRIPTOR` parsing/validation code still needs to be built or sourced from a library; not yet confirmed whether WinFsp provides this directly or it needs to be implemented against the MS-DTYP spec by hand."
+      ]
+    },
+    {
+      "id": "ADR-025",
+      "title": "Compression — Chunk Size Default, Maximum, and Floor",
+      "status": "Accepted",
+      "date": "2026-09-07",
+      "context": "Transparent compression wasn't part of Job 1's original scope; raised mid-session with BTRFS's transparent compression as the reference model, initially proposing 64MiB–1GiB chunks. Researched against BTRFS's actual current implementation before committing to a number.",
+      "decision": "The **compression chunk** — the amount of raw data fed to the compressor before writing, distinct from `block_size` (physical geometry) and from a storage extent (one file's contiguous run) — defaults to **128KiB**, matching BTRFS. Config-permitted maximum: **1GiB**, opt-in only, for storage-prioritized use cases explicitly accepting the read-amplification cost. Floor: tied to `block_size`, never below one physical block, since a smaller chunk has no purpose the block granularity doesn't already impose.\n\nA compressed extent requires **two** length fields — physical (compressed, on-disk) and logical (uncompressed) — where an uncompressed extent needs one. This is a structural change to the extent-list entry format (ADR-020) for any file using compression.",
+      "rationale": [
+        "BTRFS's 128KiB default is deliberately small, not arbitrary: it bounds decompression RAM usage and avoids forcing a full-chunk decompress to satisfy one small random read. That reasoning transfers directly and unchanged — there was no project-specific reason found to pick a different number.",
+        "The 1GiB ceiling is accepted as an explicit, informed tradeoff for a narrow use case (maximum ratio, read-latency-insensitive), not as a recommended value — large chunks and the existing `random` optimization hint are in direct tension."
+      ],
+      "consequences": [
+        "**Positive**: a production-validated default rather than an invented one.",
+        "**Negative**: extent-list entries need a compressed/uncompressed length pair for any compressed file — touches ADR-020's format.",
+        "**Negative**: no guard yet against combining a large chunk size with the `random` hint, which would defeat the hint's purpose — deferred to Job 2 (config validation rules)."
+      ]
+    },
+    {
+      "id": "ADR-026",
+      "title": "Optimization Flags — Structural (1 Bit) vs. Hint (Bitmask)",
+      "status": "Accepted, partial",
+      "date": "2026-09-07",
+      "context": "`config.fs`'s `[optimization]` flags appeared, on first inspection, to represent one spectrum of choices. Re-checked directly against the file rather than from memory: `dir_default_flags = \"hash|extent\"` and an override example `\"hash|btree|read\"` both show `hash` co-occurring with the two apparent \"structural\" options — meaning `hash` cannot itself be a third structural alternative to `extent`/`btree`, since a file can't have two mutually-exclusive storage shapes at once.",
+      "decision": "`[optimization]` flags split into two independent categories:\n\n- **Structural** (1 bit, mutually exclusive): `extent` | `btree`. Picks the on-disk storage shape (ADR-018/019/020).\n- **Hint** (bitmask, freely combinable): `sequential`, `random`, `journal`, `read`, `write`, `raw`, `hash`, `sync`, `append_only`. Layered on top of the structural choice; changes runtime behavior, not on-disk shape.\n\n`hash` is reclassified as a hint — the per-file/per-directory participation switch for the Hash Table (ADR-023), not a storage-shape choice.",
+      "rationale": [
+        "**`sync`**: every write to a file carrying this hint forces an immediate durability flush (data and metadata physically committed) before the write call returns, rather than being buffered and flushed later. Trades write latency for a zero-data-loss-window guarantee — matches the existing config example `\"btree|random|sync\"` for a database file.",
+        "**`append_only`**: redefined this session, and **not fully resolved by this ADR**. Original intent (pulled loosely from BTRFS): when a block is logically replaced, the superseded physical data must remain retained on disk regardless of how much new data has since been written, rather than being freed back to the allocator. This is a **retention** semantic (old versions never reclaimed), not the traditional POSIX append-only *write-position* restriction (disallowing non-append writes). As specified, this doesn't cleanly fit the \"hint = runtime-only, no shape change\" definition this ADR otherwise establishes: retaining every superseded extent indefinitely means the Identifier Table's extent list (ADR-018/020) needs to track historical, no-longer-live extents in addition to current ones — which is a structural concern, not a pure runtime toggle. Filed here as a flag with known intent and undecided implementation; not ready to be finalized as a simple bitmask bit."
+      ],
+      "consequences": [
+        "**Positive**: resolves the structural/hint classification question with direct evidence rather than continued open debate.",
+        "**Negative**: `config.fs`'s own declared `# Flags:` comment (9 names) doesn't match its own usage examples (which also use `sync` and `append_only` — 11 total). Needs correcting in Job 2.",
+        "**Open**: `append_only`'s actual on-disk implementation is unresolved — full-history retention has real implications (unbounded per-file growth, no automatic reclaim, unclear interaction with dedup/compression, no stated access path to retained-but-superseded data) that go beyond what this ADR settles. Needs its own dedicated design pass before implementation."
+      ]
+    },
+    {
+      "id": "ADR-027",
+      "title": "`raw` — Composite Performance Flag, Full Allocation, No CoW",
+      "status": "Accepted",
+      "date": "2026-09-07",
+      "context": "`raw` appeared in `config.fs`'s optimization-flag vocabulary with no stated meaning. Clarified this session: it's intended for `.img`-style files (disk images, VM images, USB-bootable images) — a use case validated directly against a real one (an Arch-on-USB project built on NTFS), where old-school, upfront, fully-allocated storage with no filesystem cleverness in the way is exactly what's wanted.",
+      "decision": "`raw` is a composite flag, not an independent bit. Setting it forces all of the following as one bundle, applied at allocation time to the full block batch regardless of whether that batch is completely written yet:\n\n- Full allocation upfront (the requested size is reserved immediately, not grown incrementally).\n- Single extent, always (`extent_count = 1` — a hard guarantee for `raw` specifically, stricter than ADR-020's general \"contiguous is just the common case\" framing).\n- No copy-on-write — writes land in place.\n- No participation in the Hash Table or dedup (ADR-023) — unsafe without CoW, since an in-place write to a shared block would corrupt every other reference to it.\n- Not eligible for compression (ADR-025) — compressed size is unpredictable; `raw`'s entire point is a known, fixed footprint.\n- No resize-on-write. Growth is never implicit. The process actively using the file cannot be the one that grows its own container — a resize is a distinct, external, explicit operation (matches the ordinary constraint that nothing can resize the storage it's currently running from).",
+      "rationale": [
+        "Being a composite rather than an independent flag structurally prevents the invalid combinations (`raw`+`hash`, `raw`+compression) that would otherwise need runtime validation — there's no config-time check needed because the conflicting states can't be expressed in the first place.",
+        "Matches real precedent directly: BTRFS's `NoDataCOW`/`chattr +C` exists for the identical use case (VM disks, raw images), accepting the same tradeoff (no torn-write protection on crash) for the same reason (predictable performance, no CoW fragmentation).",
+        "Resize being external-only mirrors why a running system can never resize the volume it's booted from — not a new constraint invented for `raw`, the same one made explicit."
+      ],
+      "consequences": [
+        "**Positive**: one flag instead of four independently-settable ones; no invalid-combination validation logic required anywhere.",
+        "**Positive**: guaranteed single-extent, fixed-location storage — ideal for exactly the boot-image/VM-disk case that motivated it.",
+        "**Negative**: no torn-write protection — a crash mid-write to a `raw` file can leave it in a partially-written state with no CoW fallback to the previous version.",
+        "**Negative**: cannot be protected by a volume-wide snapshot (ADR-030) — no CoW means no old copy for a snapshot to retain. Snapshot behavior when a `raw` file is present is not yet decided (skip / warn / block).",
+        "**Open**: does full allocation zero the reserved region, or leave it uninitialized? The latter is faster but risks exposing a previous occupant's freed bytes until the guest OS overwrites them — a real information-leak question, not just a performance one."
+      ]
+    },
+    {
+      "id": "ADR-028",
+      "title": "FAT32 Rescue Partition — Cross-Platform Bootstrap and Config Mirror",
+      "status": "Accepted",
+      "date": "2026-09-07",
+      "context": "A CAFS volume needs a CAFS driver to be read at all — but there was no answer for how a computer without one yet is supposed to get it, or make any sense of the drive if it's plugged in cold. Raised this session as a genuine gap, alongside a proposed fix.",
+      "decision": "`mkfs_cafs` splits the target device into two partitions: the main CAFS partition, and a small (128–256MiB) FAT32 partition holding FUSE/WinFsp installers for both Windows and Linux, plus a mirrored copy of `config.fs`. Controlled by a `mkfs_cafs` toggle, **default on** — opt-out for space-constrained or fixed-role deployments that don't need the bootstrap path, rather than opt-in (which would mean most users never discover or benefit from it).\n\nSync between the live CAFS config and the FAT32 mirror is asymmetric, not truly bidirectional:\n\n- **Push (CAFS → FAT32)**: automatic. Any config change, and mount itself, updates the mirror with no user action needed.\n- **Pull (FAT32 → CAFS)**: only on an explicit user-invoked sync command. A user can freely hand-edit the FAT32 copy (the no-CLI editing path this partition exists partly to enable) and nothing happens to the live config until they deliberately tell CAFS to take it in.\n\nAny pull is treated as untrusted input requiring full validation (well-formed TOML, every field in range, nothing that would leave the volume inconsistent) before being applied — not trusted by virtue of being \"the config file,\" since the FAT32 partition is writable by anything with physical access to the drive, with no permission model or checksum CAFS can verify before its own driver is even running.",
+      "rationale": [
+        "Solves the bootstrap problem the same way an EFI System Partition solves it for booting: a universally-readable partition sitting next to the real one, requiring no prior CAFS support to access.",
+        "Defaulting on rather than opt-in matters specifically because the feature's value depends on being present on drives whose owner didn't think to ask for it — that's the entire scenario it exists for.",
+        "The push/pull asymmetry resolves a real integrity concern raised and worked through this session: an automatic pull-on-mount would mean trusting arbitrary content from a partition anything can write to; requiring an explicit command for the dangerous direction makes it a deliberate, informed action instead of passive trust."
+      ],
+      "consequences": [
+        "**Positive**: any OS, with no prior CAFS support, can plug in the drive and get a working driver plus a human-readable description of what's on it.",
+        "**Positive**: a no-CLI config editing path exists for users who prefer it, without exposing the live filesystem to untrusted auto-applied input.",
+        "**Negative**: eats 128–256MiB of every CAFS-formatted device's usable capacity by default — real, if small, cost, most noticeable on small volumes.",
+        "**Negative**: introduces a genuine but different-shaped cost from the one ADR-006 was scoped to control (see ADR-RELATIONSHIP-MAP) — mirror writes happen on config change and mount, not on every data write, so it's not the same per-write amplification concern, but it is a third location holding the same data and needs its own accounting, not an assumption that ADR-006 already covers it.",
+        "**Open**: exact size-selection logic (fixed at 128 or 256, or `mkfs_cafs` picks within the range based on device size) and whether corruption-check/rebuild of the mirror is automatic at every mount or only on explicit repair — both unresolved.",
+        "**Open**: whether the main CAFS partition needs a registered GPT partition-type GUID for Windows to recognize it as CAFS (rather than \"unformatted\") even with the driver installed — same cross-platform immersion concern that ruled out BTRFS-style subvolumes, not yet addressed at the partition-table level."
+      ]
+    },
+    {
+      "id": "ADR-029",
+      "title": "Block and Identifier Reference Counting — Two Counts, Not One, Peer-Addressed",
+      "status": "Accepted",
+      "date": "2026-09-08",
+      "context": "Snapshots (ADR-030) need every block, not just deduplicated ones, to have a reference count — but ADR-014's Dedup Table only carries entries for blocks that are actually shared, leaving ordinary blocks with no tracked count anywhere. A direct proposal (identifier refcount hitting zero directly deletes the identifier's blocks from the Dedup Table) was worked through and found to risk corrupting a second file still sharing that block. A follow-up proposal (re-anchoring — reassigning a deleted file's shared blocks to \"the next\" referencing file) was considered and found unnecessary once the addressing model was made explicit.",
+      "decision": "Two separate counts, not one:\n\n- **Identifier-level refcount**: a new field on the Identifier Table row (ADR-018). Authoritative for whether an identifier is still reachable from anything — the live B-tree, or any snapshot's retained root. Hitting zero deletes the row.\n- **Block-level refcount**: lives with the Zone Table's existing per-block tracking (ADR-021), upgraded from a binary free/used bit to a small count. Authoritative for whether the allocator may reclaim a physical block. Incremented by: a live extent-list reference from any identifier, reachability from any snapshot's retained root, or a dedup match.\n\n**Cascade, corrected**: identifier refcount hits zero → row deletes → for each of its extents, the *block's own* refcount (not a Dedup Table lookup) is decremented independently → only if that block's count then reaches zero does it become eligible for reclaim. The identifier's fate and a given block's fate are correlated, never identical — a block the deleted identifier was sharing with someone else is untouched.\n\n**Addressing model — peer, not chained**: every extent-list entry and every Dedup Table entry points directly at a physical location. There is no representation anywhere of \"File B's data, which lives inside File A\" — B and C sharing a block with A are three independent, equal references to the same bytes, with the block's refcount reflecting how many. Deleting A therefore requires no scan, no reassignment, and no re-anchoring of any kind — it decrements a count. This holds identically whether the sharing was found by whole-file matching or per-LBA matching (ADR-014's two tiers) — both produce the same peer-addressed state, differing only in how cheaply the match was found.\n\n**Recently-zeroed queue** (Function Table): tagged, not a single undifferentiated list — freed identifier *slots* (relevant to the still-open reuse-vs-retire compaction question) and freed *blocks* (relevant to the allocator's reclaim path) are different consumers asking different questions, even though both originate from a count reaching zero.",
+      "rationale": [
+        "Splitting the count avoids the corruption risk in the original single-count proposal directly: an identifier and a block it happens to share are not the same fact, and conflating them made deletion of a shared file dangerous to a peer that never asked to be touched.",
+        "The peer/direct-addressing model matches how real reflink/dedup systems already do this (BTRFS `--reflink`, ZFS dedup) — a shared extent is one location with a count, not an original with dependents.",
+        "Dedup Table's own refcount field (ADR-014) is understood as sourced from the block-level count, not independently maintained — avoiding two numbers for one fact that could drift out of sync."
+      ],
+      "consequences": [
+        "**Positive**: closes ADR-018's deferred compaction question and the reversal-orphaned-slot wrinkle (ADR-030) with one mechanism — auto-delete on identifier refcount zero.",
+        "**Positive**: whole-file and per-LBA dedup need no separate representations — same peer model, same cascade, regardless of which tier found the match.",
+        "**Negative**: identifier slot reuse vs. permanent retirement is still unresolved — auto-delete frees the *row*, but whether its numeric identifier can be handed to a new file later is a separate, still-open decision (ADR-018).",
+        "**Open**: metadata deduplication is explicitly not decided by this ADR. Content-addressable data (user data blocks, and filenames specifically, since a filename is pure content referenced by offset) could in principle use this same mechanism; position-dependent structures (B-tree nodes, Zone Table entries, Identifier Table rows themselves) cannot, since their identity depends on where they sit, not just their bytes. Left open for later consideration, not folded into this decision."
+      ]
+    },
+    {
+      "id": "ADR-030",
+      "title": "Snapshot Mechanism — CoW-Based, Whole-Volume, Refcount-Driven",
+      "status": "Accepted, partial",
+      "date": "2026-09-08",
+      "context": "Raised originally as a redefinition of `append_only` (ADR-026 left it open: old data surviving a replace isn't a per-file write-position flag, it's what a snapshot does). Researched against real BTRFS behavior before designing: subvolume-level snapshotting was considered and rejected for granularity (see Rationale); the underlying retention mechanism was confirmed to require CoW, which the filesystem already has as its foundational write model.",
+      "decision": "A snapshot is a saved B-tree root pointer plus id, timestamp, and retention tier — nothing more. Stored in a new critical-tier **Snapshot Table**, pointed to from the Meta/User Pointer Table (alongside the Identifier Table, ADR-018 — both load-bearing, neither a speed cache). No data or metadata is copied at creation time; the mechanism is entirely reference-based (ADR-029): every block reachable from the saved root has its block-level refcount held above zero for as long as the snapshot exists.\n\n**Granularity**: whole-volume only for V1. No subvolume concept.\n\n**Reading via a snapshot**: identical traversal code to reading the live tree, just starting from the snapshot's saved root instead of the live one.\n\n**Reversal**: the live root pointer is repointed to the snapshot's saved root. Cleanup is refcount-driven, not wholesale — any block written after the snapshot that nothing else currently references (no other snapshot, nothing in the live tree) has its refcount reach zero and becomes reclaimable; a block written after the snapshot but also held by a *different*, newer snapshot survives regardless, because the reference that's keeping it alive belongs to that other snapshot, not to whichever tree the live pointer currently favors.\n\n**Retention policy**, layered (validated against Snapper's real-world config shape, not invented from scratch): a feature toggle; if enabled, an automatic schedule with a retention count per tier (hourly/daily/weekly/monthly/yearly); a space-based cap independent of count or age, reading free-space state from the Zone Table rather than separate accounting; and manual, on-demand snapshots, always available when the feature toggle is on regardless of the automatic schedule.\n\n`append_only`, per ADR-026's flagged tension, reverts to its honest, narrow meaning — a write-position gate only. The retention behavior originally wanted for it is what this ADR provides instead.",
+      "rationale": [
+        "CoW is a hard prerequisite, not a design preference: an in-place write destroys the only copy of what it overwrites, leaving nothing for a snapshot to hold a reference to. Already satisfied — CAFS's write model was CoW-based from the start.",
+        "Whole-volume-only was checked against WinBtrfs directly, not assumed: it mounts exactly one subvolume at a time (an open, unresolved limitation on its own tracker), a nested-subvolume snapshot operation through it has a filed corruption report, and even native Linux BTRFS has had subvolume-visibility inconsistencies serious enough to need a kernel patch. Reproducing that model would reintroduce the same cross-platform friction the project's dual-permission requirement (ADR-024) exists to avoid.",
+        "The layered retention policy matches Snapper's actual shape (the closest real precedent) rather than picking one axis (count, or age, or space) and calling it sufficient — real deployments need all three, evidenced by Snapper shipping all three."
+      ],
+      "consequences": [
+        "**Positive**: near-zero creation cost, confirmed by the mechanism itself requiring no copy of anything — only a saved pointer and a reference.",
+        "**Positive**: resolves ADR-026's open `append_only` question with a real mechanism rather than the abandoned \"retired extents list\" idea.",
+        "**Negative**: \"cheap to create, expensive to keep\" is a real, not hypothetical, cost — every write to already-snapshotted data means a block that would have been freed is retained instead, for as long as the snapshot lives.",
+        "**Open**: what happens when a volume-wide snapshot encounters a `raw` file (ADR-027), which has no CoW and therefore cannot be protected — skip silently, warn, or block the snapshot outright. Silent skip is the dangerous default (a later restore assumes protection that was never actually there).",
+        "**Open**: reversal orphans identifier slots the same way ordinary deletion does (ADR-029's still-open reuse-vs-retire question) — not a new problem, just another path into an existing one.",
+        "**Open**: exact retention-policy defaults (tier counts, space-cap percentage) not set by this ADR, only the shape of the policy."
+      ]
+    },
+    {
+      "id": "ADR-031",
+      "title": "Copy-on-Write Toggle — Whole-Partition Scope, Safe Mid-Usage",
+      "status": "Accepted",
+      "date": "2026-09-08",
+      "context": "CoW was treated as foundational throughout Job 1 and the early snapshot discussion, but was never actually confirmed as optional. Clarified this session: it's an extra feature, off by default, not the filesystem's core appeal the way it is for BTRFS — with the direct consequence that disabling it also disables the snapshot system (ADR-030), since snapshots have no mechanism to retain anything without it. Whether toggling it mid-usage is even safe was an open question, researched rather than assumed.",
+      "decision": "CoW is a whole-partition toggle, on or off, changeable during usage. Per-directory scoping was considered and rejected for V1 — not because it's undesirable, but because it's already achievable through an existing mechanism (see Rationale) without building a new one.\n\nMid-usage toggling is safe because the setting is not live or retroactive: whether a given file/extent is CoW-managed is tracked per-file, decided at creation time from whatever the toggle said then. Flipping the toggle changes the default handed to new files; it does not touch anything already written. This is the default behavior for every configuration change under this project (ADR-032) applied to this specific case, not a special exception invented for CoW.\n\nIndependent of the toggle's setting: any block whose refcount (ADR-029) is currently above what a single unshared reference would produce is force-CoW'd on write regardless. This is not part of the toggle — it's always-on infrastructure whenever dedup or snapshots are in use at all, since writing a shared block in place would corrupt every other reference to it.",
+      "rationale": [
+        "Confirmed directly against BTRFS's actual `nodatacow` mount-option handling before assuming this was safe: the setting only affects newly created files, tracked via a per-file flag, not derived live from the current mount option. Toggling mid-session is safe *because* old files are structurally untouched by it, not because the toggle is somehow smarter than a simple default.",
+        "The forced-CoW-on-shared-blocks behavior is directly precedented, not inferred: BTRFS's own commit history states plainly that CoW still applies to an extent under snapshot even in nodatacow mode. Confirms the design agreed on independently before this was checked.",
+        "Per-directory scoping at the mount-option/VFS level was checked against BTRFS's own documentation, which states outright that this remains unresolved and has \"proved difficult to implement correctly within the Linux VFS framework,\" years on. CAFS's existing `[optimization.dir_overrides]` mechanism achieves practical per-directory defaults through a different route — setting flags at file-creation time rather than overriding live VFS behavior for a subtree — sidestepping the specific wall BTRFS hit rather than reproducing it."
+      ],
+      "consequences": [
+        "**Positive**: safe, instant toggling with no migration step, no risk to existing data, and no special-cased logic beyond what ADR-032 already establishes generally.",
+        "**Positive**: per-directory CoW preference is already available today via `[optimization.dir_overrides]`, at zero additional design or implementation cost.",
+        "**Negative**: disabling CoW disables snapshots entirely for the volume — not a partial degradation, a hard dependency (ADR-030).",
+        "**Negative**: the forced-CoW-on-shared-blocks check has to run on every write regardless of the toggle's state, adding a mandatory per-extent check to the I/O Engine's write path whenever dedup or snapshots are enabled at all."
+      ]
+    },
+    {
+      "id": "ADR-032",
+      "title": "Configuration Change Transition Policy",
+      "status": "Accepted",
+      "date": "2026-09-08",
+      "context": "Every configurable behavior in the system (CoW, dedup, Hash Table mode, compression, and whatever else \"everything is a configuration,\" ADR-033, eventually covers) raises the same question when its value changes on an already-populated volume: what happens to data that was written under the old setting? Raised directly, with four candidate answers (leave old data alone; migrate everything immediately; schedule it through the background routine infrastructure; check for pending migrations at mount) needing to become one coherent policy rather than a different, ad-hoc answer per feature.",
+      "decision": "One policy, applied uniformly:\n\n- **Default, for every toggle, unless a specific ADR states otherwise**: a changed setting applies going forward only. Existing data is untouched. It converges toward the new setting naturally, over time, as it's rewritten in the ordinary course of use — not as a scheduled migration, as a side effect of nothing more than continuing to use the file.\n- **Opt-in escalation**: a user may explicitly request active migration of existing data toward the current setting. This reuses the supervised background-process infrastructure already established (ADR-015) rather than introducing new machinery per feature. Whether the job runs continuously in the background or is checked for once at each mount is a scheduling detail of that same job, not two different mechanisms.\n- **Explicit, rare, synchronous**: an immediate, blocking, do-it-now migration is available as an explicit command for a user who wants it and accepts the pause. Never the default anywhere.",
+      "rationale": [
+        "Confirmed directly against real precedent rather than chosen arbitrarily: BTRFS's own `nodatacow`/`nodatasum` mount options already work exactly this way — new-files-only, old files untouched — for the identical reason (retroactive migration is expensive and usually unnecessary; the natural rewrite cycle handles it for free).",
+        "\"Applied to Dedup specifically\" resolves an ambiguity the feature would otherwise carry silently: disabling dedup means *stop deduplicating new writes*, not *force-unshare everything currently shared*. The refcount mechanism (ADR-029) already causes existing shared data to unshare itself the moment nothing else needs it — no forced action required to get there eventually.",
+        "Reusing ADR-015's routine infrastructure for the opt-in escalation avoids building a bespoke scheduler per feature that wants \"convert my existing data now\" as an option."
+      ],
+      "consequences": [
+        "**Positive**: one policy to reason about instead of a bespoke answer per configurable feature; new configurable features inherit sensible transition behavior by default rather than needing their own design pass for this question.",
+        "**Positive**: near-zero cost for the common case (most toggles, most of the time, nobody needs the old data touched at all).",
+        "**Negative**: a user who wants the benefit of a new setting (space savings from newly-enabled dedup, for instance) immediately, rather than gradually, has to know to explicitly ask for the escalation — it's not automatic."
+      ]
+    },
+    {
+      "id": "ADR-033",
+      "title": "\"Everything Is a Configuration\" — Governing Policy",
+      "status": "Accepted",
+      "date": "2026-09-08",
+      "context": "Proposed as a project-wide policy: essentially everything about CAFS's behavior should be configurable, in service of the project's original modular design goal (a user should be able to swap components — the allocator, specifically — if they want to). Weighed directly against the cost of actually building to that standard: not everything can be a configuration without a format-level redesign (B-tree versus a different namespace structure being the concrete example raised), and this session alone surfaced three real format-level defects found purely by building things concretely enough to trip over them (the ADR-006/`fs.info` contradiction, the Identifier Table existing in worked examples with no pointer to it anywhere, an implicit byte-order assumption never stated) — evidence the on-disk format is still actively settling, not finished.",
+      "decision": "Adopted, with an explicit boundary: **behavior and policy are configurable; the guarantees that make the filesystem trustworthy are not.** The allocator being the sole gatekeeper (ADR-022), permission enforcement living in the filesystem rather than the kernel, and CoW as the mechanism underlying dedup and snapshots (ADR-031) are not toggles a configuration value gets to switch away — they're what everything configurable sits on top of.\n\nTwo structural commitments that follow from adopting this:\n\n- **Every pairwise interaction between two configurable things must be explicitly checked, not assumed safe.** Formalizing \"everything is configurable\" without formalizing this is how an untested combination ships. Three were already found by hand this session (`raw`×`hash`, `raw`×compression, `raw`×snapshots) — evidence this isn't a theoretical concern.\n- **Genuine structural swappability (not just behavioral toggling) requires a selector field reserved in the on-disk format now, even with only one legal value written into it for V1** — the same pattern the Superblock's `*_checksum_algo_id` fields already use. A future alternative can then be added by extending the legal-value list without breaking volumes formatted before it existed. Skipping the selector field for something that's fixed in V1 is what turns a later change into an actual format-breaking redesign rather than a config addition — worth deciding, structure by structure, which V1-fixed choices are cheap to future-proof this way now.\n\n**Sequencing**: not forked into two simultaneously-maintained variants (a conventionally-configurable filesystem and a maximally-configurable one) at this stage. The modular architecture that would eventually enable full \"everything is a toggle\" adaptability continues to be built now — it's largely happening as a side effect of clean engineering already (ADR-012's per-concern file organization is cited as an existing, unplanned example) — but committing to maintain a second full parallel variant is deferred until the shared format has demonstrably stopped producing corrections at the rate this session found them.",
+      "rationale": [
+        "The correctness-boundary distinction is not new — it's the same line ADR-022 and the FS-enforced-permissions decision already drew, generalized into an explicit rule rather than left implicit per-decision.",
+        "Deferring the fork isn't a rejection of the goal — it's a sequencing call based on direct evidence from this session: every one of the three defects found was caught by construction, not review, meaning further construction is likely to keep finding more. Maintaining two full variants means paying for every one of those corrections twice before either has shipped anything.",
+        "The IPC-over-text/socket modularity direction (raised alongside this policy) is validated by existing precedent (ADR-001's SMART Handler, already process-isolated and pipe-driven) but is not assumed to transfer to every component at equal cost — the allocator is the hottest path in the system, unlike SMART's 60-second cadence, and needs its own performance treatment rather than inheriting SMART's cost model by analogy."
+      ],
+      "consequences": [
+        "**Positive**: gives every future ADR that makes something configurable a standard to check against (is this a correctness guarantee or a policy; if structural, is a selector field being reserved) rather than deciding scope ad hoc each time.",
+        "**Positive**: the modular, swap-friendly architecture keeps accruing at effectively no extra cost, preserving the eventual goal without committing resources to it prematurely.",
+        "**Negative**: genuine full modularity (a user actually swapping the allocator, per the original goal) remains a later-phase outcome, not a V1 property — this ADR sets the direction and the discipline, not the timeline.",
+        "**Open**: which specific V1-fixed structural choices are worth a reserved selector field now is not decided by this ADR — a review pass is needed, structure by structure, as each one gets finalized."
+      ]
+    },
+    {
+      "id": "ADR-034",
+      "title": "B-Tree — Hash-Keyed, Per-Directory, Identifier Table as the Cross-Directory Path",
+      "status": "Accepted",
+      "date": "2026-09-09",
+      "context": "B-tree byte layout was flagged open through Job 1 and most of Job 3 — mechanism (path → identifier) was accepted early (ADR-019), but key encoding, branching factor, and whether it's one tree for the whole volume or one per directory were never decided, blocking any real implementation. Resolved this session, then checked against real precedent before finalizing.",
+      "decision": "**Hash-keyed**, not string-keyed: each key is an 8-byte hash of a single path component, not the variable-length name itself.\n\n**One tree per directory**, not one global tree. A directory's own subtree root LBA is stored in its own Identifier Table row (ADR-018), repurposing the otherwise-unused `extent_list_offset` field (directories hold no file data) — `unix_mode` already distinguishes file rows from directory rows, so no new field is needed to know which meaning applies. Resolving a multi-component path means: walk the current directory's tree to find the next component's identifier, then jump via that identifier's Identifier Table row (a direct-indexed O(1) read, not a search) to reach the next directory's tree, repeating per component.\n\n**Node layout**: 4096-byte node (= `block_size`), 8-byte header (`is_leaf` flag + key count) followed by up to 255 fixed 16-byte slots (8-byte key hash + 8-byte child pointer or identifier, depending on leaf/internal).\n\n**Collision handling**: on a hash match, confirm against the real filename already stored in the matched identifier's Identifier Table row — no second copy of the name anywhere, this is a read, not new machinery.\n\n**Swappable by design**: `btree.rs` as its own function file behind a shared interface, plus a `namespace_structure_id` selector field reserved in the Superblock (proposed offset 84, one legal value for V1) per ADR-033's future-proofing pattern — a later alternative namespace structure can be added without breaking volumes formatted before it existed.",
+      "rationale": [
+        "Checked directly against ext3/ext4's HTree before finalizing, not assumed safe by analogy: HTree is described in the kernel's own documentation as \"a specialized tree data structure for directory indexing, similar to a B-tree... constant depth of either one or two levels, have a high fanout factor, use a hash of the filename, and do not require balancing\" — hash-keyed, per-directory, high-fanout, the same three properties decided here independently. HTree's own entries (`dx_entry`: 4-byte hash + 4-byte block, 8 bytes total) are the same fixed-slot pattern as this design's 16-byte slots, just narrower because ext4's block numbers are 32-bit where CAFS's identifiers/pointers are 64-bit.",
+        "Real-world payoff is documented, not theoretical: HTree indexing took ext2-family directories from \"a practical limit of a few thousand files\" to \"tens of millions of files per directory.\"",
+        "Sort order was checked and found not load-bearing: every real consumer (`ls`, FUSE `readdir` callers) sorts client-side regardless of what order entries arrive in, so hash-keying's only real cost (losing server-side sort order) isn't actually a cost being paid for anything.",
+        "One-tree-per-directory avoids the alternative's real problem: a single global tree needs full paths or compound keys to disambiguate two files with the same name in different directories, which either means variable-length keys (defeating hash-keying's compactness) or a wider compound key (real, avoidable cost). Per-directory, a directory's own tree never needs to disambiguate anything outside itself.",
+        "Reusing the Identifier Table for cross-directory traversal avoids a second, redundant structure — the same reasoning already applied twice this session (Zone Table absorbing the integrity signal rather than a new table; the reference-counting design collapsing to two counts instead of three)."
+      ],
+      "consequences": [
+        "**Positive**: real, at-scale precedent for every major property of this design, not just internal consistency.",
+        "**Positive**: ~255-way branching per level keeps tree depth low even for very large directories, without needing to design a novel indexing scheme.",
+        "**Positive**: no new structure needed for cross-directory resolution — the Identifier Table already does this job.",
+        "**Negative**: HTree's \"does not require balancing\" property depends on its specific hash-range-to-block mapping scheme — whether this design's plain slot array achieves the same without needing explicit rebalancing on insert/delete is an implementation question this ADR doesn't resolve.",
+        "**Open**: `namespace_structure_id` exact Superblock offset — proposed, not yet explicitly re-confirmed as final."
+      ]
+    },
+    {
+      "id": "ADR-035",
+      "title": "Zone Table's Second Responsibility — Integrity Signal Aggregation",
+      "status": "Accepted",
+      "date": "2026-09-09",
+      "context": "Raised as \"should Zone Table also handle integrity checking.\" Every block already carries a mandatory 16-byte checksum trailer (Section 15a) regardless of this decision — the open question was whether *verifying* it proactively (rather than only incidentally, when something happens to read a block for an unrelated reason) needed new infrastructure, and if so, where it lives and on what schedule.",
+      "decision": "Zone Table's per-zone health field (ADR-021, currently fed by SMART) gains a second input: a **scrub**, piggybacked onto blocks that balance/defrag already touch for their own reasons, rather than a dedicated process competing for its own I/O budget. A checksum failure found this way feeds the same health field SMART already populates — one number, two sources, not a second parallel \"is this zone trustworthy\" signal living elsewhere.\n\nA dedicated, opt-in full-volume pass exists on top of the piggyback baseline, specifically to cover cold data the piggyback approach would never reach (balance/defrag have no reason to touch a file nobody's rewriting or fragmenting): `[scrub].full_drive_scan_preference`, default **on**, tier **monthly** — using the shared cadence-tier type (ADR-036).",
+      "rationale": [
+        "No new structure or process needed: detection is free (the checksum trailer already exists unconditionally; a scrub is just a proactive *read* of something already there), and repair is bounded by ADR-006 regardless (Superblock/SMART have a real backup to repair from; everything else can be flagged, not fixed, same as any other checksum failure).",
+        "Piggybacking avoids a dedicated scan competing with ordinary I/O for bandwidth, at the cost of opportunistic (not guaranteed) coverage — which is exactly the gap the monthly full-pass exists to close.",
+        "Default-on for the full pass, not default-off: there's no storage tradeoff to weigh (detection has no space cost), only a scheduling one, and cold data going unchecked indefinitely is arguably the scenario most worth catching."
+      ],
+      "consequences": [
+        "**Positive**: zero new on-disk structures; reuses an existing field for a second, complementary purpose rather than duplicating it.",
+        "**Positive**: default-on monthly full-pass closes the one real gap (cold data) the free piggyback approach leaves open.",
+        "**Negative**: a corruption found via scrub is detected, not repaired, for every structure except Superblock and SMART — same limit ADR-006 already accepted, now surfaced through a new detection path rather than a new limitation."
+      ]
+    },
+    {
+      "id": "ADR-036",
+      "title": "Scheduling/Preference System — Four Distinct Shapes, Not One Unified Type",
+      "status": "Accepted",
+      "date": "2026-09-09",
+      "context": "Multiple routine handlers (Hash Daemon, SMART Handler, defrag/balance, scrub) each have a genuinely different scheduling need, raised together as \"a variable system for more toggles.\" Tempting to build one shared preference type covering all of them, following the same instinct that generalized snapshot retention's tier system a few turns earlier — considered and rejected once the Hash Daemon's actual requirement (sub-second, runtime-adjustable) was examined next to the others.",
+      "decision": "Four distinct shapes, each kept in its own lane rather than forced into a shared type:\n\n| Shape | Used by | Mechanism |\n|---|---|---|\n| Coarse named tiers (`off`/`hourly`/`daily`/`weekly`/`monthly`/`yearly`) | Snapshot retention (ADR-030), full-drive scan (ADR-035) | Shared enum type |\n| Fixed numeric seconds | `--type=smart`'s user-facing cadence (ADR-038) | Plain config field, capped, deliberately not part of the tier enum |\n| Dynamic, runtime-adjustable, sub-second | Hash Daemon (ADR-037) | Not a config value — runtime state, bounded by config min/max |\n| Condition-triggered + starvation ceiling | Defrag/balance | Already-existing `[idle_detection]` / `[background].priority_order` — unchanged |\n\nThis **corrects a suggestion made earlier the same session** (folding `[dedup].scan_interval_seconds`-style fields into the tier enum) — seeing the Hash Daemon's requirement made clear that a named-tier enum can't express \"0.25 seconds\" any better than it can express \"every 3600 seconds,\" and stretching one type to cover both would produce a worse fit than two honestly-scoped types.",
+      "rationale": [
+        "Each shape corresponds to a genuinely different *kind* of question — \"which infrequent tier\" (a human preference), \"how many seconds\" (a fixed operational cadence), \"what's the current interval\" (live system state), \"is a condition currently true, with a backstop\" (event-driven, not time-driven) — and a type that tried to answer all four would either be too coarse for some or too permissive for others.",
+        "Reuses what already exists rather than inventing redundantly: the idle-triggered shape was already built (`[idle_detection]`), the tier enum was already built (this session, snapshot retention) — only the numeric-seconds and dynamic-runtime shapes needed anything new, and both are narrow, single-purpose additions."
+      ],
+      "consequences": [
+        "**Positive**: each scheduling field reads as exactly what it is, rather than a generic \"preference\" value whose actual meaning depends on which feature it's attached to.",
+        "**Positive**: corrects a real, if minor, mistake before it propagated further — the scan_interval_seconds-folding suggestion was never implemented, so nothing needs unwinding.",
+        "**Negative**: four shapes means four things to document and explain, instead of one — a genuine cost, accepted because the alternative (one shape, badly fitting three of the four cases) is worse."
+      ]
+    },
+    {
+      "id": "ADR-037",
+      "title": "Hash Daemon — Dynamic Interval via Timeout-Based Socket Wait",
+      "status": "Accepted",
+      "date": "2026-09-09",
+      "context": "The Hash Daemon (Python, socket-based, feeding the Hash Table per ADR-023) needs to run near-continuously at a low sleep interval, with the ability to snap to a much tighter interval (0.25–0.5s, from a baseline of 1–15s) during priority elevation. `time.sleep(N)` was the first instinct and was found unworkable: it blocks for the full duration of `N` with nothing able to shorten an in-progress call, so a priority-elevation request arriving mid-sleep would have to wait out whatever sleep was already running before taking effect.",
+      "decision": "The daemon's main loop blocks on its own socket **with a timeout**, using `selectors` (or `asyncio` if concurrent request handling becomes a real need later) rather than `time.sleep()`:\n\n- Timeout expiry triggers the periodic hash-building work.\n- Socket activity (an incoming request, or a priority-elevation control message) triggers request handling instead.\n- The current interval is re-read fresh on every loop iteration, so a change takes effect on the next pass rather than after whatever wait was already in progress.\n\nA priority-elevation request arrives as a message on the same socket the daemon already listens on — no second signaling channel needed, since the socket wait already wakes immediately on any activity.\n\n`config.fs` gains bounds, not the live value itself: `hash_daemon_min_interval_seconds` / `hash_daemon_max_interval_seconds`. The actual current interval is runtime state that floats between them based on load and elevation requests, not a fixed setting read once at startup.",
+      "rationale": [
+        "The daemon already needed to listen on a socket for its actual job (answering hash queries) — using that same wait for scheduling means one mechanism does both jobs, rather than a separate sleep loop plus separate socket-polling logic running alongside it.",
+        "Re-reading the interval every loop iteration, rather than capturing it once, is what makes the change \"take effect on the next pass\" true rather than aspirational — a value captured once at loop start and never re-checked would have the same staleness problem as `time.sleep()`, just with a different root cause."
+      ],
+      "consequences": [
+        "**Positive**: near-instant responsiveness to priority elevation (bounded by however fast the control message propagates, not by whatever interval happened to be in progress).",
+        "**Positive**: no new dependency — `selectors` is standard library, consistent with ADR-004's no-new-dependency embedded-Python approach.",
+        "**Negative**: the live interval is genuinely runtime state, not a value visible in `config.fs` — anything wanting to observe or log the daemon's current interval needs its own mechanism (not decided here)."
+      ]
+    },
+    {
+      "id": "ADR-038",
+      "title": "SMART Handler — User-Configurable vs. Allocator-Critical Cadence Split",
+      "status": "Accepted",
+      "date": "2026-09-09",
+      "context": "`smart_handler.py` is invoked three separate ways (`--type=smart`, `--type=avg`, `--type=trends`), confirmed directly against the uploaded source rather than assumed from the \"3-in-1\" description alone. Raised directly: only one of the three should be user-adjustable — the other two aren't in the user's hands, the filesystem needs them.",
+      "decision": "`--type=avg` (the hourly aggregator) and `--type=trends` (the allocator's health/degradation signal) run on a cadence internal to the filesystem's own cycle and are **not exposed as configurable** — the allocator depends on `--type=trends` directly for health-aware placement decisions (project foundational goal), so their frequency isn't a setting a user gets to turn down.\n\n`--type=smart` (the human-facing health score and recommendation) **is** user-configurable: `[smart].report_interval_seconds`, ceiling of ≤3600 (one hour).",
+      "rationale": [
+        "The split follows a real structural line, not an arbitrary one: two of the three calls feed a decision-making system (the allocator) that can't function correctly on stale or user-disabled input; the third is informational output for a person, with no downstream system depending on its cadence.",
+        "The ≤3600 ceiling isn't a round-number default — it's tied to `--type=avg`'s own design, which folds samples into the *currently-accumulating* hourly bucket (ADR-003's sufficient-statistics model) before it finalizes. A `--type=smart` interval longer than an hour risks reading a health score computed against a bucket that already rolled over without ever being scored."
+      ],
+      "consequences": [
+        "**Positive**: the allocator's health-aware behavior can't be silently degraded by a user turning down a \"SMART frequency\" setting that they'd reasonably assume was just about the on-screen health report.",
+        "**Positive**: the ceiling has a stated engineering reason, not just \"seemed reasonable\" — makes it harder to loosen by mistake later without noticing why it was there.",
+        "**Negative**: two of the three SMART call types have zero user-facing configuration surface at all — anyone expecting to tune the filesystem's own internal health-monitoring cadence will find there's nothing to adjust, by design."
+      ]
+    },
+    {
+      "id": "ADR-039",
+      "title": "Module Organization — Function Files, Wrapper Files, Shared-Folder Promotion",
+      "status": "Accepted",
+      "date": "2026-09-09",
+      "context": "Proposed as a repo-wide organizing convention: group related functions into \"function files\" (`checksum.rs`, `syscall.rs`), with \"wrapper files\" calling them in a specific order (`mount_auto.rs`). Checked directly against the uploaded `mkfs_cafs.rs`, which reimplements `blake3_128` locally rather than importing a shared one — concrete, present-tense evidence for exactly the duplication this convention prevents, not a hypothetical justification.",
+      "decision": "- **Function files**: related functions grouped by what they do, not by who calls them.\n- **Wrapper files**: a specific, ordered sequence of function-file calls (already the shape of `mount_auto.rs`, and of ADR-007's mount → check → remount → confirm pipeline).\n- **Shared-folder promotion rule**: a file used by 2 or more consumers is promoted to the level where those consumers' paths actually diverge — not a raw file-count threshold. Python scripts shared between FUSE and Kernel land at `Src/`, since that's where those two paths fork, regardless of how many individual files within each subsystem call them.\n- **Practical trigger for the rule**: if the level a shared file would be promoted to already contains a `Cargo.toml` or `README`, that's confirmation it's a real, already-recognized component boundary, not an arbitrary intermediate directory — the natural home for a shared folder to grow into without its organization getting lost as it accumulates files.\n- **`shared/` is its own crate**, not a same-crate module — evidenced by `mkfs_cafs.rs`'s own `use cafs_io::layout::*`. Buys a structural guarantee, not just a style preference: Cargo enforces acyclic crate dependencies, so a dependency cycle back into `shared/` is impossible by construction, where a same-crate module boundary would only prevent it by discipline.\n- **\"No mod.rs\"** means no *nested per-subdirectory* `mod.rs` — confirmed against the actual 2018-edition change, which is narrower than commonly summarized: a module with submodules can be named `foo.rs` (sibling to a `foo/` directory) instead of `foo/mod.rs`, not that module declaration disappears entirely. One root declaration file per crate (`lib.rs`) remains unavoidable and is already how the proposal draws `src/`.\n- **`var.rs`** holds shared *type definitions* (`CafsCtx`, `MountOpts`, `ConfigSnapshot`) — a good idea, but it doesn't replace `mod.rs`/`lib.rs`'s actual job (declaring the module tree), which was never really \"exporting variables\" in the first place. Two separate concerns, both still need a home.",
+      "rationale": [
+        "The shared-folder rule as a path-divergence rule, rather than a count threshold, matches its own stated origin example (Python shared between FUSE and Kernel landing at `Src/`) precisely — a count-based rule would need an arbitrary number attached to \"FUSE and Kernel,\" where a divergence-based rule just asks where those two things stop being the same path.",
+        "The Cargo.toml/README anchor is checkable at a glance, rather than requiring the abstract \"one level above\" calculation to be reasoned about fresh each time a new shared file comes up.",
+        "Checked against real evidence at two points, not just accepted as stated: the `blake3_128` duplication in `mkfs_cafs.rs` (justifies `checksum.rs`), and the actual Rust 2018 edition module-system change (confirms \"no mod.rs\" as stated, with the correct scope)."
+      ],
+      "consequences": [
+        "**Positive**: already has room for everything Job 1/2 added (`identifier.rs`, `btree.rs`, `zone.rs`, `dedup.rs`, `snapshot.rs` slot in as peers of `mount.rs`/`verify.rs`/`confirm.rs`) without changing shape.",
+        "**Positive**: `shared/`-as-crate makes a class of dependency-cycle mistake impossible rather than merely discouraged.",
+        "**Negative**: none identified beyond the ordinary cost of any convention — requires being followed consistently to pay off, which isn't something an ADR can enforce on its own."
+      ]
+    }
+  ]
+}

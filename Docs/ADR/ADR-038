@@ -1,0 +1,24 @@
+# ADR-038: SMART Handler — User-Configurable vs. Allocator-Critical Cadence Split
+
+**Status**: Accepted (2026-09-09)
+
+## Context
+
+`smart_handler.py` is invoked three separate ways (`--type=smart`, `--type=avg`, `--type=trends`), confirmed directly against the uploaded source rather than assumed from the "3-in-1" description alone. Raised directly: only one of the three should be user-adjustable — the other two aren't in the user's hands, the filesystem needs them.
+
+## Decision
+
+`--type=avg` (the hourly aggregator) and `--type=trends` (the allocator's health/degradation signal) run on a cadence internal to the filesystem's own cycle and are **not exposed as configurable** — the allocator depends on `--type=trends` directly for health-aware placement decisions (project foundational goal), so their frequency isn't a setting a user gets to turn down.
+
+`--type=smart` (the human-facing health score and recommendation) **is** user-configurable: `[smart].report_interval_seconds`, ceiling of ≤3600 (one hour).
+
+## Rationale
+
+- The split follows a real structural line, not an arbitrary one: two of the three calls feed a decision-making system (the allocator) that can't function correctly on stale or user-disabled input; the third is informational output for a person, with no downstream system depending on its cadence.
+- The ≤3600 ceiling isn't a round-number default — it's tied to `--type=avg`'s own design, which folds samples into the *currently-accumulating* hourly bucket (ADR-003's sufficient-statistics model) before it finalizes. A `--type=smart` interval longer than an hour risks reading a health score computed against a bucket that already rolled over without ever being scored.
+
+## Consequences
+
+- **Positive**: the allocator's health-aware behavior can't be silently degraded by a user turning down a "SMART frequency" setting that they'd reasonably assume was just about the on-screen health report.
+- **Positive**: the ceiling has a stated engineering reason, not just "seemed reasonable" — makes it harder to loosen by mistake later without noticing why it was there.
+- **Negative**: two of the three SMART call types have zero user-facing configuration surface at all — anyone expecting to tune the filesystem's own internal health-monitoring cadence will find there's nothing to adjust, by design.

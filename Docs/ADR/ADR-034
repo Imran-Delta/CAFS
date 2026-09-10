@@ -1,0 +1,35 @@
+# ADR-034: B-Tree — Hash-Keyed, Per-Directory, Identifier Table as the Cross-Directory Path
+
+**Status**: Accepted (2026-09-09)
+
+## Context
+
+B-tree byte layout was flagged open through Job 1 and most of Job 3 — mechanism (path → identifier) was accepted early (ADR-019), but key encoding, branching factor, and whether it's one tree for the whole volume or one per directory were never decided, blocking any real implementation. Resolved this session, then checked against real precedent before finalizing.
+
+## Decision
+
+**Hash-keyed**, not string-keyed: each key is an 8-byte hash of a single path component, not the variable-length name itself.
+
+**One tree per directory**, not one global tree. A directory's own subtree root LBA is stored in its own Identifier Table row (ADR-018), repurposing the otherwise-unused `extent_list_offset` field (directories hold no file data) — `unix_mode` already distinguishes file rows from directory rows, so no new field is needed to know which meaning applies. Resolving a multi-component path means: walk the current directory's tree to find the next component's identifier, then jump via that identifier's Identifier Table row (a direct-indexed O(1) read, not a search) to reach the next directory's tree, repeating per component.
+
+**Node layout**: 4096-byte node (= `block_size`), 8-byte header (`is_leaf` flag + key count) followed by up to 255 fixed 16-byte slots (8-byte key hash + 8-byte child pointer or identifier, depending on leaf/internal).
+
+**Collision handling**: on a hash match, confirm against the real filename already stored in the matched identifier's Identifier Table row — no second copy of the name anywhere, this is a read, not new machinery.
+
+**Swappable by design**: `btree.rs` as its own function file behind a shared interface, plus a `namespace_structure_id` selector field reserved in the Superblock (proposed offset 84, one legal value for V1) per ADR-033's future-proofing pattern — a later alternative namespace structure can be added without breaking volumes formatted before it existed.
+
+## Rationale
+
+- Checked directly against ext3/ext4's HTree before finalizing, not assumed safe by analogy: HTree is described in the kernel's own documentation as "a specialized tree data structure for directory indexing, similar to a B-tree... constant depth of either one or two levels, have a high fanout factor, use a hash of the filename, and do not require balancing" — hash-keyed, per-directory, high-fanout, the same three properties decided here independently. HTree's own entries (`dx_entry`: 4-byte hash + 4-byte block, 8 bytes total) are the same fixed-slot pattern as this design's 16-byte slots, just narrower because ext4's block numbers are 32-bit where CAFS's identifiers/pointers are 64-bit.
+- Real-world payoff is documented, not theoretical: HTree indexing took ext2-family directories from "a practical limit of a few thousand files" to "tens of millions of files per directory."
+- Sort order was checked and found not load-bearing: every real consumer (`ls`, FUSE `readdir` callers) sorts client-side regardless of what order entries arrive in, so hash-keying's only real cost (losing server-side sort order) isn't actually a cost being paid for anything.
+- One-tree-per-directory avoids the alternative's real problem: a single global tree needs full paths or compound keys to disambiguate two files with the same name in different directories, which either means variable-length keys (defeating hash-keying's compactness) or a wider compound key (real, avoidable cost). Per-directory, a directory's own tree never needs to disambiguate anything outside itself.
+- Reusing the Identifier Table for cross-directory traversal avoids a second, redundant structure — the same reasoning already applied twice this session (Zone Table absorbing the integrity signal rather than a new table; the reference-counting design collapsing to two counts instead of three).
+
+## Consequences
+
+- **Positive**: real, at-scale precedent for every major property of this design, not just internal consistency.
+- **Positive**: ~255-way branching per level keeps tree depth low even for very large directories, without needing to design a novel indexing scheme.
+- **Positive**: no new structure needed for cross-directory resolution — the Identifier Table already does this job.
+- **Negative**: HTree's "does not require balancing" property depends on its specific hash-range-to-block mapping scheme — whether this design's plain slot array achieves the same without needing explicit rebalancing on insert/delete is an implementation question this ADR doesn't resolve.
+- **Open**: `namespace_structure_id` exact Superblock offset — proposed, not yet explicitly re-confirmed as final.

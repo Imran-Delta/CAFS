@@ -1,0 +1,68 @@
+# Job 3 Overview — For Review
+
+Everything discussed this session, organized by topic, for verification before ADRs/config/fs.info get generated. Flag anything misrepresented before I proceed.
+
+---
+
+## 1. mkfs_cafs.rs / layout.rs — reviewed, scope clarified
+
+The uploaded files are a **proof-of-concept test fixture for the I/O Engine only** — not an early draft of the real `mkfs.cafs`, which depends heavily on `fs.info` and is explicitly scoped much later. Findings from the review are recorded as known-and-accepted PoC limitations, not defects to fix now:
+
+- `FORMAT_VERSION = 4` in `layout.rs` (and the matching v19 comments) will need bumping to match whatever format version is current when the real tool is built — not relevant to fix today.
+- No tail anchor mirror is built (only Superblock Backup + B-SMART) — accepted, matches the PoC's narrow scope.
+- Meta/User Table is written as an all-zero placeholder, whose checksum field (also zero) doesn't match what BLAKE3-128 of an all-zero payload actually produces — accepted, noted as a landmine *if* this fixture is ever reused for something checksum-verifying it, not touched now.
+- Config Snapshot template is minimal (missing v20's `cow`/`snapshot`/`compression_chunk_*` fields) — accepted as intentionally minimal for a PoC.
+
+`checksum.rs` as a shared module is still a real, standing recommendation independent of the above — `mkfs_cafs.rs` reimplements `blake3_128` locally rather than importing one, concrete evidence of the duplication the module-structure proposal (Section 2) is meant to prevent.
+
+## 2. Module organization — "everything is a file," resolved
+
+- **Function files** (related functions grouped, e.g. `checksum.rs`, `syscall.rs`) called by **wrapper files** (a specific ordered sequence of function-file calls, e.g. `mount_auto.rs`) — accepted as the governing pattern.
+- **Shared-file promotion rule**: shared by 2 or more consumers → promoted to the level where those consumers' paths actually diverge (not a raw file-count threshold — corrected from an earlier overcomplicated reading). Python scripts shared between FUSE and Kernel land at `Src/` because that's where those two paths fork, not because of any numeric tier.
+- **Practical anchor for the rule**: if the level a shared file would be promoted to already contains a `Cargo.toml` or `README`, that confirms it's a real, already-recognized component boundary — a sound place for a shared folder to live and grow, rather than an arbitrary intermediate directory.
+- **`shared/` as its own crate**, not a same-crate module — confirmed by `mkfs_cafs.rs`'s own `use cafs_io::layout::*`. Buys a real, structural guarantee beyond style: Cargo enforces acyclic crate dependencies, so a same-crate module boundary (enforced only by discipline) can't accidentally develop a dependency cycle back into itself the way a module boundary could.
+- **"No mod.rs"** reads as "no *nested per-subdirectory* mod.rs," not zero declaration anywhere — one root `lib.rs`/`src/lib.rs` per crate is unavoidable and already present in the proposal as drawn.
+- **`var.rs`**: the instinct (pull shared types — `CafsCtx`, `MountOpts`, `ConfigSnapshot` — into one file) is good and accepted, but it doesn't replace `mod.rs`'s actual job (declaring the module tree). Two different concerns — "shared type definitions" and "module tree declaration" — both still need a home; `var.rs` fills the first, not both.
+- **Forward-compatibility check**: the structure already has room for every Job 1/2 addition (`identifier.rs`, `btree.rs`, `zone.rs`, `dedup.rs`, `snapshot.rs` slot in as peers of `mount.rs`/`verify.rs`/`confirm.rs`) without needing to change shape.
+
+## 3. B-tree — resolved
+
+- **Hash-keyed**, not string-keyed. Sort order isn't load-bearing (every consumer sorts client-side anyway), and hash-keying gets ~255-way branching per 4096-byte node versus ~170 for variable-length string keys. Collision handling reuses what already exists — the Identifier Table already stores the real filename, so an exact-match check on hash collision is a read, not new machinery.
+- **One tree per directory, not one global tree.** A single global tree needs full paths or compound keys as the key (expensive, defeats hash-keying's compactness). Per-directory trees keep the key a plain 8-byte name hash, since only one "readme.txt" can exist inside any given directory's own tree.
+- **The "pointer highway" between directories isn't a new structure** — it's the Identifier Table, doing a job it was already positioned for. A directory's own subtree root LBA is stored in its Identifier Table row's `extent_list_offset` field (repurposed — directories have no file data, so this field was otherwise unused; `unix_mode` already distinguishes file vs. directory rows, so nothing new is needed to know which meaning applies). Reaching the next directory's tree is a direct-indexed O(1) read, not a search.
+- **Swappable by design from V1**, even though only one implementation ships: `btree.rs` as its own function file behind a shared interface, plus a `namespace_structure_id`-style selector field reserved in the Superblock (one legal value for V1, per ADR-033's future-proofing pattern) so a later alternative implementation can be added without breaking volumes formatted before it existed. Proposed placement: Superblock offset 84 onward (currently reserved) — flagged as proposed, not yet explicitly re-confirmed after the underlying idea was accepted.
+- Node byte layout (8-byte header: `is_leaf` flag + key count; 16-byte slots: 8-byte key hash + 8-byte child pointer/identifier) is concrete and ready to formalize into `fs.info`.
+
+## 4. Zone Table — now two jobs, both confirmed
+
+1. **Original**: free-space/health scoreboard feeding the allocator's placement decisions (ADR-021, unchanged).
+2. **New**: the aggregation point for integrity-verification signal. A scrub (piggybacked on blocks balance/defrag already touch, rather than a dedicated competing scan) checks the existing mandatory 16-byte checksum trailer (Section 15a) and feeds a hit directly into the same per-zone health field SMART already populates — one health number, two sources, not two parallel "is this zone trustworthy" signals.
+3. **`full_drive_scan_preference`**: default **on**, tier **monthly** (corrects the earlier draft default of "off") — the dedicated full-pass exists specifically to cover cold, rarely-touched data the piggyback approach would otherwise never reach.
+
+## 5. Scheduling / preference system — four distinct shapes, not unified
+
+Deliberately **not** one shared type — forcing all of these into one enum was considered and rejected as a bad fit:
+
+| Shape | Used by | Mechanism |
+|---|---|---|
+| Coarse named tiers (hourly/daily/weekly/monthly/yearly) | Snapshot retention, full-drive scan | Shared enum type (ADR, this session) |
+| Fixed numeric seconds | `--type=smart`'s user-facing cadence | Plain config field, deliberately **not** folded into the tier enum — correction of an earlier suggestion to merge these |
+| Dynamic, runtime-adjustable, sub-second | Hash Daemon | Not a config value at all — runtime state bounded by config-set min/max |
+| Condition-triggered + starvation ceiling | Defrag/Balance | Already-existing `[idle_detection]` / `[background].priority_order` |
+
+## 6. Hash Daemon — sleep mechanism resolved
+
+`time.sleep(N)` rejected — not interruptible mid-sleep. Resolved via `selectors`/`asyncio`, blocking on the daemon's own socket **with a timeout**: timeout expiry triggers the periodic hash-building work, socket activity triggers request handling, and the current interval is re-read every loop iteration so a change takes effect on the next pass rather than waiting out whatever sleep was already in progress. A priority-elevation request arriving as a message on the same socket wakes the daemon immediately, rather than needing a second signaling channel.
+
+Config surface: `hash_daemon_min_interval_seconds` / `hash_daemon_max_interval_seconds` bound the range; the live value floats between them at runtime, driven by load/elevation, not read as a fixed setting.
+
+## 7. SMART Handler — scope split, confirmed
+
+- `--type=avg` and `--type=trends` feed the allocator directly and are **not user-configurable** — their cadence is internal to the filesystem's own cycle, not exposed.
+- `--type=smart` (the human-facing health score/recommendation) **is** user-configurable: `[smart].report_interval_seconds`, capped at ≤3600 — tied to `--type=avg`'s hourly bucket boundary (ADR-003's sufficient-statistics model), not an arbitrary round number.
+
+## Open items carried forward
+
+- **`namespace_structure_id` exact placement** — proposed (Superblock, offset 84+), proceeding with this unless corrected.
+- **`smart_handler.py`'s two independent `emergency_mode` signals** (from `--type=smart` and `--type=trends`, which can legitimately disagree) — explicitly left open, to be discussed later, not resolved this session.
+- Everything already carried forward from Job 1/2 (`STRUCTURE-OVERVIEW`'s open list) remains open — B-tree node layout is now resolved above, but Hash Table bucket layout, Recently-Zeroed Queue format, Snapshot Table `retention_tier` encoding, identifier slot reuse-vs-retire, metadata dedup, `raw`-in-snapshot policy, `raw` zero-vs-uninitialized, FAT32 sizing/trigger, and the GPT partition GUID question are all still exactly where they were.

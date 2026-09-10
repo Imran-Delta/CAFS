@@ -1,0 +1,29 @@
+# ADR-039: Module Organization — Function Files, Wrapper Files, Shared-Folder Promotion
+
+**Status**: Accepted (2026-09-09)
+
+## Context
+
+Proposed as a repo-wide organizing convention: group related functions into "function files" (`checksum.rs`, `syscall.rs`), with "wrapper files" calling them in a specific order (`mount_auto.rs`). Checked directly against the uploaded `mkfs_cafs.rs`, which reimplements `blake3_128` locally rather than importing a shared one — concrete, present-tense evidence for exactly the duplication this convention prevents, not a hypothetical justification.
+
+## Decision
+
+- **Function files**: related functions grouped by what they do, not by who calls them.
+- **Wrapper files**: a specific, ordered sequence of function-file calls (already the shape of `mount_auto.rs`, and of ADR-007's mount → check → remount → confirm pipeline).
+- **Shared-folder promotion rule**: a file used by 2 or more consumers is promoted to the level where those consumers' paths actually diverge — not a raw file-count threshold. Python scripts shared between FUSE and Kernel land at `Src/`, since that's where those two paths fork, regardless of how many individual files within each subsystem call them.
+- **Practical trigger for the rule**: if the level a shared file would be promoted to already contains a `Cargo.toml` or `README`, that's confirmation it's a real, already-recognized component boundary, not an arbitrary intermediate directory — the natural home for a shared folder to grow into without its organization getting lost as it accumulates files.
+- **`shared/` is its own crate**, not a same-crate module — evidenced by `mkfs_cafs.rs`'s own `use cafs_io::layout::*`. Buys a structural guarantee, not just a style preference: Cargo enforces acyclic crate dependencies, so a dependency cycle back into `shared/` is impossible by construction, where a same-crate module boundary would only prevent it by discipline.
+- **"No mod.rs"** means no *nested per-subdirectory* `mod.rs` — confirmed against the actual 2018-edition change, which is narrower than commonly summarized: a module with submodules can be named `foo.rs` (sibling to a `foo/` directory) instead of `foo/mod.rs`, not that module declaration disappears entirely. One root declaration file per crate (`lib.rs`) remains unavoidable and is already how the proposal draws `src/`.
+- **`var.rs`** holds shared *type definitions* (`CafsCtx`, `MountOpts`, `ConfigSnapshot`) — a good idea, but it doesn't replace `mod.rs`/`lib.rs`'s actual job (declaring the module tree), which was never really "exporting variables" in the first place. Two separate concerns, both still need a home.
+
+## Rationale
+
+- The shared-folder rule as a path-divergence rule, rather than a count threshold, matches its own stated origin example (Python shared between FUSE and Kernel landing at `Src/`) precisely — a count-based rule would need an arbitrary number attached to "FUSE and Kernel," where a divergence-based rule just asks where those two things stop being the same path.
+- The Cargo.toml/README anchor is checkable at a glance, rather than requiring the abstract "one level above" calculation to be reasoned about fresh each time a new shared file comes up.
+- Checked against real evidence at two points, not just accepted as stated: the `blake3_128` duplication in `mkfs_cafs.rs` (justifies `checksum.rs`), and the actual Rust 2018 edition module-system change (confirms "no mod.rs" as stated, with the correct scope).
+
+## Consequences
+
+- **Positive**: already has room for everything Job 1/2 added (`identifier.rs`, `btree.rs`, `zone.rs`, `dedup.rs`, `snapshot.rs` slot in as peers of `mount.rs`/`verify.rs`/`confirm.rs`) without changing shape.
+- **Positive**: `shared/`-as-crate makes a class of dependency-cycle mistake impossible rather than merely discouraged.
+- **Negative**: none identified beyond the ordinary cost of any convention — requires being followed consistently to pay off, which isn't something an ADR can enforce on its own.
