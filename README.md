@@ -1,43 +1,116 @@
 # Configurable Adaptive FileSystem (CAFS)
-## Source Code
 
-A FUSE‑based filesystem.
-Kernel Driver not recommended.
+A (Linux Kernel and) ZFS-inspired, config-first filesystem for consumer drives.
 
-## About Origins
-Hoi, so the origins is me (Imran) wanting to go all in into one hobby project. First!:
+> [!WARNING]
+> Alpha. Not production-ready.
+
+> [!NOTE]
+> Kernel driver is a placeholder. Isn't a priority for the time being.
+
+> [!IMPORTANT]
+> No software can fix a failing drive. CAFS can only try to delay data loss.
+
+## What it is
+
+CAFS aims to bring customizability and adaptability to consumer drives: health-aware block allocation driven by SMART data, two-tier deduplication, and an anchor/recovery design that only duplicates what actually matters. The configuration surface is the point — most design decisions are exposed as parameters rather than baked in.
+
+Currently at PoC stage: the I/O Engine builds and passes tests. Everything else is unbuilt.
+
+## Two builds
+
+| Build | IPC | Guardrails | For |
+|---|---|---|---|
+| Release | Per-interface, CAFS-controlled | On | Normal use |
+| Custom | One standard messaging format | Off | See below |
+
+**Custom** exists for people who want to plug CAFS into their own system, swap the allocator or any other module, or drive it over a standard messaging format instead of the per-interface IPC that Release uses internally. It ships as source only — anyone building Custom is already compiling.
+
+## What works right now
+
+- **PoC I/O Engine** — Rust, at `Src/FUSE/Linux/x86-64/I-O_Engine/`. Anchor mount lifecycle, generic block read/write. `cargo test` passes.
+- **`mkfs_cafs`** — format tool, built as a bin target inside the engine crate.
+- **`smart_handler.py`** — shared SMART telemetry processor at `Src/`.
+
+Not built yet: allocator, FUSE request layer, dedup table, WAL.
+
+## Repo layout
+
+```text
+cafs/
+├── Docs/
+│   ├── fs.info              on-disk format spec — canonical
+│   ├── config.fs            config format + crash-criticality
+│   ├── ADR/                 one decision per file, never edited
+│   ├── Research/            informs decisions, isn't one
+│   └── Drafts/              AI output before it's trusted — not canon
+├── Src/
+│   ├── smart_handler.py     shared: Kernel + FUSE
+│   ├── FUSE/
+│   │   ├── Linux/x86-64/I-O_Engine/   Rust PoC — the only buildable component
+│   │   └── Windows/                   placeholder
+│   └── Kernel/              placeholder
+├── Tools/                   check.py, test helpers
+├── .github/                 CI pipeline
+├── LICENSE
+├── LICENSES/                BSD-3-Clause, GPL-2.0
+├── Makefile                 provisional
+└── README.md
 ```
-Disclaimer: AI WAS USED! It's outputs are checked thoroughly!
-```
-Basically, I take almost everything in [Docs](Docs/) and use Claude to make the code, then have Deepseek and Gemini check the code, then I read it myself fully! So I hope no bugs go through.
-```
-But I am open to bugs and advice!!!!
-```
-~~The main idea was, a filesystem that can be configured, used extremely and ussd on semi-reliable devices.~~
-* The main idea is bringing customizability to consumer drives, with as much features as possible, and adaptability for almost all hardware.
-### Note:
-**If your drive is failing. No amount of software can help fix it, but (the software) can try to delay the loss of data.**
 
-## Status
+Critical files:
 
-### Alpha. Not production‑ready.
-1. S.M.A.R.T. Handler done, but needs update once allocator is being worked on.
-2. I/O Engine V1 Demo is done, in rust to prevent AI Hallucination to happen to a certain extent.
+· Docs/fs.info — on-disk format, byte-for-byte. Canonical.
+· Docs/config.fs — config file format and crash-criticality per section.
+· LICENSE / LICENSES/ — BSD-3-Clause repo-wide; GPL-2.0 for Src/Kernel/ only.
 
-* Next I will possibly work on the file strcuture, allocator or tests (To test on real hardware partitions)
+Repo conventions and the full layout rationale: cafs-repo-structure-2026-09-03.md.
 
-## Building
-### ;-; IGNORE the make please. I need to research rust.
+Building
+
+The only buildable component today is the I/O Engine:
+
 ```bash
-make
+cd Src/FUSE/Linux/x86-64/I-O_Engine
+cargo build
+cargo test
 ```
 
-## Documentation
+The root Makefile is provisional and may not work.
 
-1. See **[Docs](Docs/)** for the on‑disk format specification and configuration reference.
-2. See **[Src](Src/)** for the build source code.
-3. For Current Structure Draft (AI), see [CAFS Repo Setup](cafs-repo-structure-2026-09-03.md).
+A workspace root is planned so cargo build works from the repo root, but it isn't set up yet.
 
-## License
+Releases & versioning
 
-Multiple. See [LICENSE](LICENSE).
+```text
+Phase Tag GitHub flag Artifacts
+Alpha none — none
+Beta v0.1.0-beta.dev1 pre-release yes
+RC v0.1.0-rc1 pre-release yes
+Release v0.1.0 latest yes
+```
+
+Each tagged release includes:
+
+```text
+source.tar.gz             Release + Custom source. Build it yourself.
+installer_linux.sh        Bootstrap. Downloads portable.zip.
+installer_win_x86.exe     Self-contained Windows installer.
+installer_win_amd64.exe   Self-contained Windows installer.
+portable.zip              Offline bundle: Release binaries + docs.
+```
+
+Custom ships as source only, inside source.tar.gz.
+
+<details>
+<summary>AI disclosure</summary>
+
+AI is used to generate code from the specs in Docs/. Alpha builds may not be fully reviewed. Beta and release builds are checked before tagging.
+
+Bug reports and advice welcome.
+
+</details>
+
+License
+
+BSD-3-Clause repo-wide. GPL-2.0 for Src/Kernel/ only. See LICENSE and LICENSES/.
