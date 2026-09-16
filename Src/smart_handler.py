@@ -18,9 +18,10 @@ One file, three modes, all stdin JSON in / stdout JSON out:
                                    average/std_dev, weights them, and
                                    produces a single trend judgement.
 
-C invokes this three times per cycle: --type=avg to fold the current
-hour's samples, (default) to get a health score, --type=trends to get
-what the allocator actually consumes.
+FS Tasker (Rust, not C -- corrected from an earlier draft of this
+docstring) invokes this three times per cycle: --type=avg to fold the
+current hour's samples, (default) to get a health score, --type=trends
+to get what the allocator actually consumes.
 """
 
 import sys
@@ -355,12 +356,255 @@ def run_trends(payload):
     primary, primary_name, consistency = reconcile_smart_tables(scratch, main, backup)
     if primary is None:
         return {"trend": "unknown", "weighted_degradation": None, "consistency": "critical",
-                "allocator": {"emergency_mode": True, "caution": True}}
+                "allocator": {"emergency_mode": True, "caution": True},
+                "signals": compute_signals(payload, primary=None)}
 
     result = compute_trend_signal(primary, averages)
     result["consistency"] = consistency
     result["primary_table"] = primary_name
+    result["signals"] = compute_signals(payload, primary=primary)
     return result
+
+
+# =====================================================================
+# Signals layer (added this session) -- allocation_chs.rs's knob inputs
+# =====================================================================
+#
+# Different job from compute_trend_signal() above. That mechanism asks
+# "is CAFS's own error-counter history degrading relative to itself."
+# This layer asks "what does each allocator knob's live-swap decision
+# need to see, right now." Both live under --type=trends because both
+# genuinely belong to trends' scope -- kept side by side, not merged,
+# since they answer different questions from different data.
+#
+# Every value returned here is already bounded/normalized on purpose --
+# allocation_chs.rs is meant to do nothing but threshold comparisons
+# against these, no computation of its own.
+#
+# PLACEHOLDER INPUTS. Two real data sources this logic depends on
+# don't exist in the codebase yet:
+#   - io_placeholder: per-operation I/O Engine counters (consecutive
+#     write LBA distances, write-size samples). Needs syscalls.rs to
+#     actually populate -- not built yet.
+#   - smartctl_placeholder: real drive smartctl attribute reads
+#     (5, 187, 188, 197, 198 / NVMe critical_warning). No smartctl
+#     shell-out exists anywhere in this file yet -- this is standing
+#     in for that missing integration, not a finished one.
+# The math below is real and reviewable now; wiring these two sources
+# in for real is a separate, later change to this file's payload
+# handling, not to the formulas themselves.
+
+FIXED_CAP_BLOCKS = 262144   # 1GiB at 4KB blocks -- R_write normalization reference. Provisional, needs real tuning against actual workloads.
+BIAS_THRESHOLD = 2.0        # workload_bias >= this -> "sequential-friendly". Recalibrated this session -- the original threshold of 15 needed a 960KB average write at zero randomness to ever fire, unreachable for realistic sequential I/O.
+FREE_SPACE_LOW = 0.15       # Reused from the existing Urgent-B routine-tasker threshold rather than inventing a second number for the same concept.
+
+
+def compute_r_write(avg_consecutive_distance_blocks):
+    """Mean |LBA_new - LBA_prev| across writes in the window, normalized
+    against a fixed cap rather than total device blocks -- keeps
+    R_write's meaning consistent across different device sizes, so the
+    same physical write pattern scores the same on a 128GB SSD and a
+    20TB HDD."""
+    if avg_consecutive_distance_blocks is None:
+        return None
+    return min(avg_consecutive_distance_blocks / FIXED_CAP_BLOCKS, 1.0)
+
+
+def compute_workload_bias(mean_write_size_bytes, r_write):
+    """B = (mean write size in 64KB units) / denominator(r_write).
+    Denominator recalibrated this session: the original 1/(1+R_write)
+    can only ever halve B even at maximum randomness, too weak to
+    meaningfully penalize large-but-scattered writes. Replaced with a
+    shape whose denominator genuinely grows large as r_write -> 1 --
+    the *0.99 factor keeps (1 - r_write*0.99) bounded away from zero
+    (minimum 0.01 at r_write=1.0), so no real divide-by-zero risk
+    despite the harsh penalty near maximum randomness."""
+    if mean_write_size_bytes is None or r_write is None:
+        return None
+    size_component = mean_write_size_bytes / 65536.0
+    denominator = 1.0 / (1.0 - r_write * 0.99)
+    return size_component / denominator
+
+
+def normalize_attribute(raw_value, warn_at):
+    """0.0 = no concern, 1.0 = at or past the warn threshold. Straight
+    linear ramp -- a placeholder shape, not validated against real
+    drive-population failure data the way the 5/187/188/197/198
+    attribute *selection* itself was (Backblaze)."""
+    if raw_value is None or warn_at <= 0:
+        return 0.0
+    return min(raw_value / warn_at, 1.0)
+
+
+def compute_ewma(bucket_history, alpha=0.18):
+    """Fold an oldest-first bucket history into a single recency-
+    weighted value -- each point's influence decays exponentially the
+    further back it is, rather than every point counting equally
+    (a raw average) or only the endpoints mattering (a first-to-last
+    delta). alpha=0.18 targets roughly the last ~10 buckets dominating
+    the result (alpha = 2/(n+1) for n=10) -- a real starting number,
+    not tuned against actual drive data yet. A length-1 history just
+    returns that single point, which is the deliberate degrade path
+    for callers that don't have real history yet (see compute_signals)."""
+    if not bucket_history:
+        return None
+    ewma = bucket_history[0]
+    for value in bucket_history[1:]:
+        ewma = alpha * value + (1 - alpha) * ewma
+    return ewma
+
+
+def compute_health_composite(attr_5_history, attr_197_history, attr_188_history,
+                              checksum_mismatch_history=None, host_relocations_history=None):
+    """EWMA-smoothed per attribute, not raw-value-scored -- a single
+    isolated error nudges the score and decays back out over
+    subsequent buckets; a sustained climb doesn't. Matches real
+    disk-failure-prediction research's core finding for cumulative
+    counters: recent *change* is more informative than the raw
+    accumulated total, and matches the stated design goal directly --
+    drives don't fail instantly and occasional isolated errors are
+    normal, so the score has to distinguish noise from a genuine trend
+    rather than reacting to either identically.
+
+    Five inputs, not three: attr_5/197/188 (real ATA attributes) plus
+    checksum_mismatch and host_relocations, CAFS's own on-disk
+    counters. Those two aren't redundant with the ATA data -- they
+    catch a silent bit-flip that trips CAFS's own checksum without
+    ever crossing whatever internal threshold makes drive firmware
+    report an ATA error at all. Real smartctl evidence and CAFS-proven
+    evidence, combined, not overlapping.
+
+    187/198 never reach this function at all, at any input position --
+    they go straight to check_hard_floor and bypass scoring entirely,
+    on purpose. Combined via max(), not average -- one climbing input
+    shouldn't be diluted by four clean ones into a falsely reassuring
+    blend."""
+    inputs = [
+        (compute_ewma(attr_5_history), 10),
+        (compute_ewma(attr_197_history), 5),
+        (compute_ewma(attr_188_history), 5),
+        (compute_ewma(checksum_mismatch_history), 5),   # warn_at placeholder, same as the ATA ones -- needs its own tuning pass, not yet validated
+        (compute_ewma(host_relocations_history), 3),    # a relocation already succeeded in saving the data, but it's still real degradation evidence -- lower warn_at than checksum_mismatch since even a few relocations is worth noticing
+    ]
+    scores = [normalize_attribute(ewma, warn_at) for ewma, warn_at in inputs if ewma is not None]
+    return max(scores) if scores else 0.0
+
+
+def compute_pending_trajectory(attr_197_bucket_history):
+    """EWMA of the bucket-to-bucket *rate of change*, not a raw
+    first-to-last delta (the original shape) -- the delta version was
+    noisy with few buckets and couldn't tell a single-bucket blip from
+    a steady climb; this smooths that out while still reacting faster
+    than health_composite's own slower alpha, deliberately, since this
+    knob's whole job is catching deterioration before it becomes a
+    hard-floor event, not confirming it after the fact."""
+    if not attr_197_bucket_history or len(attr_197_bucket_history) < 2:
+        return None
+    deltas = [b - a for a, b in zip(attr_197_bucket_history, attr_197_bucket_history[1:])]
+    return compute_ewma(deltas, alpha=0.3)
+
+
+def compute_write_size_cv(write_size_average, write_size_std_dev):
+    """Deliberately separate from workload_bias -- bias conflates size
+    with sequentiality; Preallocation only cares whether write sizes
+    are *consistent*, not how big or how sequential they are."""
+    if write_size_average is None or write_size_std_dev is None or write_size_average == 0:
+        return None
+    return write_size_std_dev / write_size_average
+
+
+def check_hard_floor(attr_187_uncorrectable, attr_198_offline_uncorrectable,
+                      nvme_critical_warning_bits=None):
+    """Filesystem-wide override. Monotonic within a mount by design --
+    once True here, the caller is expected to keep hard_floor_active
+    True for the rest of the session regardless of what later reads
+    say; clearing it is a hot-remount concern, not something this
+    function does. 187/198 (both literally "uncorrectable" -- the
+    drive's own firmware already exhausted its retries before
+    reporting either) are the ATA hard triggers. NVMe critical_warning
+    bit 2 (reliability degraded) and bit 3 (media read-only) mirror
+    them -- bit 2 specifically matches VMware vSAN's own automatic-
+    action trigger, not an invented threshold."""
+    if attr_187_uncorrectable and attr_187_uncorrectable > 0:
+        return True
+    if attr_198_offline_uncorrectable and attr_198_offline_uncorrectable > 0:
+        return True
+    if nvme_critical_warning_bits is not None:
+        if nvme_critical_warning_bits & 0b0100:   # bit 2
+            return True
+        if nvme_critical_warning_bits & 0b1000:   # bit 3
+            return True
+    return False
+
+
+def compute_signals(payload, primary=None):
+    """Assembles every value allocation_chs.rs needs, each already
+    normalized/bounded. See module-level note above on io_placeholder
+    and smartctl_placeholder -- both stand in for data sources that
+    don't exist in the codebase yet.
+
+    primary: the already-reconciled on-disk SMART array from
+    reconcile_smart_tables() (same data compute_trend_signal already
+    uses) -- real, not a placeholder. Supplies checksum_mismatch and
+    host_relocations' *current* values directly. Their multi-hour
+    bucket history (for real EWMA smoothing, not just a single-point
+    read) isn't available from anywhere yet -- same gap as the ATA
+    attributes' history. Until that plumbing exists, every history
+    list here degrades to length-1 (just the current value) when a
+    fuller history isn't supplied in the payload -- compute_ewma of a
+    single point is just that point, so this runs correctly today and
+    improves automatically once real history is wired in, with no
+    further code change needed here."""
+    io = payload.get("io_placeholder", {})
+    smartctl = payload.get("smartctl_placeholder", {})
+
+    r_write = compute_r_write(io.get("avg_consecutive_write_distance_blocks"))
+    workload_bias = compute_workload_bias(io.get("mean_write_size_bytes"), r_write)
+
+    def history_or_single(explicit_history_key, single_value):
+        history = smartctl.get(explicit_history_key)
+        if history:
+            return history
+        return [single_value] if single_value is not None else None
+
+    checksum_mismatch_current = primary[CKSUM_ERR] if primary is not None else None
+    host_relocations_current = primary[RELOC] if primary is not None else None
+
+    health_composite = compute_health_composite(
+        history_or_single("attr_5_bucket_history", smartctl.get("attr_5_reallocated")),
+        history_or_single("attr_197_bucket_history", smartctl.get("attr_197_pending")),
+        history_or_single("attr_188_bucket_history", smartctl.get("attr_188_timeout")),
+        history_or_single("checksum_mismatch_bucket_history", checksum_mismatch_current),
+        history_or_single("host_relocations_bucket_history", host_relocations_current),
+    )
+    pending_trajectory = compute_pending_trajectory(
+        history_or_single("attr_197_bucket_history", smartctl.get("attr_197_pending"))
+    )
+    write_size_cv = compute_write_size_cv(
+        io.get("write_size_average"), io.get("write_size_std_dev")
+    )
+
+    # Zone Table pass-through -- not computed here, just carried along
+    # so allocation_chs.rs has one place to read every signal from.
+    free_space_percent = payload.get("free_space_percent")
+
+    hard_floor_active = check_hard_floor(
+        smartctl.get("attr_187_uncorrectable"),
+        smartctl.get("attr_198_offline_uncorrectable"),
+        smartctl.get("nvme_critical_warning_bits"),
+    )
+
+    return {
+        "workload_bias": workload_bias,
+        "workload_bias_sequential": workload_bias is not None and workload_bias >= BIAS_THRESHOLD,
+        "r_write": r_write,
+        "health_composite": health_composite,
+        "pending_trajectory": pending_trajectory,
+        "write_size_cv": write_size_cv,
+        "free_space_percent": free_space_percent,
+        "free_space_low": free_space_percent is not None and free_space_percent < FREE_SPACE_LOW,
+        "hard_floor_active": hard_floor_active,
+    }
 
 
 # =====================================================================
