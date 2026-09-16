@@ -724,6 +724,296 @@
         "**Positive**: `shared/`-as-crate makes a class of dependency-cycle mistake impossible rather than merely discouraged.",
         "**Negative**: none identified beyond the ordinary cost of any convention — requires being followed consistently to pay off, which isn't something an ADR can enforce on its own."
       ]
+    },
+    {
+      "id": "ADR-040",
+      "title": "Allocator Process Architecture — Daemon and Library, Both Real, Mode-Gated",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "ADR-017 established a balance/performance/safety mode toggle but left the allocator's process architecture as a single implicit choice. Extended discussion this session (crash isolation vs. per-operation IPC latency, precedent from ntfs-3g's verified single-threaded FUSE loop and SPDK's zero-hop design) found no single answer that fit every mode: safety-oriented deployments benefit from a separate process's crash isolation and simpler concurrency reasoning; performance-oriented deployments cannot absorb the 10-50+ microsecond IPC tax on every allocation against NVMe's sub-100-microsecond native latency.",
+      "decision": "Both a daemon (separate process) and a library (in-process) form of the allocator are implemented, not one. Core allocation logic lives in one struct exposing `allocate`, `free`, and `update_knob`. A shared trait defines this contract; two thin implementations satisfy it — one calling the core struct directly (library), one serializing the same calls over a socket (daemon). Which implementation mntproc holds is selected once, at mount, via `[allocator].mode` — `safety` biases toward daemon, `performance`/`balanced` default to library, `custom` sets it explicitly.",
+      "rationale": [
+        "No mainstream FUSE filesystem splits its allocator into a separate local process; the per-operation IPC cost compounds FUSE's own unavoidable kernel-userspace hop rather than being independent of it.",
+        "A daemon still has real value for the safety-oriented case: crash isolation, and simpler concurrency reasoning via natural request serialization.",
+        "Rust's catch_unwind at the library-mode call boundary recovers most of a daemon's crash-isolation benefit for library mode too, at effectively zero cost on the non-panicking path.",
+        "Committing to one shape only would have made the 'safety' and 'performance' presets structurally unable to actually differ on this axis."
+      ],
+      "consequences": [
+        "Positive: matches the project's stated maximal-configuration philosophy without sacrificing performance where it matters most.",
+        "Negative: two deployment shapes to implement, test, and keep behaviorally identical, not one.",
+        "Open: where the daemon-mode binary is actually built/packaged from (same crate as a build target, or a separate crate) is not yet decided — a packaging question, not an architecture question."
+      ]
+    },
+    {
+      "id": "ADR-041",
+      "title": "Allocator Concurrency — Per-Zone RwLock, Fixed at Mount, Global-Order Locking for Cross-Zone Operations",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "An earlier design allowed the allocator's concurrency model to switch live between mount-time epochs, which a prior audit found caused a genuine data race — two overlapping locking regimes could double-allocate the same block. The correct replacement concurrency model, and how cross-zone operations avoid deadlock under it, were undecided this session's entry.",
+      "decision": "Concurrency is one of two locking primitives, selected by media type and fixed for the entire mount: a single Global lock (HDD — matches ntfs-3g's own verified approach, confirmed directly from its source, which never runs its FUSE loop multithreaded) or a per-zone/block/B-tree-leaf `RwLock` (SSD/NVMe — many concurrent readers or one exclusive writer, never both). Concurrency is explicitly excluded from the six-knob live hot-swap system (ADR-043) for the same reason it caused the original race. Operations needing more than one zone's lock simultaneously (a cross-directory rename is the concrete case) acquire in a fixed global order — always the numerically lower zone ID first — and hold both for the operation's duration.",
+      "rationale": [
+        "Fixing concurrency at mount removes the exact axis that caused the previously-audited race, without giving up adaptivity on the other six allocator knobs.",
+        "Global-order lock acquisition is a standard, provably deadlock-free technique — no cycle can form if every thread acquires shared resources in the same total order.",
+        "The alternative to global ordering (release the first lock before acquiring the second) was rejected: it opens a window where a renamed file resolves from neither its old nor new path, violating POSIX rename atomicity."
+      ],
+      "consequences": [
+        "Positive: eliminates a known, previously-audited class of race entirely, by construction.",
+        "Negative: no live adaptation of concurrency strategy within a session — a media-detection error at mount persists until the next remount.",
+        "Open: whether 'same file / same block / same leaf / same zone' are four genuinely separate lock domains an operation might need simultaneously, or collapse to one in practice, is not resolved."
+      ]
+    },
+    {
+      "id": "ADR-042",
+      "title": "Allocator Configuration — Four Modes Gate Preset Eligibility at Mount, Six Presets (A0-A5)",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "ADR-017's balance/performance/safety toggle predates this session's finding that hardware type (HDD vs. SSD) and health both need to influence the allocator's starting configuration, and that a mode should not permanently lock a preset's values regardless of later observed conditions.",
+      "decision": "Four modes — performance, balanced, safety, custom. A mode gates which presets are *eligible* at mount time only; it does not fix runtime knob values and does not override live signal-driven swapping afterward (ADR-043). If exactly one preset survives a mode's filter it is auto-selected; if more than one survives, `--type=trends`' signal values pick among what remains. Six presets exist, not the nine a naive three-media-type model would suggest: M.2 is a connector, not a protocol, and collapses into whichever of SATA or NVMe it actually is; SSD-SATA and SSD-NVMe are identical across every currently-defined knob (nothing in the current knob vocabulary distinguishes them — see Open Questions), so they share one row. A4/Emergency is not a seventh preset; it is the hard-floor override (ADR-044), cross-cutting every preset rather than being one.",
+      "rationale": [
+        "Two-stage gating (mode narrows eligibility, signals pick within it) means a healthy drive in safety mode still reaches fast knob values once confirmed healthy, and a degrading drive in performance mode still gets the same protective swaps as any other mode — mode is not a permanent ceiling.",
+        "Manufacturing an artificial SATA-SSD/NVMe-SSD distinction to fill separate table cells would have been fabricated precision; being honest that the current knob set doesn't differentiate them is more useful than pretending it does.",
+        "Removing A4 from the preset list and making it a cross-cutting override directly fixes a documented hysteresis bug in the original static model, where the allocator could become permanently trapped in Emergency."
+      ],
+      "consequences": [
+        "Positive: mode's influence is now honestly scoped to what it actually controls, rather than implying a permanent behavioral lock that was never actually intended.",
+        "Negative: SSD-SATA and SSD-NVMe presently sharing a row is a real, not cosmetic, gap — an NVMe-specific behavior (queue-depth-aware placement or similar) has no home in the current knob vocabulary at all.",
+        "Open: whether the mode-to-preset tiebreak (when more than one preset survives the mode filter) uses only health-derived signals or the full Signals set including Workload Bias is not resolved.",
+        "Open: 'balanced' mode's daemon-vs-library default (ADR-040) was never explicitly confirmed, unlike safety and performance."
+      ]
+    },
+    {
+      "id": "ADR-043",
+      "title": "Allocator Knobs — Seven-Knob Decomposition and Independent Per-Knob Hot-Swap",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "The original A0-A4 static model selected five bundled algorithms wholesale, with no live adaptation. Bundled selection conflated several genuinely independent concerns (placement strategy, preallocation, delayed allocation, read-ahead size) and gave no way to adjust one without reselecting all of them, and offered no mechanism for safe live reconfiguration at all — a prior design that attempted live whole-algorithm switching was found, on audit, to cause a data race.",
+      "decision": "Seven components, not five bundled algorithms: Concurrency (fixed at mount, ADR-041, not part of what follows), Placement, Preallocation, Delayed Allocation, Read-Ahead, Flush Interval, and Bad-Block Relocation. The latter six are fully independent — each has its own generation-counter/`Arc<KnobValue>` state and its own timer; none depend on any other's state. Decision logic (which signal drives which knob, and the threshold rules) lives in a separate module, `allocation_chs.rs`, distinct from the core allocator (`allocator.rs`) and again from the knobs' own value definitions — allowing policy to be swapped, and new positions added to an existing knob, without touching core allocation mechanics. Hot-swap mechanism: each knob's current value sits behind a reference-counted pointer; an operation clones that pointer at the exact point it needs the knob (not once at operation start), so a swap never requires draining or stalling in-flight work. Per-knob timing: 15-second poll (matching `--type=trends`' cadence), 3 consecutive readings must agree within a soft range before a change is eligible to fire, and a 300-second stabilization lock applies independently per knob after any change.",
+      "rationale": [
+        "Per-operation, point-of-use reads (rather than pinning a whole config snapshot at operation start) are sufficient for safety specifically because each of the six knobs individually requires no synchronization against other in-flight operations — the property Concurrency alone lacked, which is why Concurrency is excluded from this system rather than included in it.",
+        "Splitting decision policy (chs.rs) from mechanics (allocator.rs) from value definitions (the knob enums) gives real, if partial, third-party modularity: policy-swapping and position-adding are supported; genuinely novel knob semantics still require a matching arm in the core allocator's execution logic.",
+        "Independent per-knob stabilization avoids one knob's thrashing forcing a lock on five unrelated ones, and matches this session's explicit 'the knobs are independent' requirement rather than a bundled-swap model."
+      ],
+      "consequences": [
+        "Positive: closes the exact race class that made whole-algorithm live switching unsafe, while still getting live adaptation on six of seven axes.",
+        "Positive: a single large sequential write straddling a Placement swap could in principle place its early and late extents under different strategies — acknowledged as a real, rare consequence of point-of-use reads, not an oversight.",
+        "Negative: six independent timers and generation counters are more implementation surface than one bundled swap would have been.",
+        "Open: the consensus window's 'soft agreement, not exact match' range width is explicitly flagged as needing real on-disk testing, not yet a number.",
+        "Open: whether the emergency override (ADR-044) respects each knob's individual stabilization lock or bypasses all six simultaneously was resolved toward simultaneous bypass via a single checked-first global flag, not by coordinating six counters."
+      ]
+    },
+    {
+      "id": "ADR-044",
+      "title": "Hard Floor — Monotonic Filesystem-Wide Override for Unrecoverable Drive Errors",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "smart_handler.py has historically produced two independent emergency_mode signals (from --type=smart and --type=trends) that can legitimately disagree, with no stated precedence — flagged as an open gap in fs.info prior to this session. Separately, this session's allocator work needed a way for a genuinely unrecoverable drive condition to override the normal per-knob signal-driven system (ADR-043) without requiring six knobs' independent timers to somehow coordinate a simultaneous change.",
+      "decision": "Precedence resolved: --type=smart's acute signal wins over --type=trends by default, user-configurable — except a hard floor no configuration can override. The hard floor is a single global, monotonic `hard_floor_active: AtomicBool`, checked first by every knob's read, ahead of that knob's own generation-counter logic — if set, the knob uses its hardwired emergency position (Placement=Sequential-Append, Preallocation=Off, Delayed Allocation=Off, Read-Ahead=128KB, Flush Interval=Short; Bad-Block Relocation's emergency value is not yet decided) instead of its normally swapped value. Trigger, ATA: SMART attribute 187 (Reported Uncorrectable Errors) or 198 (Offline Uncorrectable Sector Count), either non-zero — both indicate the drive's own firmware already exhausted its retries before reporting. Trigger, NVMe: `critical_warning` bit 2 (reliability degraded, matching VMware vSAN's own automatic-action trigger) or bit 3 (media read-only). Single writer only (the real-smartctl-reading code path); monotonic within a mount — clearing it requires a hot remount, never a live reset.",
+      "rationale": [
+        "A single checked-first flag avoids inventing a mechanism to coordinate six independent generation counters into a simultaneous bump — the override short-circuits ahead of them instead.",
+        "187/198 (ATA) and bits 2/3 (NVMe) were chosen specifically because they represent the drive's firmware having already exhausted recovery attempts, not a threshold CAFS invented — real signal, not noise, which is what justifies making them non-configurable.",
+        "The drive's own aggregate smartctl -H PASSED/FAILED self-assessment was deliberately excluded as a trigger — it is documented as unreliable in both directions (drives fail while reporting PASSED, and vice versa) — in favor of the specific validated attribute values."
+      ],
+      "consequences": [
+        "Positive: closes a gap fs.info had flagged as open prior to this session, with a concrete, precedented (VMware vSAN) resolution rather than an arbitrary one.",
+        "Positive: monotonicity means a reader mid-write-cycle sees at most a few seconds' staleness, never a false positive — no synchronization needed on the read side.",
+        "Negative: a hot remount to clear the flag must fully quiesce in-flight I/O under the old concurrency regime first, or it reintroduces the exact overlapping-epoch race ADR-041 exists to prevent — not yet verified as implemented correctly, only specified as a requirement.",
+        "Open: whether the hard-floor response (switch to safest mode) is global (whole volume) or zone-scoped is unresolved; smartctl-derived signals are inherently whole-device, so this may not be answerable in all cases even in principle.",
+        "Open: severity gradient (warning vs. error notification) is unspecified.",
+        "Open: Bad-Block Relocation's emergency-floor value (Off vs. Reactive) was not decided."
+      ]
+    },
+    {
+      "id": "ADR-045",
+      "title": "SMART Handler Signals Layer — Workload Bias, Health Composite, Pending Trajectory",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "The allocator's six hot-swappable knobs (ADR-043) need decision-ready input values, but neither raw SMART attribute counts nor raw I/O counters are directly usable — real disk-failure-prediction research indicates recent change in a cumulative counter is more informative than its raw accumulated value, and drives accumulate occasional errors as a matter of course without those errors indicating imminent failure.",
+      "decision": "A Signals layer, computed inside --type=trends, additive alongside the pre-existing internal-error-counter z-score mechanism rather than replacing it (that mechanism answers a different question — CAFS's own error-counter drift relative to its own history — from real data). Health Composite combines three ATA attributes (5, 197, 188) and two CAFS-native on-disk counters (checksum_mismatch, host_relocations — evidence smartctl cannot see, since these catch silent corruption that never crosses an ATA-reportable threshold) via max(), not average, each smoothed by an exponentially-weighted moving average (EWMA, alpha=0.18) rather than scored on raw value — an isolated error nudges the score and decays out, a sustained trend does not. Pending Trajectory applies the same EWMA technique to attribute 197's bucket-to-bucket rate of change (alpha=0.3, more reactive, since this knob's purpose is catching deterioration early). Workload Bias (B = mean write size in 64KB units, divided by a denominator derived from R_write) and R_write (normalized average consecutive-write LBA distance, fixed-cap normalized rather than device-relative, to keep meaning consistent across device sizes) drive Read-Ahead. All Signals outputs are pre-normalized/bounded specifically so allocation_chs.rs performs no computation of its own, only comparisons.",
+      "rationale": [
+        "EWMA is standard, decades-old statistical process control technique (Western Electric/Shewhart lineage) — proportionate to a lightweight Python script, unlike the ML-based (LSTM/XGBoost) approaches surveyed in current disk-failure-prediction literature, which would require a training pipeline and labeled data this project does not have.",
+        "187 and 198 are deliberately excluded from Health Composite's scoring entirely — they route directly to the hard floor (ADR-044) instead, since 'uncorrectable' data loss is a different category from gradual degradation.",
+        "Workload Bias's original formula (recovered from an earlier drafting session) had two internally-contradictory R_write normalization methods and a threshold (B >= 15) unreachable at realistic write sizes; both were corrected this session — fixed-cap normalization, denominator reshaped to genuinely penalize near-maximum randomness, threshold recalibrated to B >= 2."
+      ],
+      "consequences": [
+        "Positive: verified end-to-end via smoke tests with realistic payloads before being considered working, not just specified on paper.",
+        "Positive: on-disk-counter fields degrade gracefully to a single-point EWMA when full multi-hour bucket history isn't available (which it currently isn't, pending real integration) — runs correctly today, improves automatically once real history is wired in.",
+        "Negative: no real smartctl shell-out and no syscalls.rs I/O-counter instrumentation exist anywhere in the codebase yet — every real-world input to this layer is currently a placeholder payload field.",
+        "Open: every numeric threshold (EWMA alpha constants, per-attribute warn-at values, R_write's fixed cap, write_size_cv's low/high split) is a reasoned starting shape, not validated against real drive data."
+      ]
+    },
+    {
+      "id": "ADR-046",
+      "title": "WAL Physical Model — Raw-Tagged Chunk Chain, Head-Based Rotation",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "WAL's block-level allocation strategy and its relationship to the Zone Table's general allocation pool was unspecified prior to this session — an earlier analysis identified a real gap where WAL block allocation did not participate in the same refcount mechanism the Zone Table uses as its sole write-collision protection, meaning the general allocator could in principle hand out a still-live WAL block.",
+      "decision": "WAL is built from one or more raw-tagged, ~512MB chunks, allocated by the allocator at mount time (the specific 'permission slip' hand-off mechanism deferred to broader allocator work); if a full contiguous chunk isn't available, multiple variable-length contiguous runs are chained instead. Rotation is head-based, not a ring buffer or array: older entries sit at the head, get applied, and the head advances/shrinks by block_size increments as each block's worth is confirmed applied — entries are never moved. When the active chunk fills, a new chunk is allocated for further writes while the old one continues draining independently; once fully drained it is destroyed. Default behavior when no full chunk is available is to stall; under high I/O, allocation falls back to block_size granularity instead of stalling, to keep writes flowing. The Function Table's wal_lba is a fast-path discoverability pointer only, not authoritative (the Zone Table remains ground truth) — this is what justifies its existing placement in the non-critical Function Table rather than a critical structure.",
+      "rationale": [
+        "Because WAL blocks are ordinary raw-tagged allocations, they inherit whatever collision-protection mechanism already covers raw files generally — closing the refcount-integration gap without inventing a WAL-specific mechanism.",
+        "Head-based (not tail-based, not ring-buffer) rotation directly matches the actual constraint: entries must never move, since moving them would require rewriting already-durable WAL content.",
+        "Stall-by-default with a block_size fallback under high I/O avoids the original three-way overflow-handling fork (spill to general pool / force emergency head advancement / stall) by making the chunk-chain model itself open-ended — there is no fixed capacity to overflow past, only a decision about allocation granularity when large space is scarce."
+      ],
+      "consequences": [
+        "Positive: resolves a real collision-safety gap by reusing an existing mechanism (raw-file allocation protection) rather than adding a new one.",
+        "Negative: Function Table's wal_lba needs to become a list of active chunk locations, not a single pointer — proposed reusing the 16-byte extent-entry shape, not yet formally specified in fs.info.",
+        "Open: whether granular applied/not-applied tracking (so fsck can tell a head-block was applied before a crash, before the head pointer itself was updated) lives in the Function Table's fast-path structure or the WAL Block Header itself was not resolved."
+      ]
+    },
+    {
+      "id": "ADR-047",
+      "title": "Identifier Slot Lifecycle — Immediate Retirement, Asynchronous Reuse via Recently-Zeroed Queue",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "fs.info flagged identifier slot reuse vs. permanent retirement as unresolved, affecting whether the Identifier Table only ever grows or eventually needs compaction — deferred multiple times across prior sessions.",
+      "decision": "Both: an identifier's refcount reaching zero triggers immediate retirement (inline, cheap — no hot-path cost) and the slot is queued via the Recently-Zeroed Queue's existing `tag` field (a new tag value for 'retired identifier, available for reuse') for asynchronous reclaim by defrag/balance/storage-expander — the same background-reclaim pattern already used for data blocks, not new plumbing.",
+      "rationale": [
+        "identifier_refcount already accounts for snapshot-root reachability, not just live B-tree references — so reuse cannot collide with an identifier still referenced by a retained snapshot; the correctness risk that made this decision seem harder than it needed to be does not actually apply.",
+        "Offloading the actual reclaim/reuse bookkeeping to existing background housekeeping (rather than doing it inline at delete time) keeps the hot path's cost to a single retirement flag flip and a queue push.",
+        "The Recently-Zeroed Queue's tag field existing specifically to distinguish different kinds of 'recently freed' things made this the natural mechanism, rather than a new structure."
+      ],
+      "consequences": [
+        "Positive: bounded Identifier Table growth via reuse, without the async-offload pattern adding hot-path latency.",
+        "Negative: the Recently-Zeroed Queue's byte format, already provisional, now needs to accommodate a second entry kind — the kind is decided, the layout is not (fs.info Section 18)."
+      ]
+    },
+    {
+      "id": "ADR-048",
+      "title": "B-Tree Branching Factor Correction — 254 Slots, Resolving a Checksum-Trailer Collision",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "ADR-034 resolved the B-tree's node layout at 255-way branching. Checking that layout's byte offsets directly against the checksum trailer's fixed position (Section 15a, the last 16 bytes of every node) this session found a genuine, present-tense conflict: a full 255-slot node's final slot occupies offset 4072-4087, overlapping the trailer's first 8 bytes (4080-4095) by construction, not hypothetically.",
+      "decision": "254 slots, not 255 (8-byte header + 254 x 16-byte slots = 4072 bytes, 8 bytes reserved/zero, 16-byte trailer at offset 4080-4095). Mirrors ext4's own dx_tail precedent — reducing usable capacity specifically to make room for a checksum — rather than inventing a novel resolution.",
+      "rationale": [
+        "The conflict was found by directly checking two already-written sections' byte ranges against each other, not by speculation — RESEARCH-JOB3 had flagged the general category of question (what happens when a node's checksum doesn't fit once full) as open; this closes it with the actual numbers rather than leaving it as a category.",
+        "ext4's dx_tail handles the structurally identical problem (a directory index format with a trailing checksum that doesn't fit a maximal node) the same way — precedent, not invention."
+      ],
+      "consequences": [
+        "Positive: fs.info's B-tree section is now internally consistent with its own checksum-trailer section, closing a real defect before implementation rather than after.",
+        "Negative: any code or documentation still assuming 255-way branching from the ADR-034/v21 era needs correction.",
+        "Open: whether the corrected node format needs explicit rebalancing on insert/delete, or achieves HTree's 'no balancing required' property by construction, remains an implementation question, not resolved by this fix."
+      ]
+    },
+    {
+      "id": "ADR-049",
+      "title": "`raw` Full-Allocation Semantics — Unwritten-Extent Flag, and Exclusion from Snapshot Scope",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "Two open items from ADR-027 and fs.info's known-gaps list: whether a `raw` file's full upfront allocation should be physically zero-filled or left uninitialized, and what policy governs a `raw` file encountered during a volume-wide snapshot (config.fs's raw_file_policy field existed as a provisional skip/warn/block choice).",
+      "decision": "Zero-vs-uninitialized resolved toward ext4-style unwritten-extent semantics: the top bit of an extent's length field is a new UNWRITTEN flag: allocated space is marked logically zero without being physically zero-filled, a read of an unwritten range returns zero without touching disk, and a write clears the flag for the written portion. Separately, `raw` files are now understood as categorically outside snapshot scope by construction (no CoW means nothing for a snapshot to hold a reference to) rather than subject to a runtime policy choice — `raw_file_policy` is removed from config.fs as a result, not merely defaulted.",
+      "rationale": [
+        "A physical zero-fill pass at allocation time is itself the write-amplification cost `raw`'s whole design intent exists to avoid — recommending it as the 'safe' choice would have directly contradicted the feature's own stated purpose.",
+        "The unwritten-extent flag achieves both goals simultaneously (no stale-data leak, no upfront write cost) rather than trading one for the other, matching real ext4 precedent (confirmed directly from a 2007 ext4 kernel-mailing-list design discussion) for the underlying mechanism.",
+        "raw_file_policy's three options implied a genuine choice existed where, on inspection, none did — a `raw` file was never actually protectable by a snapshot regardless of the configured policy value."
+      ],
+      "consequences": [
+        "Positive: closes two separately-tracked open items with one coherent design rather than two independent patches.",
+        "Negative: the unwritten-extent mechanism has a real history of subtle correctness bugs even in mature filesystems (partial-zeroing edge cases, stale-data exposure on power loss mid-conversion) — flagged as deserving deliberate implementation care, not a trivial one-bit addition.",
+        "Negative: removing raw_file_policy is a behavior-visible config change for anything that referenced the old field."
+      ]
+    },
+    {
+      "id": "ADR-050",
+      "title": "Process/Handler Architecture — Routine Tasker's Three Priorities and Named Housekeeping Modules",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "ADR-015 established master/mntproc and per-housekeeping-task child processes at a high level; ADR-036 established four scheduling shapes without naming an executor. Neither named the concrete set of housekeeping modules or specified how routine (non-emergency) maintenance is actually sequenced.",
+      "decision": "Two distinct tasker roles inside tasker.rs: FS Tasker (runs non-blocking, on-demand filesystem scripts called during I/O — e.g. --type=trends, hash queries) and Routine Tasker (a scheduler: checks I/O stats and config, decides whether to run a routine now, computes a next-check schedule). Named housekeeping modules: defrag.rs, balance.rs, scrub.rs (the full A-to-Z pass — this is what 'scrub' means: integrity verification and repair from redundancy, not space reclamation), and store_mgr.rs (storage expander, described as 'the fast scrubber' — reclaims dead identifier/data-block references, distinct from scrub). Routine Tasker has three priorities, not the four originally described: Normal (idle/low-I/O, on a configured interval — runs storage-expander, then balance, then defrag, then balance again, then SMART, in that order: storage-expander clears already-deleted-but-uncommitted entries first, balance closes gaps, defrag's merge work creates a new gap that a second balance pass closes), Urgent (two variations — A: accumulated maintenance debt past 30 days, runs the full Normal set at slightly higher priority; B: free space below 15%, runs a narrower fast set — storage-expander plus high-speed balance, skipping defrag — since the priority is space back immediately, not thoroughness), and Check (the full scrub pass, on a daily-to-biennial cadence).",
+      "rationale": [
+        "Naming FS Tasker and Routine Tasker as distinct roles within one module, rather than separate processes, reflects that FS Tasker's job (on-demand script invocation during I/O) is closer to a code role mntproc already performs than a new supervised process.",
+        "The double-balance sequencing in Normal isn't redundant: each pass has a distinct job (closing pre-existing gaps vs. cleaning up the gap defrag's own merge work just created), confirmed directly rather than assumed.",
+        "Urgent's two variations get different task sets because their triggers imply different urgency shapes — space pressure needs speed, accumulated debt needs thoroughness at elevated priority, not the same response to both."
+      ],
+      "consequences": [
+        "Positive: 'scrub' terminology corrected before it caused a design-level confusion between integrity-checking and space-reclamation, which had been conflated in an earlier framing this session.",
+        "Negative: Linux's `PR_SET_CHILD_SUBREAPER` (verified directly against its actual behavior) is required for master to reliably detect orphaned housekeeping children if Routine Tasker itself crashes mid-dispatch under a nested supervision tree — not yet confirmed as implemented.",
+        "Open: whether Routine Tasker calls defrag.rs/balance.rs/scrub.rs/store_mgr.rs as separate supervised child processes (preserving ADR-015's crash isolation) or in-process function calls was flagged as needing an explicit answer, not assumed either way.",
+        "Open: migration/cold_storage's handler identity (its own process vs. a mode of balance) and the relocation-log's execution owner (who drains pending bad-block relocation intents) remain unnamed."
+      ]
+    },
+    {
+      "id": "ADR-051",
+      "title": "Defrag/Balance Scheduling — On-Demand on SSD, Automatic on HDD",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "Verified research this session found that data-shuffling for layout purposes provides no read-latency benefit on SSD (no seek time to optimize for) while directly costing write endurance — the same physical write-wear cost regardless of why data was moved, whether for classic seek-time locality or CAFS's own CoW-related space-reclamation reasons.",
+      "decision": "Defrag and balance run automatically, on a configured schedule, on HDD (matching ADR-050's Normal priority sequencing). On SSD, both become on-demand only — a user-triggered config action, not part of the automatic Routine Tasker rotation — leaving storage-expander (which reclaims space directly, without data-shuffling for layout) as the automatic SSD-side component.",
+      "rationale": [
+        "The classic 'never defrag an SSD' guidance is specifically about seek-time locality, which doesn't apply to CAFS's defrag/balance (space-reclamation motivated) — but the write-wear cost of moving data applies identically regardless of motivation, so the media-type split still holds for a different reason than the folk wisdom usually cites.",
+        "On-demand access is retained rather than removed entirely because genuine per-file contiguity needs exist (the Easy2Boot-style use case, later formalized as extent_limit=1 in the allocator's ENOSPC handling) — some workloads have a real requirement classic 'don't defrag SSDs' advice doesn't account for."
+      ],
+      "consequences": [
+        "Positive: avoids unnecessary SSD write-wear from automatic layout optimization that provides no corresponding benefit.",
+        "Negative: found via this same research pass that TRIM (a genuinely necessary SSD maintenance operation, unlike defrag) is absent from the codebase entirely — addressed separately (ADR-052)."
+      ]
+    },
+    {
+      "id": "ADR-052",
+      "title": "TRIM Strategy — Batched by Default, with Targeted Eager Exceptions",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "No TRIM/discard mechanism existed anywhere in the specification prior to this session, despite SSD/NVMe being explicit target hardware — verified by direct search across every project document.",
+      "decision": "Batched/coalesced discard as the default (matching the cross-ecosystem-consistent precedent of Linux's FITRIM/fstrim and ZFS's autotrim, both of which deliberately delay and aggregate freed ranges before issuing a discard, since inline discard fragments into many small commands that compete with foreground I/O on slow-discard devices), implemented as a per-zone 'needs-trim' flag on the Zone Table directly mirroring GFS2's per-resource-group approach (set on deallocation, cleared after a successful trim of that zone). A hybrid exception: WAL-chunk destruction, scratch-area frees, and low-free-space conditions get immediate/eager discard instead of waiting for the batched sweep — safe specifically because these are already large, naturally coalesced ranges, sidestepping the usual inline-discard downside of many small fragmented commands. Rate-limiting is self-throttling within the trim-issuing code (a token bucket tracking bytes issued per second) rather than an OS or FUSE feature — matching how ZFS's own rate-limit option works, which is also software-side throttling, not a kernel primitive.",
+      "rationale": [
+        "Verified this is not merely undocumented but genuinely absent — no code path anywhere issues a discard, confirmed by direct search rather than assumed.",
+        "GFS2's specific per-resource-group flag mechanism maps directly onto the Zone Table's existing per-zone structure, requiring no new tracking concept, only a new field.",
+        "The hybrid eager-exception cases were chosen specifically because they don't incur the downside inline discard normally has (many small commands) — they're already coalesced by construction, not an arbitrary carve-out."
+      ],
+      "consequences": [
+        "Positive: closes a real gap for explicitly-targeted hardware (SSD/NVMe) rather than leaving it as an unaddressed assumption.",
+        "Negative: verifying a discard actually reached physical media (rather than being silently dropped by an intervening layer — encryption, virtualization, an overlay) is unresolved and directly relevant to this project's stated ext4-overlay pain-point motivation.",
+        "Negative: the Windows side of this decision required its own separate ADR (ADR-053) due to a platform-specific blocker discovered during this same research pass."
+      ]
+    },
+    {
+      "id": "ADR-053",
+      "title": "Windows TRIM — Narrow Kernel-Mode Helper Driver, Scoped Minimally",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "Verified directly against Microsoft's own documentation that the TRIM DSM action (IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES, Action=Trim) is explicitly unsupported for user-mode applications, and that Windows' Optimize Drives / disabledeletenotify mechanism is gated to NTFS/ReFS only, with no generic third-party-filesystem hook (confirmed via the exFAT/FAT32 precedent — neither gets automatic Windows TRIM either, despite being native Microsoft formats). WinFsp filesystems, including CAFS's V1 Windows target, run in user mode, so ADR-052's TRIM strategy has no direct path to execution on Windows as specified.",
+      "decision": "A narrow, single-purpose kernel-mode helper driver (Src/Kernel/Windows/helper.rs) whose only job is relaying trim requests from user-mode CAFS code to the DSM API kernel-mode code can call. Confirmed as a viable, precedented approach: WinBtrfs (a real, shipping third-party filesystem) implements TRIM/DISCARD successfully, specifically because it operates as a kernel-mode driver rather than a user-mode one like WinFsp filesystems.",
+      "rationale": [
+        "Deliberately minimal kernel-mode surface area — a single-purpose relay, not porting broader filesystem logic into the kernel — given that kernel-mode bugcheck conditions (KeBugCheckEx, IRQL violations) are not catchable by SEH/__try__except the way user-mode exceptions are; the actual safety net for this class of code is a VM-plus-kernel-debugger development workflow, not a code-level wrapper.",
+        "WinBtrfs's real, verified precedent (its own published feature list explicitly names TRIM/DISCARD support) confirms this is achievable, while also confirming it requires the kernel-mode path specifically — a user-mode alternative was searched for and not found."
+      ],
+      "consequences": [
+        "Positive: unblocks TRIM on Windows at all, where no path otherwise existed.",
+        "Negative: kernel-mode driver signing (EV certificate, Microsoft Hardware Dev Center attestation) is a real cost/process hurdle, independent of code correctness — accepted as a stated compromise (to be documented in the project README) rather than solved around, given this project's resource constraints.",
+        "Negative: admin rights are required to install this driver — accepted as no additional friction, since the kernel helper driver installation already requires it for other reasons."
+      ]
+    },
+    {
+      "id": "ADR-054",
+      "title": "Allocator Boundary Behavior — CoW/Dedup Awareness, Exclusive Grants, and ENOSPC Handling",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "The allocator's relationship to CoW snapshot redirection, deduplication matches, WAL's exclusive access, and out-of-space handling were each raised without a settled mechanical answer.",
+      "decision": "The allocator is policy-aware, not a dumb LBA provider: CoW redirection (writing a snapshot-shared block to a fresh location instead of in place) is decided and driven by the allocator itself, since the I/O Engine cannot make that determination blind. Nothing bypasses the allocator except by explicit exclusive grant (WAL, ADR-046, is the existing case) — any grant requires a matching revocation path (the requirement that the I/O Engine can invalidate a permit through an independently-verifiable mechanism is locked in; the specific 'how' is deferred to implementation). fsck invalidates stale grants as part of its existing crash-recovery scope, not a new mechanism. Dedup's detection (the hash lookup) is independent of the allocator — no mutation, no locking needed — but registering a match (the refcount bump) goes through the allocator, same reasoning as CoW's redirect. ENOSPC is rescoped from 'device is full' to 'the allocator could not satisfy this specific attempt,' and is per-attempt, not persistent state: on failure, the allocator logs a warning-level signal and attempts one lightweight recovery step — temporarily relaxing the extent-limit *preference* (not a hard extent_limit=1 requirement) to use already-available fragmented space — explicitly without invoking defrag/balance/storage-expander inline, since that could block a write for an unbounded time on a large HDD and directly contradicts defrag's on-demand-only status on SSD (ADR-051). A file with extent_limit=1 set skips this relaxation entirely and fails immediately with a distinct error rather than ever being silently fragmented. Identifier-slot exhaustion (ADR-047's reuse mechanism failing to keep pace, or an undersized table) is a third, separate error condition from generic ENOSPC — reclaiming data blocks does nothing for it.",
+      "rationale": [
+        "extent_limit=1 (the mechanical form of a 'never fragment this file' requirement) automatically implies no-CoW, since a CoW redirect elsewhere would itself violate the single-extent guarantee — a hard requirement with a distinct failure mode, not a soft preference that degrades silently.",
+        "The lightweight ENOSPC relaxation (dropping a preference, not running a task) was chosen specifically because it doesn't inherit the execution-model problems 'run compaction inline' would have — no unbounded blocking, no conflict with defrag's on-demand SSD status.",
+        "EDQUOT and EFBIG (POSIX's quota-exceeded and file-too-large errors) were considered and explicitly rejected — CAFS has no quota system and no independent max-file-size concept, so neither has an underlying condition that could ever produce it; adopting either would import taxonomy without the feature that makes it real."
+      ],
+      "consequences": [
+        "Positive: gives concrete, distinct error codes (Docs/error_id.md CA-1001/1002/1003) for three genuinely different failure conditions that would otherwise all collapse into one uninformative ENOSPC.",
+        "Negative: the exclusive-grant revocation mechanism's actual implementation is deferred, not designed — a locked requirement without a locked solution.",
+        "Open: whether the extent-limit relaxation is strictly per-allocation-attempt or persists as temporary state for some duration was asked and not yet answered."
+      ]
+    },
+    {
+      "id": "ADR-055",
+      "title": "Error Identifier Scheme — Sequential Subsystem-Ranged Codes",
+      "status": "Accepted",
+      "date": "2026-09-13",
+      "context": "CAFS needs an application-owned error namespace, surfaced through OS-native logging (Windows Event Log, Linux dmesg/syslog), documented in a reference file. A hash-derived numeric code (first 4 bytes of a hash of the error's identifier string) was proposed and evaluated.",
+      "decision": "CA-NNNN / CAFS-NNNN, sequentially assigned, grouped by subsystem via reserved leading-digit ranges (1000s allocator, 2000s WAL, 3000s SMART/handler, further ranges reserved for future subsystems) — not hash-derived. Documented in a top-level errors.md (canonical, version-controlled), with Docs/error_id.md describing the scheme itself; a read-only external document is a possible future overflow reference if the catalog grows very large, explicitly non-authoritative relative to errors.md. On Windows, the numeric portion is the actual Event Log Event ID (kept under the platform's compatibility-recommended range); the CA- prefix appears in the message text rather than the machine-queryable ID field.",
+      "rationale": [
+        "A 4-byte hash slice lands outside Windows Event Log's recommended sub-65536 ID range essentially every time by construction, and starts colliding (by the birthday paradox) around roughly 65,000 distinct codes — not a safe margin for a scheme this project already anticipates needing an external overflow reference for.",
+        "Sequential per-subsystem-range assignment has zero collision risk by construction, stays inside the platform-compatible range naturally, and solves the actual likely underlying motivation for wanting a hash (avoiding coordination overhead between contributors in different files) more directly than a hash would, via reserved ranges rather than derived uniqueness."
+      ],
+      "consequences": [
+        "Positive: three concrete codes already assigned this session (CA-1001 through 1003, ADR-054) demonstrate the scheme is usable immediately, not just theoretical.",
+        "Negative: errors.md itself (the populated catalog, as opposed to the scheme description in Docs/error_id.md) was not populated as part of this decision — scheme only."
+      ]
     }
   ]
 }

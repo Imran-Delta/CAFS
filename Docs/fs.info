@@ -1,6 +1,6 @@
 # CAFS Filesystem Information
-**Document version:** v21
-**On-disk format version:** 6
+**Document version:** v22
+**On-disk format version:** 7
 **Status:** Locked
 
 ---
@@ -210,7 +210,7 @@ Row size: 48 bytes, chosen over the minimum 44 for 8-byte alignment.
 
 `identifier_refcount` is authoritative for whether this identifier is still reachable from anything — the live B-tree (Section 7b) or any Snapshot Table (Section 7e) entry's retained root. Reaching zero deletes the row (mechanics: Section 7f).
 
-Filenames, extent lists, and ACLs are variable-length and live in a separate blob region, referenced by the offset fields above. Extent list entries are 16 bytes each (`start_lba` + `length`); a contiguous file has `extent_count = 1` — there is no separate "contiguous" storage type (ADR-020).
+Filenames, extent lists, and ACLs are variable-length and live in a separate blob region, referenced by the offset fields above. Extent list entries are 16 bytes each (`start_lba` + `length`); a contiguous file has `extent_count = 1` — there is no separate "contiguous" storage type (ADR-020). **v22**: the top bit of `length` is now the `UNWRITTEN` flag — a `raw` file's full upfront allocation is marked allocated-but-logically-zero rather than physically zero-filled; a read of an unwritten range returns zero without touching disk, a write clears the flag for the written portion. No practical file needs `length`'s full original range for a single extent, so this costs nothing structurally. Avoids both the stale-data leak of leaving blocks truly uninitialized and the write-amplification cost of a physical zero-fill pass at allocation time (ADR pending — logged this version, formal ADR not yet written).
 
 **Directory rows (v21, ADR-034)**: `unix_mode`'s `S_IFDIR` bit distinguishes a directory row from a file row, no new field needed. For a directory row, `extent_list_offset` is repurposed — directories hold no file data, so this field is otherwise unused — to instead hold that directory's own B-tree subtree root LBA (Section 7b). `extent_count` is meaningless for a directory row and stays zero. This is what makes cross-directory path resolution a direct-indexed O(1) read rather than a search: reaching a subdirectory's tree means reading its own Identifier Table row, not walking anything.
 
@@ -229,10 +229,11 @@ Critical tier. Resolved in v21 (ADR-034) — previously mechanism-only, byte lay
 | 0 | 1 | is_leaf flag |
 | 1–2 | 2 | key_count |
 | 3–7 | 5 | reserved, zero |
-| 8–4087 | up to 255 × 16 | slot array |
-| — | — | (unused tail, zero, if key_count < 255) |
+| 8–4071 | up to 254 × 16 | slot array |
+| 4072–4079 | 8 | reserved, zero |
+| 4080–4095 | 16 | checksum trailer (Section 15a) |
 
-Each slot: 8-byte key hash + 8-byte value (child node LBA for an internal node; identifier for a leaf node). ~255-way branching per level (8-byte header + 255 × 16-byte slots = 4088 of 4096 bytes).
+Each slot: 8-byte key hash + 8-byte value (child node LBA for an internal node; identifier for a leaf node). **254-way branching per level, not 255 (v22 fix)** — the original 255-slot layout (8-byte header + 255 × 16-byte slots = 4088 of 4096 bytes) overlapped the checksum trailer's fixed last-16-bytes position by 8 bytes whenever a node was full: the 255th slot's value field (offset 4080–4087) sat exactly where the trailer's first 8 bytes go. 254 slots leaves the required 16 bytes for the trailer with 8 bytes to spare, mirroring ext4's own dx_tail precedent (reducing usable capacity to make room for a checksum) rather than inventing a new resolution.
 
 **Collision handling**: two different path components hashing identically within one directory's tree is resolved by confirming against the real name already stored in the matched identifier's Identifier Table row (`filename_blob_offset`) — a read, not a second stored copy of the name.
 
@@ -788,20 +789,25 @@ Real structures (Superblock, Config Snapshot, Meta/User Table, Function Table) u
 - Documented the Identifier Table's directory-row field repurposing (Section 7a): `extent_list_offset` holds a subtree root LBA for directory rows, distinguished via the existing `unix_mode` `S_IFDIR` bit — no new field.
 - Documented Zone Table's second health-field input (Section 7c): a scrub, piggybacked on balance/defrag's existing I/O, feeding the same per-zone health field SMART already populates.
 
+## 17e. Changes from v21 (format_version 6 → 7)
+
+- **Fixed B-tree branching factor** (Section 7b): 254 slots, not 255. The v21 layout overlapped the checksum trailer's fixed last-16-bytes position by 8 bytes whenever a node was completely full — a real conflict, not a hypothetical one, found by checking the two sections' byte ranges against each other directly. Closes the "dx_tail-style" question RESEARCH-JOB3 had flagged as unresolved.
+- **Added the `UNWRITTEN` flag** to extent entries (Section 7): top bit of `length`. A `raw` file's full upfront allocation is now allocated-but-logically-zero rather than physically zero-filled at allocation time — ext4-style unwritten-extent semantics, chosen specifically because a physical zero-fill pass is itself the write-amplification `raw` exists to avoid, while still closing the stale-data-exposure risk of leaving blocks truly uninitialized.
+- **`raw` files are categorically outside snapshot scope**, not subject to a runtime policy — removed `config.fs [snapshot].raw_file_policy` as a behavior fork (see config.fs changelog). No CoW means nothing for a snapshot to hold a reference to; this was always structurally true, the field just implied a choice that didn't actually exist.
+- **`smart_handler.py`'s dual `emergency_mode` precedence resolved**: `--type=smart`'s acute signal wins over `--type=trends` by default, user-configurable — except a hard floor (ATA SMART 187/198; NVMe `critical_warning` bits 2/3) that no configuration can override. Not a format change, noted here since it closes a gap this document previously flagged as open.
+- **Identifier slot lifecycle resolved as "both"**: refcount-zero retires the slot immediately (inline, cheap) and queues it via the Recently-Zeroed Queue's existing `tag` field (a new tag value for "retired identifier, available for reuse") for asynchronous reclaim by defrag/balance/storage-expander — the same background-reclaim pattern already used for data blocks, not new plumbing. The queue's exact byte format is still open (Section 18); the lifecycle policy that format needs to support is not.
+
 ## 18. Known Open Gaps
 
 Not resolved in this document — flagged rather than silently left implicit:
 
 - **B-tree rebalancing** (Section 7b): whether the resolved node format needs explicit rebalancing on insert/delete, or achieves HTree's "no balancing required" property by construction, is an implementation question, not a format question — not resolved here.
 - **Hash Table bucket/entry layout** (Section 8a): the config-level toggle and 256-bit width are decided; the physical table format is not.
-- **Recently-Zeroed Queue entry format** (Section 8b): provisional, not locked.
-- **WAL Block Header checksum (Section 9.1) covers the header plus all current entries, recomputed on every append** — O(block_size) cost per write as the block fills. Left as-is; noting it here as an acknowledged tradeoff rather than a resolved decision, in case it wasn't the intended one.
+- **Recently-Zeroed Queue entry format**: provisional, not locked — now needs to accommodate a second entry kind (retired identifier slots, v22) in addition to zeroed data blocks, via the existing `tag` field. The kind is decided; the byte layout is not.
 - **Snapshot Table `retention_tier` encoding** (Section 7e): field exists, exact value mapping does not.
-- **Identifier slot reuse vs. permanent retirement** after an identifier's refcount reaches zero (Section 7a/7f): unresolved — affects whether the Identifier Table only grows or eventually needs compaction.
 - **Metadata deduplication**: explicitly deferred (2026-09-08), not decided either way. Content-addressable data (user data, and filenames specifically) could in principle share this document's dedup mechanism; position-dependent structures (B-tree nodes, Zone Table entries, Identifier Table rows) structurally cannot, since their identity depends on position, not just content.
-- **`raw` full allocation**: zero-fill vs. uninitialized reservation not decided — the latter is faster but risks exposing a previous occupant's freed bytes.
-- **`raw` file inside a volume-wide snapshot's scope**: `config.fs [snapshot].raw_file_policy` exists as a provisional field; not locked.
-- **`smart_handler.py`'s two independent `emergency_mode` signals** (from `--type=smart` and `--type=trends`, which can legitimately disagree): which one governs the allocator's actual behavior is explicitly left open (2026-09-09), to be discussed later.
+- **`wal_lba` (Function Table) needs to become a list of active WAL chunk locations, not a single pointer** — WAL is now allocated as one or more `raw`-tagged 512MB-ish chunks rather than a single fixed region, and the fast-path pointer needs to reflect the current chunk(s), not just a start. Proposed reusing the 16-byte extent-entry shape for this; not yet formally specified in this document.
+- **`fsck_scratch_lba`, `scratch_lba`, `temp_cache_lba`**: three reserved pointer fields (one critical-tier, two non-critical) with no described purpose or format anywhere in this document, and no grounding found in any other project document either as of v22. Needs the underlying intent defined before a format can be proposed.
 - `config.fs [identity].uuid_sequence`, `volume_label`, `volume_label_strict` remain crash-critical fields with no protocol role described anywhere in this document. Treated as inert passthrough data carried in the Config Snapshot's TOML text; no action taken.
 
 ---

@@ -1,23 +1,23 @@
 # =================================================================
-# CAFS CONFIGURATION PARAMETERS (v21 – format version 6)
+# CAFS CONFIGURATION PARAMETERS (v22 – format version 7)
 # =================================================================
 # This file contains all user- and administrator-facing settings.
 # For on-disk layout, binary structures, and atomic protocols,
 # see fs.info. The Config Snapshot in LBA1 is this file, verbatim,
 # minus [mount_hints] — see fs.info Section 5.
 #
-# CHANGES FROM v20 (format_version 5 -> 6 — B-tree byte layout
-# resolved, Superblock gains a namespace-structure selector field.
-# See ADR-034 through ADR-039 and JOB3-OVERVIEW):
-#   - [smart]: new section. report_interval_seconds governs ONLY the
-#     user-facing --type=smart health report; --type=avg/--type=trends
-#     feed the allocator directly and are not exposed here (ADR-038)
-#   - [scrub]: new section. full_drive_scan_preference, default
-#     "monthly" — piggyback checking (on blocks balance/defrag already
-#     touch) is always on and not a setting; this governs only the
-#     dedicated full-volume pass on top of that (ADR-035)
-#   - [hash_daemon]: new section. min/max interval bounds only — the
-#     live value is runtime state, not a config field (ADR-037)
+# CHANGES FROM v21 (format_version 6 -> 7 — B-tree branching fix,
+# raw unwritten-extent flag, allocator mode/preset/knob system.
+# See Docs/allocator.md, Docs/io_engine.md, Docs/error_id.md):
+#   - [snapshot]: raw_file_policy REMOVED. Raw files are categorically
+#     outside snapshot scope, not a runtime policy choice — see
+#     fs.info 17e.
+#   - [allocator]: substantially extended. Mode (performance/balanced/
+#     safety/custom) gates preset eligibility at mount time only;
+#     runtime knob values move independently afterward regardless of
+#     mode, driven by smart_handler.py --type=trends' Signals output.
+#     Most numeric thresholds below are placeholder, not yet tuned
+#     against real data — flagged individually.
 #   - Scheduling is deliberately NOT one unified preference type: see
 #     ADR-036 for why tier-enum / numeric-seconds / dynamic-runtime /
 #     idle-triggered are kept as four separate shapes
@@ -442,12 +442,11 @@ limit_yearly = 0
 # from the Zone Table, not separate accounting.
 space_limit_fraction = 0.5
 
-# Policy when a volume-wide snapshot encounters a raw file (ADR-027),
-# which cannot be protected (no CoW, nothing for the snapshot to
-# retain). "skip" silently omits it (dangerous default — a later
-# restore may assume protection that was never there), "warn" skips
-# and logs, "block" refuses to take the snapshot at all.
-raw_file_policy = "warn"     # OPEN — not yet decided, provisional
+# v22: raw_file_policy field REMOVED. Raw files (ADR-027, no CoW) are
+# categorically outside snapshot scope — a snapshot silently doesn't
+# protect them, by construction, not by configurable choice. There
+# was never actually a decision to make here; the field implied one
+# that didn't exist. See fs.info 17e.
 
 # Manual, on-demand snapshots are always available when enabled = true,
 # regardless of timeline_enabled — no separate flag needed for this.
@@ -581,13 +580,69 @@ wal_checkpoint_interval_seconds = 5
 # =================================================================
 
 [allocator]
-# Delayed Allocation's On path for SSD was originally scored as a
-# coin-flip (0.5) with no defined threshold. Explicit default now.
+# Legacy fields from the original static A0-A4 model. Superseded by
+# the mode/preset/knob system below, which uses continuous signal
+# scores rather than discrete condition-matching — the "both trigger
+# at once" scenario these described may not have a direct analog
+# under the new model. Kept rather than deleted pending explicit
+# review; do not assume these still govern anything.
 delayed_allocation_on_ssd_default = true
-
-# Delayed Allocation On (HDD, high fragmentation, no shared variable
-# with Off) and Off (low free space) can both trigger at once.
 delayed_allocation_conflict_default = "off"   # "on" or "off"
+
+# ---------------------------------------------------------------
+# Mode: gates which presets are ELIGIBLE at mount time only. Does
+# NOT fix runtime knob values or override live signal-driven
+# swapping — a healthy drive in "safety" mode still reaches fast
+# knob values once trends confirms it, and a degrading drive in
+# "performance" mode still gets the same protective swaps everyone
+# else does. Mode only narrows the mount-time starting pool; if
+# more than one preset survives the filter, --type=trends' values
+# pick among what's left.
+# ---------------------------------------------------------------
+mode = "balanced"   # "performance", "balanced", "safety", "custom"
+
+# Only read when mode = "custom". Empty list = no restriction (same
+# as an unset mode). Preset names match the A0-A5 legacy table in
+# Docs/allocator.md.
+custom_eligible_presets = []
+
+# Daemon vs. library is itself mode-gated, not independently set,
+# except under "custom" — see Docs/allocator.md for the full
+# daemon/library tradeoff and the shared-trait implementation shape.
+custom_process_model = "library"   # "library" or "daemon" — ignored unless mode = "custom"
+
+# ---------------------------------------------------------------
+# Per-knob hot-swap timing (generation-counter model, one Arc/timer
+# PER KNOB, fully independent — see Docs/allocator.md). Applies to
+# all six live-adjustable knobs uniformly; Concurrency is fixed at
+# mount and has no entry here.
+# ---------------------------------------------------------------
+[allocator.timing]
+poll_interval_seconds = 15          # matches --type=trends' invocation cadence
+stabilization_lock_seconds = 300    # a knob cannot change again for this long after changing
+consensus_reads_required = 3        # consecutive poll cycles that must agree before a change fires
+consensus_agreement_range = 0.10    # PLACEHOLDER, not tuned — "soft agreement" width as a fraction of signal range; needs real on-disk testing to pin down (open question, logged)
+
+# ---------------------------------------------------------------
+# Signal thresholds feeding knob decisions. ALL numeric values below
+# are provisional starting shapes, not validated against real drive
+# data — see Docs/allocator.md and the session open-questions file
+# for what's actually been tested vs. asserted.
+# ---------------------------------------------------------------
+[allocator.signals]
+free_space_low_threshold = 0.15     # matches Urgent-B's existing routine-tasker threshold, reused not reinvented
+workload_bias_sequential_threshold = 2.0   # recalibrated this pass; original value of 15 was unreachable at realistic write sizes
+r_write_fixed_cap_blocks = 262144   # 1GiB at 4KB blocks; R_write normalization reference
+
+health_composite_ewma_alpha = 0.18       # ~last 10 buckets dominate (alpha = 2/(n+1), n=10)
+pending_trajectory_ewma_alpha = 0.3      # deliberately more reactive than health_composite — this knob's job is catching deterioration early
+health_warn_at_reallocated = 10          # SMART attribute 5
+health_warn_at_pending = 5               # SMART attribute 197
+health_warn_at_command_timeout = 5       # SMART attribute 188
+health_warn_at_checksum_mismatch = 5     # CAFS on-disk counter, not ATA
+health_warn_at_host_relocations = 3      # CAFS on-disk counter, not ATA — lower than checksum_mismatch since a relocation already succeeded in saving the data but is still real degradation evidence
+
+write_size_cv_low_high_split = 0.5  # PLACEHOLDER, not tuned — coefficient-of-variation threshold for Preallocation On/Off eligibility
 
 # =================================================================
 # SECTION: PER-FILE / PER-DIRECTORY OPTIMIZATION FLAGS
