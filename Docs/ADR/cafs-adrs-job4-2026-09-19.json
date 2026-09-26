@@ -1,0 +1,104 @@
+{
+  "adrs": [
+    {
+      "id": "ADR-056",
+      "title": "Concurrency Execution Model — Allocator as Sole Lock-Holder, I/O Engine as Stateless Permit-Gated Executor",
+      "status": "Accepted",
+      "date": "2026-09-19",
+      "context": "The I/O Engine PoC's read_block/write_block take &mut self and use plain non-atomic counters, incompatible with ADR-041's concurrent mntproc model (per-zone RwLock for SSD/NVMe, global lock for HDD). Whether the I/O Engine or the Allocator owns locking for concurrent block access was undecided.",
+      "decision": "The Allocator is the sole lock-holder and sole allocation/concurrency authority. The I/O Engine holds no locks of its own and executes only against a valid permit supplied by the Allocator. Permits use reusable numeric IDs: a fixed-size slot table, owned by the Allocator, records the authoritative (target_lba, mode) for each in-use slot; grant_id is simply that slot's index. A permit carries (grant_id, target_lba, mode) only — no embedded LBA range beyond what the slot itself records. Validity check: slot in_use, and the touched LBA falls within that slot's own recorded range — trusting the table, not the bare permit, is what makes ID reuse safe. Grants expire at unmount, including an unclean one (power loss); the I/O Engine's own WAL drain on next mount is stateless but healing and requires no separate grant-recovery mechanism, since mount sequencing itself (ADR-059) is the safety mechanism. Long-lived exclusive grants (WAL chunks, and by extension any other scratch-type consumer, see ADR-057) use this permit mechanism; an ordinary single-call write does not need a persisted permit, since the Allocator already holds the lock synchronously for that call's duration.",
+      "rationale": "Matches the existing policy/mechanism split (ADR-040's daemon/library duality, ADR-041's concurrency model) rather than introducing a second locking authority. Reusable IDs plus table-owned state prevent the exact failure mode a stale or recycled bare ID would otherwise create — a permit that embeds its own range could pass validation against a slot that has since been reassigned to a different grant.",
+      "consequences": "read_block/write_block gain a permit parameter, checked before the underlying pread/pwrite executes. CafsCtx's SmartCounters move from &mut self plain increments to &self AtomicU64::fetch_add, since concurrent callers can now legitimately call in at once. Open, not resolved by this ADR: the permit slot table's actual size, and the CafsError variant/CA- code for a failed permit check."
+    },
+    {
+      "id": "ADR-057",
+      "title": "Scratch as a General Allocation-Purpose Category, Not a Single Mechanism",
+      "status": "Accepted",
+      "date": "2026-09-19",
+      "context": "WAL's chunks and Cache SMART were both informally referred to as 'scratch' during design discussion, raising the question of whether they share a mechanism. Separately, a `temp_cache_lba` Function Table field had been proposed for filesystem-internal fast storage, originally conceived as RAM-like (heavily rewritten).",
+      "decision": "'Scratch' is an allocation-purpose tag, not one structure or mechanism: space holding provisional data — not yet part of the filesystem's committed, referenced state — that becomes real only once a pointer-flip or promotion step completes. WAL's chunks (pending operations, not yet applied), Cache SMART (a candidate value, not yet promoted to B/M-SMART, see ADR-058), and the relocation log's copy-first staging (see ADR-061) are three independent instances of this same pattern, each with mechanics sized to its own need rather than a single shared grant mechanism. `temp_cache_lba` is retired: routed to RAM rather than persisted to disk at all.",
+      "rationale": "WAL's chunks need the full exclusive-grant/permit machinery (ADR-056) given their scale and lifetime; Cache SMART does not, being small, single-writer, and explicitly tolerant of loss by the SMART reconciliation logic's own design — forcing both into one mechanism would have over-engineered the lightweight case. temp_cache's original 'RAM-like, heavily rewritten' intent is exactly the access pattern that harms flash write endurance, so it is not persisted at all rather than redesigned to be SSD-safe.",
+      "consequences": "`scratch_lba` is understood specifically as Cache SMART's own pointer, not a general scratch registry. `temp_cache_lba`'s Function Table slot disposition (removed outright vs. left reserved) is not resolved by this ADR."
+    },
+    {
+      "id": "ADR-058",
+      "title": "SMART Flush Pipeline Mechanics — Cache/B/M-SMART Update Paths",
+      "status": "Accepted",
+      "date": "2026-09-19",
+      "context": "ADR-002/005 define a four-tier SMART flow (V-SMART to Cache SMART to B-SMART to WAL to M-SMART) without specifying Cache SMART's on-disk placement or the update mechanics for any of the three on-disk tiers.",
+      "decision": "Cache SMART holds the raw, unverified combination of {device SMART stats + current V-SMART RAM counters}, written after every check cycle, before reconciliation runs — it is the reconciliation logic's input, not an authoritative value in its own right. Cache SMART updates via the same atomic-pointer-swap shape as B-SMART (write the new candidate value, flip the pointer, old copy discarded) rather than a bare in-place overwrite, since M/B-SMART can go hours between updates and Cache SMART is the only current picture available in the meantime — it must be protected against a torn read, though not against loss (a stale Cache SMART value is acceptable; the reconciliation logic already tolerates it being absent or checksum-invalid, falling back to main/backup). B-SMART updates the same way, directly. M-SMART goes through a WAL entry first, for the additional safety margin appropriate to the primary copy, before its own pointer swap.",
+      "rationale": "The SMART tiers' actual criticality differs (M-SMART is authoritative, B-SMART is a fast-swap backup, Cache SMART is a tolerant-of-loss staging value), and the update mechanism for each should match that, rather than treating all three identically.",
+      "consequences": "`smart_main_lba`/`smart_backup_lba`/`scratch_lba` remain the Function Table's existing separate pointer fields; their values being allocator/mkfs-chosen rather than fixed already satisfies any need for non-predictable physical placement, no new mechanism required there."
+    },
+    {
+      "id": "ADR-059",
+      "title": "Mount Sequence — mount, check, remount, drain, heat_caches, confirm",
+      "status": "Accepted",
+      "date": "2026-09-19",
+      "context": "The I/O Engine PoC's mount pipeline (mount, check, remount, confirm) predates WAL drain and cache heat-up, neither of which had a defined place in the sequence.",
+      "decision": "The mount sequence is: mount (open device) -> check (verify Superblock and configuration, including format_version, see ADR-060) -> remount (apply final configuration, respecting CLI overrides) -> drain (WAL replay; stateless but healing, so an unclean prior unmount can make this mount take longer) -> heat_caches (load the Dedup Table and Hash Table into memory, returned as data) -> confirm (returns a report bundling the loaded cache handles, the finalized configuration snapshot, and current SMART data, replacing the previous bare success/failure result).",
+      "rationale": "Configuration must be finalized before drain, since drain needs to know which algorithms/parameters to apply. Drain must finish before cache heat-up, since loading tables before recovery risks caching pre-correction state. Confirm must be last so a 'cleanly mounted' report is never issued before drain and heat-up have actually completed.",
+      "consequences": "confirm()'s return type changes from a bare CafsResult<()> to a report type. No separate permit-recovery step is needed during drain; ordering itself is the safety mechanism (ADR-056)."
+    },
+    {
+      "id": "ADR-060",
+      "title": "Superblock Corrections — format_version Validation Policy, namespace_structure_id Offset Finalized",
+      "status": "Accepted",
+      "date": "2026-09-19",
+      "context": "Two Superblock loose ends surfaced during this session's review. First, format_version was stamped by mkfs but never validated at mount, and the stored constant itself was stale (4, three format bumps behind the current 7) in fs.info, config.fs, and layout.rs alike. Second, ADR-034 proposed offset 84 for namespace_structure_id but explicitly left it 'not yet explicitly re-confirmed as final,' while layout.rs already carried it at 84 as if settled.",
+      "decision": "format_version is corrected to 7 everywhere it was stale. check() compares the Superblock's stored format_version against the running code's expected value at mount; any mismatch, older or newer, refuses the mount. No backward-compatible parsing of older format versions is in scope until a second supported version actually exists. Separately, namespace_structure_id's Superblock offset (84, 4 bytes) is confirmed final.",
+      "rationale": "A stamped-but-unchecked version field provides no actual protection against mounting an unsupported format. No conflicting use for offset 84 surfaced anywhere else in the format this session, and layout.rs already implements it there.",
+      "consequences": "mkfs_cafs, fs.info, and config.fs all corrected to format_version 7 this session. Closes ADR-034's one remaining open item."
+    },
+    {
+      "id": "ADR-061",
+      "title": "Relocation Log — Entry Format, Crash-Safety Mechanism, and Corruption-Response Policy",
+      "status": "Accepted",
+      "date": "2026-09-19",
+      "context": "relocation_log_head_lba/tail_lba (critical tier, Meta/User Pointer Table) and config.fs's [relocation_log] (max_intents=1000, abort_on_log_corruption) already existed in the format but were undesigned in mechanism. First-party resize/relocation safety is a firm requirement: upstream Parted support for CAFS is not expected until well after CAFS reaches a mainstream level of adoption, so CAFS cannot rely on Parted's own safety mechanisms in the meantime.",
+      "decision": "The relocation log is a crash-recovery journal for the relocator's own in-progress operations, not a permanent, always-consulted LBA-indirection layer — before a move, an intent is logged, so that a power loss mid-move leaves the relocator able to determine what state that move was in in on next mount. Entry format: known file content hash, old logical LBA, old physical LBA, new destination, plus ECC (error-correcting, not just detecting) data. Mechanism: copy the data to its new location first, staged in scratch (ADR-057) and WAL-protected; only then flip the referring pointer or extent-list entry; the old copy is then discarded. This is synchronous, not a deferred background pass. abort_on_log_corruption is a three-value setting: false / true / on_ucerr (abort only on an uncorrectable error). Recovery is layered: the entry's own ECC is the first line of defense against small corruption; if that is insufficient, the candidate location's actual content is checked against data_checksum_algo_id (universal) or the Global Hash Table (for hash-participating files, as an additional confirmation) to resolve ambiguity; on_ucerr aborts only once both are exhausted.",
+      "rationale": "ECC's overhead is only a reasonable tradeoff at this structure's low volume (capped at 1000 intents) — the same overhead on the main journal's high-frequency entries would be a real, unwarranted cost. A flat abort_on_log_corruption boolean cannot distinguish safely-ignorable staleness from genuine uncertainty about a file's true location; the three-value setting and layered recovery resolve that without requiring the whole volume to fail one way or the other.",
+      "consequences": "Defrag, Balance, and shrink-driven relocation all share this same move-and-log-intent primitive as their common mechanism, differing only in what triggers a move and how the destination is chosen (Allocator-owned policy, calling the I/O Engine's existing read/write primitives). GParted/Parted integration sits on top of the resize case specifically, and is independent of this mechanism's own timeline."
+    },
+    {
+      "id": "ADR-062",
+      "title": "Multi-Journal Architecture — Separate Streams and Formats, One Shared Primitive, Not User-Configurable",
+      "status": "Accepted",
+      "date": "2026-09-19",
+      "context": "'WAL' and 'journal' had been used interchangeably without confirming they were the same concept. The filesystem needs crash-safe sequencing for more than ordinary metadata operations alone — the relocation log (ADR-061) and a future adaptive block-size system were both named as needing their own journaled bookkeeping.",
+      "decision": "A journal is a general primitive (head/tail rotation, entry format, checksum/ECC verification, recovery-scan replay). WAL is one instance of it, not a singular bespoke mechanism. The filesystem journal, the relocation journal, and any future journal are separate physical streams with separate entry formats, each their own instance of the shared underlying primitive. This separation is a fixed architectural choice, on the same footing as the concurrency model (ADR-041) — not exposed as a user-configurable option.",
+      "rationale": "Separate streams avoid an entry-format compromise between the relocation journal's rich, ECC-protected entries and the filesystem journal's compact, high-throughput ones; avoid cross-subsystem contention for a shared append point; and avoid a single point of failure for crash recovery across the whole system. The usual cost of separation, cross-journal recovery ordering, is substantially mitigated because the Allocator already holds exclusive access to whatever is being relocated for the entire duration of that operation (ADR-056), so the dangerous interleaving that ordering would otherwise need to resolve does not arise in practice. Making the split configurable was considered and rejected: recovery-path code correctness matters more than the configurability this would add, and recovery code should not carry branching for a choice that is not itself safety-critical.",
+      "consequences": "WAL's own inner byte format (still open) is the first concrete instance of the shared primitive to fully specify; the relocation log's already-separate head/tail pointers are retroactively understood as the second instance, not a special case."
+    },
+    {
+      "id": "ADR-063",
+      "title": "Snapshot Support for Non-CoW (raw) Files — Per-File Opt-In, Lazy CoW Break",
+      "status": "Accepted",
+      "date": "2026-09-19",
+      "context": "raw files have no CoW (ADR-027), so ordinary snapshot protection (ADR-030) cannot cover them; ADR-030 left the resulting skip/warn/block choice undecided. BTRFS's nodatacow files are simply excluded from snapshot protection.",
+      "decision": "CAFS supports snapshotting raw files, deliberately unlike BTRFS, via an explicit per-file opt-in toggle, default off. Mechanism: lazy. Snapshot creation costs nothing extra for an opted-in raw file; the first write to the file after that snapshot exists triggers a one-time CoW break for the touched blocks only, identical in kind to what already happens to any ordinary file's post-snapshot writes.",
+      "rationale": "Matches the general per-file-where-possible design principle. Confirmed by two independent, real, shipped precedents rather than proposed as novel: bcachefs's nocow option breaks CoW transparently on an actual snapshot or reflink reference, and the generic NO_DATA_COW inode flag (the BTRFS-family lineage) is defined identically as 'no CoW while the block's reference count is 1.'",
+      "consequences": "An eager-copy-at-snapshot-time alternative was considered and rejected as the default, since it carries a real, sized cost at snapshot-creation time and would break ADR-030's near-zero-creation-cost property for any volume using it. The opt-in is per-file, not a volume-level policy."
+    },
+    {
+      "id": "ADR-064",
+      "title": "immutable Optimization Flag",
+      "status": "Accepted",
+      "date": "2026-09-19",
+      "context": "append_only's design lineage was reconsidered when direct verification showed BTRFS never actually implements append-only at all (it is a generic ext2-family chattr attribute BTRFS does not support). BTRFS's real file-protection attribute, immutable, is also present identically in ext4 and XFS — a broad, multi-filesystem standard CAFS lacked an equivalent of.",
+      "decision": "Add immutable as a 12th optimization hint flag: blocks all writes, deletes, and renames on the file, not liftable without first clearing the flag.",
+      "rationale": "Real, broad, three-filesystem precedent (ext4/XFS/BTRFS, identical semantics in each); distinct from and stricter than append_only, which only gates write position and permits deletion.",
+      "consequences": "optimization_flags now has 12 flags claimed (9 original hint, 1 structural, dedup, immutable) of 32 available bits, 20 spare. Storage for optimization_flags itself, and the Identifier row's overall byte budget, remain open pending the row-growth decision (extent-limit, timestamps)."
+    },
+    {
+      "id": "ADR-065",
+      "title": "Zone-Level ECC for User Data — HDD-Only, Opt-In",
+      "status": "Accepted",
+      "date": "2026-09-19",
+      "context": "Proposed as a config option to give CAFS single-device bit-rot recovery for user data, not merely detection, via zone-level metadata (RAID5/6-style striping), tracked through the Zone Table.",
+      "decision": "Zone-level ECC/parity for user data is an HDD-only feature, opt-in with a default of off, config-gated. The configuration is expected to refuse enabling it on a volume identified as SSD/NVMe.",
+      "rationale": "Two independent reasons rule this out for SSD, not one. First, recomputing and rewriting a stripe's parity on every write to a protected zone is real, ongoing write amplification, a known cost to flash endurance. Second, and more fundamentally: an SSD's flash translation layer owns real physical placement via wear-leveling, so a stripe's data and its parity have no guaranteed physical independence from each other and could end up on the same physical NAND die with no visibility or control available to the filesystem — if that die fails, both the data and the means of recovering it are lost together, defeating the premise the redundancy depends on. SSDs also already carry their own internal hardware ECC (commonly LDPC-based) for the bit-flip-level errors this feature would otherwise address. HDDs have direct enough LBA-to-physical mapping for the redundancy to have genuine, independent value.",
+      "consequences": "This ADR locks scope (HDD-only, opt-in) only. Stripe width, parity scheme (single vs. double parity), and exact Zone Table field additions are not yet designed."
+    }
+  ]
+}

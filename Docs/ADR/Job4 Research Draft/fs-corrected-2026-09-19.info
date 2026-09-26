@@ -1,0 +1,817 @@
+# CAFS Filesystem Information
+**Document version:** v22
+**On-disk format version:** 7
+**Status:** Locked
+
+---
+
+## 1. Critical Design Decisions
+
+1. LBA0–5 are dynamic pointer blocks, not the real structures themselves.
+2. LBA0–3 are 2048 bytes each; LBA4–5 are 4096 bytes each.
+3. Pointer block checksums are configurable at format time.  
+   Default: CRC32C. Optional: XXHASH32.
+4. Parity is the XOR of the full real Superblock block and full real Config Snapshot block. There is exactly one parity block — no separate "backup parity," since only the Superblock has a genuine second copy (see Decision 9 and Section 12).
+5. The WAL uses fixed 48-byte entries.  
+   `sequence_number` is a 6-byte unsigned integer, little-endian.
+6. ANCHOR_DIFF uses a dedicated 4KB TLV block.  
+   The 16-byte WAL `value` field points to that block.
+7. The end-of-device anchor mirror is a **pointer-recovery mechanism**, not a second copy of the real structures it points to. Only the Superblock has a genuine, independently-written backup, cross-linked from both ends (Section 2, Section 12). This corrects v19's Section 12/17b, which described distinct backup copies for Config Snapshot, Meta/User Table, Function Table, and a "Backup Parity Block" — none of those exist; they contradicted ADR-006 and were never authoritative (ADR-006 amendment, 2026-09-06).
+8. On-disk format version is bumped from 4 to 5 (v19 bumped 3 to 4). New critical-tier structures added: Identifier Table, Snapshot Table, Dedup Table (formalized — previously referenced by pointer only, never given its own layout section), and a per-block reference count replacing the Zone Table's former binary free/used bit.
+9. **All multi-byte integer fields across every structure in this document are little-endian**, chosen to match every currently-targeted platform (Linux x86-64, Windows x86-64/i686), none of which is big-endian. Previously only stated for `sequence_number` (Section 9.2); stated here as the global rule it was always implicitly assumed to be.
+10. Pointer block magic is the literal 8-byte ASCII string `"CAFSPTR\0"`, compared byte-for-byte — not parsed as a hexadecimal integer. `0xCAFSPTR` as written in earlier versions of this document is not valid hex (P, T, R are not hex digits); corrected throughout Section 2 and Section 3.
+
+---
+
+## 2. Anchor Layout
+
+| LBA | Size | Head (start of device) primary → | Head fallback → |
+|----|------|------|------|
+| 0 | 2048 | Superblock | Superblock Backup (real second copy) |
+| 1 | 2048 | Config Snapshot | unused — no second copy exists |
+| 2 | 2048 | Parity Block | unused |
+| 3 | 2048 | Meta/User Pointer Table | unused |
+| 4 | 4096 | Function Table | unused |
+| 5 | 4096 | Byte-for-byte copy of LBA4 pointer block | — |
+
+LBA4 points to the Function Table.  
+LBA5 is a copy of the LBA4 pointer block, so both point to the same Function Table LBA.
+
+LBA0 is the only slot with a genuine second target, and it's reachable from both ends of the device (Section 12) — this is what makes the Superblock specifically hard to lose. LBA1–4's fallback fields are zero-filled and unused: there is nothing for them to point to, since Config Snapshot, the Parity Block, the Meta/User Pointer Table, and the Function Table each have exactly one on-disk copy (ADR-006).
+
+---
+
+## 3. Pointer Block Format
+
+### 3.1 LBA0–3: 2048-byte pointer block
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–7 | 8 | magic = `"CAFSPTR\0"` (literal ASCII, byte-compared) |
+| 8–15 | 8 | real_lba |
+| 16–23 | 8 | real_size |
+| 24–27 | 4 | checksum over bytes 0–23 |
+| 28–1023 | 996 | reserved, zero |
+| 1024–1031 | 8 | fallback_magic = `"CAFSPTR\0"` |
+| 1032–1039 | 8 | fallback_real_lba |
+| 1040–1047 | 8 | fallback_real_size |
+| 1048–1051 | 4 | fallback_checksum over bytes 1024–1047 |
+| 1052–2047 | 996 | reserved, zero |
+
+### 3.2 LBA4–5: 4096-byte pointer block
+
+Same structure, with enlarged reserved areas:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–7 | 8 | magic = `"CAFSPTR\0"` (literal ASCII, byte-compared) |
+| 8–15 | 8 | real_lba |
+| 16–23 | 8 | real_size |
+| 24–27 | 4 | checksum over bytes 0–23 |
+| 28–2047 | 2020 | reserved, zero |
+| 2048–2055 | 8 | fallback_magic = `"CAFSPTR\0"` |
+| 2056–2063 | 8 | fallback_real_lba |
+| 2064–2071 | 8 | fallback_real_size |
+| 2072–2075 | 4 | fallback_checksum over bytes 2048–2071 |
+| 2076–4095 | 2020 | reserved, zero |
+
+### 3.3 Pointer Block Checksum
+
+| ID | Algorithm |
+|----|-----------|
+| 1 | CRC32C — default |
+| 2 | XXHASH32 |
+
+- Primary checksum: computed over bytes 0–23.
+- Fallback checksum: computed over bytes 1024–1047 for 2048-byte blocks (Section 3.1), or bytes 2048–2071 for 4096-byte blocks (Section 3.2).
+
+---
+
+## 4. Real Superblock
+
+Size: 4KB.  
+Pointed by LBA0 primary pointer.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–3 | 4 | magic = `0x53555042` |
+| 4–7 | 4 | format_version = **7** |
+| 8–23 | 16 | volume_uuid |
+| 24–31 | 8 | config_generation |
+| 32–39 | 8 | function_table_anchor_lba = 4 |
+| 40–47 | 8 | wal_sequence |
+| 48–55 | 8 | last_mount_time |
+| 56–59 | 4 | flags |
+| 60–63 | 4 | data_checksum_algo_id |
+| 64–67 | 4 | anchor_checksum_algo_id = 1 |
+| 68–71 | 4 | pointer_checksum_algo_id |
+| 72–79 | 8 | last_applied_wal_seq |
+| 80–83 | 4 | root_hash_algo_id |
+| 84–87 | 4 | namespace_structure_id (v21, ADR-034) |
+| 88–4079 | 3992 | reserved, zero |
+| 4080–4095 | 16 | checksum, BLAKE3-128 over bytes 0–4079 |
+
+`root_hash_algo_id` was dropped in the v15→v17 transition when `pointer_checksum_algo_id` was added at its old offset (68–71) without a replacement slot. Restored here at 80–83, matching how its two siblings (`data_checksum_algo_id`, `anchor_checksum_algo_id`) both keep dedicated Superblock fields.
+
+`namespace_structure_id` (v21) selects the path-resolution mechanism (Section 7b). Exactly one legal value for V1 (`1` = the hash-keyed, per-directory B-tree design below) — reserved now, with only one value defined, specifically so a future alternative can be added by extending the legal-value list rather than requiring a format-breaking change to add it later (ADR-033's future-proofing pattern, applied concretely here for the first time).
+
+---
+
+## 5. Real Config Snapshot
+
+Size: 4KB.  
+Pointed by LBA1.
+
+Layout:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0..N-1 | N | UTF-8 TOML text, canonical config.fs |
+| N..4079 | — | zero padding |
+| 4080–4095 | 16 | BLAKE3-128 checksum over bytes 0–4079 |
+
+Rules:
+
+- `[mount_hints]` is removed before snapshot generation.
+- Within any section that mixes crash-critical and runtime fields (identified by inline `# CRASH-CRITICAL` / `# RUNTIME ONLY` comments, e.g. `[recovery]`, `[dedup]`), only the fields marked `# CRASH-CRITICAL` are kept; runtime fields in that section are stripped along with `[mount_hints]`.
+- Comments and blank lines are stripped; only section headers and `key = value` pairs are kept.
+- `config_self_checksum` is set to `""`.
+- The stripped TOML text is hashed with **xxhash64**.
+- The hash is placed into `config_self_checksum` inside the TOML text, hex-encoded, matching config.fs's own field format.
+- The block-level BLAKE3-128 checksum is then computed over the final 4KB block.
+- The stripped TOML text (`N` bytes above) MUST fit within 4080 bytes. `cafs.sync-config` rejects a config that doesn't, before it reaches mkfs or remount.
+
+Config fields:
+
+- `dedup.enabled = false`
+- `dedup.algo` immutable, stored in this snapshot.
+- `[buffer].granularity` replaces `[buffer].block_size`.
+- `[journal]` section removed.
+- `[cow].enabled` (v20) — whole-partition toggle, ADR-031. Replaces the previously undocumented `default_mode` integer.
+- `[snapshot]` section (v20, new) — crash-critical: `enabled`, timeline limits, `space_limit_fraction`, `raw_file_policy`. ADR-030.
+- `[data].compression_chunk_size` / `compression_chunk_max` / `compression_chunk_min` (v20, new fields in an existing crash-critical section). ADR-025.
+- `[hash_table]` is **not** included — it's runtime-only (non-critical speed cache, ADR-023), same treatment as `[mount_hints]`.
+
+---
+
+## 6. Parity Block
+
+Size: 4KB.  
+Pointed by LBA2.
+
+- There is exactly **one** parity block: XOR of the (single) Superblock and the (single) Config Snapshot.
+- Computation is byte-wise over the full 4KB blocks.
+- Parity block has no header or checksum.
+- No "backup parity" exists (corrected in v20). A backup-parity computation would require a backup Config Snapshot, which does not exist under ADR-006 — only the Superblock has a genuine second copy. Superblock recovery therefore has two paths (Superblock Backup, or XOR-reconstruction against this Parity Block); Config Snapshot recovery has only the XOR path (Section 14, Track B).
+
+---
+
+## 7. Meta/User Pointer Table
+
+Size: `block_size`, usually 4KB.  
+Pointed by LBA3.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–7 | 8 | generation |
+| 8–15 | 8 | zone_table_lba |
+| 16–23 | 8 | btree_root_lba |
+| 24–31 | 8 | dedup_table_root_lba |
+| 32–39 | 8 | relocation_log_head_lba |
+| 40–47 | 8 | relocation_log_tail_lba |
+| 48–55 | 8 | compaction_checkpoint_lba |
+| 56–63 | 8 | fsck_scratch_lba |
+| 64–71 | 8 | identifier_table_lba (v20, ADR-018) |
+| 72–79 | 8 | snapshot_table_lba (v20, ADR-030) |
+| 80–127 | 48 | reserved, zero |
+| 128–143 | 16 | checksum, BLAKE3-128 over bytes 0–127 |
+
+`identifier_table_lba` and `snapshot_table_lba` were added in v20 (format version 5). Both are critical-tier by the same criterion every field in this table already satisfies: losing either risks leak or corruption, not just a rebuild — the Identifier Table is load-bearing namespace/permission data (ADR-018), and the Snapshot Table is the only record of which blocks a snapshot is holding alive (ADR-030). Neither belongs under the Function Table (Section 8), which is reserved for structures whose loss costs speed or discoverability only.
+
+There are three fields named `generation` / `config_generation` in this format: Superblock `config_generation` (Section 4), `config.fs`'s own `[identity].config_generation` (embedded verbatim in the Config Snapshot's TOML text, Section 5), and this table's `generation`. All three MUST hold the same value at all times outside of an in-flight Full Anchor Commit (Section 13.2). Section 13.2 step 7 ("verify generation matches") checks all three against each other, not just two.
+
+---
+
+## 7a. Identifier Table
+
+Critical tier. Pointed by `identifier_table_lba` (Section 7). One row per identifier, direct-indexed — `row_offset = identifier_table_lba + identifier × 48`, no search structure required, since identifiers are assigned as a plain sequential counter (never derived from filename or content, ADR-013's invariant).
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–7 | 8 | filename_blob_offset |
+| 8–15 | 8 | extent_list_offset |
+| 16–19 | 4 | extent_count |
+| 20–31 | 12 | unix_mode + uid + gid |
+| 32–39 | 8 | acl_blob_offset (0 = none; MS-DTYP `SECURITY_DESCRIPTOR`, ADR-024) |
+| 40–43 | 4 | identifier_refcount (ADR-029) |
+| 44–47 | 4 | reserved, zero |
+
+Row size: 48 bytes, chosen over the minimum 44 for 8-byte alignment.
+
+`identifier_refcount` is authoritative for whether this identifier is still reachable from anything — the live B-tree (Section 7b) or any Snapshot Table (Section 7e) entry's retained root. Reaching zero deletes the row (mechanics: Section 7f).
+
+Filenames, extent lists, and ACLs are variable-length and live in a separate blob region, referenced by the offset fields above. Extent list entries are 16 bytes each (`start_lba` + `length`); a contiguous file has `extent_count = 1` — there is no separate "contiguous" storage type (ADR-020). **v22**: the top bit of `length` is now the `UNWRITTEN` flag — a `raw` file's full upfront allocation is marked allocated-but-logically-zero rather than physically zero-filled; a read of an unwritten range returns zero without touching disk, a write clears the flag for the written portion. No practical file needs `length`'s full original range for a single extent, so this costs nothing structurally. Avoids both the stale-data leak of leaving blocks truly uninitialized and the write-amplification cost of a physical zero-fill pass at allocation time (ADR pending — logged this version, formal ADR not yet written).
+
+**Directory rows (v21, ADR-034)**: `unix_mode`'s `S_IFDIR` bit distinguishes a directory row from a file row, no new field needed. For a directory row, `extent_list_offset` is repurposed — directories hold no file data, so this field is otherwise unused — to instead hold that directory's own B-tree subtree root LBA (Section 7b). `extent_count` is meaningless for a directory row and stays zero. This is what makes cross-directory path resolution a direct-indexed O(1) read rather than a search: reaching a subdirectory's tree means reading its own Identifier Table row, not walking anything.
+
+## 7b. B-Tree (Namespace Resolution)
+
+Critical tier. Resolved in v21 (ADR-034) — previously mechanism-only, byte layout fully open.
+
+**One tree per directory**, not one global tree — each directory row's repurposed `extent_list_offset` (Section 7a) points at its own subtree root. A directory's tree only ever needs to disambiguate names *within that directory*, so keys stay a plain fixed-width hash rather than a full path or compound key.
+
+**Hash-keyed**: each key is an 8-byte hash of a single path component (the name as it exists inside this one directory), not the variable-length name itself. Resolving `/foo/bar/readme.txt`: hash `"foo"`, walk the root directory's tree to find `foo`'s identifier; read `foo`'s Identifier Table row to get its subtree root; hash `"bar"`, walk that tree; repeat for `readme.txt`, whose match yields the target identifier. Each level's tree walk is a real search; each hop *between* levels is a direct-indexed read (Section 7a), not a search.
+
+**Node**: 4096 bytes (= `block_size`).
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | is_leaf flag |
+| 1–2 | 2 | key_count |
+| 3–7 | 5 | reserved, zero |
+| 8–4071 | up to 254 × 16 | slot array |
+| 4072–4079 | 8 | reserved, zero |
+| 4080–4095 | 16 | checksum trailer (Section 15a) |
+
+Each slot: 8-byte key hash + 8-byte value (child node LBA for an internal node; identifier for a leaf node). **254-way branching per level, not 255 (v22 fix)** — the original 255-slot layout (8-byte header + 255 × 16-byte slots = 4088 of 4096 bytes) overlapped the checksum trailer's fixed last-16-bytes position by 8 bytes whenever a node was full: the 255th slot's value field (offset 4080–4087) sat exactly where the trailer's first 8 bytes go. 254 slots leaves the required 16 bytes for the trailer with 8 bytes to spare, mirroring ext4's own dx_tail precedent (reducing usable capacity to make room for a checksum) rather than inventing a new resolution.
+
+**Collision handling**: two different path components hashing identically within one directory's tree is resolved by confirming against the real name already stored in the matched identifier's Identifier Table row (`filename_blob_offset`) — a read, not a second stored copy of the name.
+
+Precedent: this design's three defining properties (hash-keyed, per-directory, high fanout) match ext3/ext4's HTree directory index directly, confirmed against the kernel's own documentation before finalizing (ADR-034) — not an untested design.
+
+**Open**: whether this node format requires explicit rebalancing on insert/delete, or achieves HTree's "no balancing required" property by construction, is an implementation question not resolved by this document.
+
+## 7c. Zone Table
+
+Critical tier. Pointed by `zone_table_lba` (Section 7). Divides the drive into large fixed-size regions ("zones" — exact size not fixed by this document, candidate range a few GiB). Per zone: a free-space summary and a health indicator, consumed by the allocator and by balance. Not a reverse LBA-to-owner index (ADR-022) — write-collision protection comes from the allocator refusing to hand out anything not marked free, never from a lookup structure.
+
+**Health field has two independent sources (v21, ADR-035)**: SMART data (unchanged), and a scrub — piggybacked onto blocks balance/defrag already touch, checking the mandatory checksum trailer (Section 15a) that already exists on every block regardless. A checksum failure found this way feeds the same per-zone health field SMART already populates; one number, two sources, not a second parallel signal. `config.fs [scrub].full_drive_scan_preference` (default monthly) governs an additional dedicated full pass specifically to reach cold data the piggyback approach would never touch — this document defines only that the signal exists and where it lands, not the scan implementation.
+
+Per-block state within a zone is a small **reference count** (v20; previously a binary free/used bit) — the number that gates whether the allocator may reclaim a physical block. Incremented by a live extent-list reference, reachability from a retained snapshot root, or a dedup match; decremented by ADR-029's cascade. Exact zone size, per-zone field widths, and per-block count width are not fixed by this document.
+
+## 7d. Dedup Table
+
+Critical tier. Pointed by `dedup_table_root_lba` (Section 7). Formalized here for the first time — previously referenced only by pointer and by prose in ADR-014, never given a layout section.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–7 | 8 | hash |
+| 8–15 | 8 | location_id (raw physical LBA — see peer-addressing note below) |
+| 16–23 | 8 | offset |
+| 24–27 | 4 | length |
+| 28–31 | 4 | refcount |
+
+Entry size: 32 bytes. Bucketed by hash (bucket count / overflow chain depth: `config.fs [dedup_table]`).
+
+**Peer-addressed, not chained** (ADR-029): every entry points directly at a physical location. There is no representation of "File B's data, which lives inside File A" — two files sharing a block are independent, equal references to the same bytes. `refcount` here mirrors the block-level count (Section 7c), not an independently-tracked number — avoiding two counts for one fact that could drift. Same representation for both dedup tiers (whole-file and per-LBA matching, ADR-014) — they differ only in how the match was found, not in the resulting on-disk state.
+
+## 7e. Snapshot Table
+
+Critical tier. Pointed by `snapshot_table_lba` (Section 7). One row per snapshot. No file or metadata content is ever copied into this table — see Section 7g for why.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–7 | 8 | snapshot_id |
+| 8–15 | 8 | timestamp |
+| 16–19 | 4 | retention_tier (hourly/daily/weekly/monthly/yearly/manual — encoding not yet fixed) |
+| 20–27 | 8 | saved_btree_root_lba |
+| 28–31 | 4 | reserved, zero |
+
+Row size: 32 bytes. Array with a header (count, capacity) rather than direct-indexed like the Identifier Table — snapshot cardinality is expected to be orders of magnitude smaller than file count.
+
+## 7f. Reference Counting Protocol
+
+Two independent counts (ADR-029), not one:
+
+- **Identifier-level** (Section 7a) — authoritative for reachability of an identifier.
+- **Block-level** (Section 7c) — authoritative for whether the allocator may reclaim a physical block.
+
+**Cascade on identifier deletion**: identifier refcount reaches zero → row deleted from the Identifier Table → for each of its extents, the *block's own* refcount is decremented independently (not a Dedup Table lookup or wipe) → only if a given block's count then reaches zero does it become reclaimable, and only then is its Dedup Table entry (Section 7d), if any, no longer meaningful. A block shared with another identifier is untouched by the first identifier's deletion — its count simply drops by one.
+
+Both kinds of zero-event (freed identifier slot, freed block) are logged to the Recently-Zeroed Queue (Section 8b).
+
+**Open**: whether a freed identifier's numeric slot is later reused for a new file, or permanently retired (requiring eventual compaction), is not decided by this document.
+
+## 7g. Snapshot Protocol
+
+A snapshot (Section 7e) is created by saving the current B-tree root pointer alongside an id, timestamp, and retention tier — nothing is copied. Every block reachable from that saved root has its block-level refcount (Section 7c) held above zero for as long as the row exists, by the ordinary reference-counting mechanics of Section 7f — a snapshot is simply one more reason a block's count is nonzero, not a distinct mechanism.
+
+Reading through a snapshot uses identical traversal logic to reading the live tree (Section 7b), started from the saved root instead of the live one.
+
+**Reversal**: the live root pointer (Section 7, `btree_root_lba`) is repointed to a snapshot's saved root. Cleanup is refcount-driven and partial, not wholesale — a block written after the snapshot that nothing else currently references becomes reclaimable; a block also held by a different, still-existing snapshot survives regardless of what the live pointer now points to.
+
+**Requires** `[cow].enabled = true` (config.fs) — there is nothing for a snapshot to retain without copy-on-write; an in-place write destroys the only copy of whatever it overwrites.
+
+**Open**: behavior when a snapshot's reachable set includes a `raw`-flagged file (which has no CoW and cannot be protected) — `config.fs [snapshot].raw_file_policy` exists as a provisional field (skip/warn/block) but is not locked by this document.
+
+---
+
+## 8. Function Table
+
+Pointed by LBA4.  
+LBA5 is a byte-for-byte copy of the LBA4 pointer block.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–7 | 8 | wal_lba |
+| 8–15 | 8 | smart_main_lba |
+| 16–23 | 8 | smart_backup_lba |
+| 24–31 | 8 | scratch_lba |
+| 32–39 | 8 | temp_cache_lba |
+| 40–47 | 8 | hash_table_lba (v20, ADR-023) |
+| 48–55 | 8 | recent_zero_queue_lba (v20, ADR-029) |
+| 56–63 | 8 | reserved, zero |
+| 64–79 | 16 | checksum, BLAKE3-128 over bytes 0–63 |
+
+Both new fields are non-critical by design, same as every other field in this table: `hash_table_lba` points at a rebuildable speed cache (Section 8a); `recent_zero_queue_lba` points at a bounded, informational log (Section 8b) whose loss costs nothing but the list itself — the authoritative refcounts it was built from (Section 7's Identifier Table, and the Zone Table) are unaffected either way.
+
+### 8a. Hash Table
+
+Non-critical speed-index cache (ADR-013, redesigned ADR-023). Existence-check only, content-hash → identifier. Bucketed (same bucket/overflow-chain pattern as the Dedup Table, Section 7d), config-selected width via `[hash_table].mode` in config.fs. Exact bucket-header/entry byte layout: **open**, not specified by this document — the config-level toggle and 256-bit width are decided; the physical table layout is not.
+
+### 8b. Recently-Zeroed Queue
+
+Bounded log of things whose refcount (Section 7a, Section 10a) recently reached zero. Two kinds of entry, tagged — a freed Identifier Table slot (relevant to the still-open reuse-vs-retire compaction question) and a freed physical block (relevant to the allocator's reclaim path) are different consumers' concerns, even though both originate the same way.
+
+Provisional entry format (not yet locked):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | tag: 0 = identifier slot, 1 = block |
+| 1–8 | 8 | value (identifier number, or block LBA) |
+| 9–16 | 8 | timestamp (zeroed-at) |
+
+Bounded by a maximum entry count or maximum age, config-driven (not yet named in config.fs) — oldest entries are dropped once either bound is exceeded.
+
+---
+
+## 9. WAL
+
+### 9.1 WAL Block Header
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–7 | 8 | magic = `0x57414C42` |
+| 8–15 | 8 | block_seq |
+| 16–23 | 8 | prev_lba |
+| 24–31 | 8 | next_lba |
+| 32–35 | 4 | entry_count |
+| 36–39 | 4 | flags |
+| 40–47 | 8 | header_checksum |
+
+Checksum: xxhash64 over bytes 0–39 and fixed entries.
+
+### 9.2 WAL Entry
+
+Fixed size: 48 bytes.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | valid |
+| 1 | 1 | operation_type |
+| 2–17 | 16 | key |
+| 18–33 | 16 | value |
+| 34–41 | 8 | entry_checksum |
+| 42–47 | 6 | sequence_number |
+
+Operation types:
+
+| Value | Meaning |
+|---|---|
+| 0x01 | INSERT |
+| 0x02 | DELETE |
+| 0x03 | UPDATE |
+| 0x04 | CHECKPOINT |
+| 0x05 | ANCHOR_DIFF |
+
+Sequence number:
+
+- 6 bytes, unsigned.
+- Little-endian.
+- Range: `0 .. 2^48-1`.
+
+Max fixed entries per block:
+
+    floor((block_size - 48) / 48)
+
+### 9.3 ANCHOR_DIFF
+
+The WAL entry’s 16-byte `value` field contains:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–7 | 8 | anchor_diff_block_lba |
+| 8–15 | 8 | anchor_diff_block_size |
+
+The anchor diff block is a separate 4KB block containing:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–3 | 4 | anchor_id |
+| 4–7 | 4 | diff_count |
+| 8... | variable | diffs[] |
+| end-4 | 4 | CRC32C over preceding payload |
+
+`anchor_id` values (v16 defined 0–6 for these; the original mapping wasn't carried into v17 and isn't recovered from a source document — this is a reconstruction, not a verified original, and should be swapped for the real v16 table if that turns up):
+
+| ID | Structure |
+|---|---|
+| 0 | Superblock |
+| 1 | Config Snapshot |
+| 2 | Parity Block |
+| 3 | Meta/User Pointer Table |
+| 4 | Function Table |
+| 5 | SMART Main |
+| 6 | SMART Backup |
+
+`diffs[]` MUST fit within 4084 bytes (4096 minus the 8-byte header minus the 4-byte trailing CRC32C). A diff set that doesn't fit is not chained across multiple anchor diff blocks — there is no chaining field for this block type (unlike WAL blocks, which chain via `prev_lba`/`next_lba`). It falls back to a full anchor rewrite via Section 13.1 instead.
+
+Each diff:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–3 | 4 | offset |
+| 4–7 | 4 | size |
+| 8... | variable | value |
+
+---
+
+## 10. WAL Protocols
+
+### 10.1 Append
+
+1. If tail block has free slot:
+   - Write fixed entry.
+   - Increment `entry_count`.
+   - Recompute header checksum.
+   - Write tail block in place.
+   - `fsync()`.
+
+2. If tail block is full:
+   - Allocate new zeroed block.
+   - The new block's own first entry (entry_count=1, below) IS the
+     allocation-log INSERT — every new WAL block's first entry
+     records its own allocation. This is what Section 10.2 step 3
+     scans for. (The old tail can't receive it: this branch's
+     precondition is that the old tail has no free slot.)
+   - Write new block with:
+     - `block_seq = tail.block_seq + 1`
+     - `prev_lba = tail_lba`
+     - `next_lba = 0`
+     - `entry_count = 1`
+   - Write first entry.
+   - `fsync()`.
+   - Read old tail.
+   - Set old tail `next_lba = new_lba`.
+   - Set old tail `flags.full = 1`.
+   - Recompute old tail checksum.
+   - Write old tail.
+   - `fsync()`.
+   - Update volatile tail pointer.
+   - The operation that triggered this rollover is then appended
+     via step 1 against the new tail, which now has entry_count=1
+     and free slots remaining.
+
+No Function Table update occurs during ordinary appends.
+
+### 10.2 Recovery
+
+1. Read WAL head from `Function Table[0]`.
+2. Walk `next_lba` chain.
+3. Reconstruct Zone Table free-list from WAL allocation INSERT entries.
+4. Scan each WAL block:
+   - Verify header checksum.
+   - If corrupt: abort and require fsck.
+   - For each valid entry:
+     - Skip if `sequence_number <= last_applied_wal_seq`.
+     - Otherwise apply idempotently.
+5. For ANCHOR_DIFF:
+   - Read anchor diff block.
+   - Verify CRC32C.
+   - Apply diff.
+6. Set volatile tail to last valid block.
+7. Update Superblock `last_applied_wal_seq`.
+
+### 10.2b WAL Region Sizing Guidance
+
+`[wal].region_size` (config.fs) should hold at least a few minutes of
+write traffic at the expected sustained write rate, so Head
+Advancement (10.3) doesn't run on every append under heavy load:
+
+    region_size >= sustained_write_MBps * 60 * target_minutes_between_advancement
+
+`[wal].sync_interval_seconds` and `[wal].sync_on_every_write` trade
+latency for durability window. `sync_on_every_write = true` ignores
+`sync_interval_seconds` and fsyncs every append (10.1 step 1).
+`false` batches up to `sync_interval_seconds` of unsynced appends —
+that interval is also the crash-loss window.
+
+### 10.3 Head Advancement
+
+1. Flush dirty metadata.
+2. Find first WAL block with at least one valid entry.
+3. Set Function Table `wal_lba` to that block.
+4. Perform full anchor commit.
+5. Return invalid blocks to free pool.
+
+---
+
+## 11. SMART
+
+### 11.1 Layout
+
+| Offset | Size | Field |
+|---|---|---|
+| 0–3 | 4 | magic = `0x534D5254` (`"SMRT"`) |
+| 4–7 | 4 | version = 1 |
+| 8–15 | 8 | sequence |
+| 16–23 | 8 | total_reads |
+| 24–31 | 8 | total_writes |
+| 32–35 | 4 | total_read_errors |
+| 36–39 | 4 | total_write_errors |
+| 40–43 | 4 | total_checksum_mismatch |
+| 44–51 | 8 | total_host_relocations |
+| 52–59 | 8 | last_access_lba |
+| 60–67 | 8 | last_access_timestamp |
+| 68–71 | 4 | mount_count |
+| 72 | 1 | clean_unmount_flag |
+| 73–127 | 55 | reserved |
+| 128–143 | 16 | BLAKE3-128 checksum over bytes 0–127 |
+
+### 11.2 SMART Flow
+
+    I/O Engine
+      -> SMART Buffer
+      -> SMART Handler
+      -> B-SMART
+      -> WAL
+      -> M-SMART
+
+M-SMART: main, pointed by Function Table `smart_main_lba`.  
+B-SMART: backup, pointed by Function Table `smart_backup_lba`.
+
+---
+
+## 12. End-of-Device Backup
+
+**Corrected in v20.** The last 6 anchor blocks hold a copy of LBA0–5, but this is a **pointer-recovery mechanism, not a second copy of the real structures pointed to** — with exactly one exception (Superblock). v19's Section 12/17b described distinct "Config Snapshot Backup," "Meta/User Pointer Table Backup," "Function Table Backup," and a "Backup Parity Block." None of these exist. They contradicted ADR-006 (which explicitly scoped redundancy to Superblock and SMART only, to control write amplification) and were never authoritative — corrected per the ADR-006 amendment.
+
+| Anchor block (tail) | Primary → | Fallback → |
+|---|---|---|
+| LBA0 | Superblock Backup (the genuine second copy) | real Superblock |
+| LBA1 | same single Config Snapshot as the head copy | unused |
+| LBA2 | same single Parity Block as the head copy | unused |
+| LBA3 | same single Meta/User Pointer Table as the head copy | unused |
+| LBA4/5 | same single Function Table as the head copy | unused |
+
+Only **Superblock** has a genuine, independently-written second copy — cross-linked from both ends of the device (head's fallback reaches it, tail's primary reaches it), which is what makes it specifically hard to lose. Every other real structure (Config Snapshot, Parity Block, Meta/User Pointer Table, Function Table) has exactly one physical copy; the tail anchor region gives a second *path* to that same one copy, not a second copy. If a structure's one copy is corrupt, the tail pointer block finding it doesn't help — recovery falls to Section 14, Track B or C.
+
+M-SMART/B-SMART are unaffected by any of this — they've always been two separately-addressed structures reachable via the Function Table (`smart_main_lba`, `smart_backup_lba`), identically from either end, with no anchor-pointer-level redirect involved.
+
+The WAL has no backup under any mechanism — corruption requires fsck (Section 14).
+
+---
+
+## 13. Atomic Protocols
+
+### 13.1 Single Anchor Update
+
+1. Write new real structure if needed. `fsync()`.
+2. Update corresponding pointer block.
+3. Recompute pointer block checksum.
+4. Write end-of-device backup. `fsync()`.
+5. Write primary anchor region. `fsync()`.
+
+### 13.2 Full Anchor Commit
+
+1. Prepare new real structures.
+2. Write real structures. `fsync()`.
+3. Update LBA0, LBA1, LBA2, LBA3, LBA4 pointer blocks.
+4. Write LBA5 as copy of LBA4 pointer block.
+5. Write end-of-device backup. `fsync()`.
+6. Write primary anchor region LBA0–5. `fsync()`.
+7. Verify generation matches.
+
+### 13.3 In-Place Content Update
+
+For a content change that does not relocate the structure (e.g. Head
+Advancement rewriting the Function Table's `wal_lba`, or any Meta/User
+Table pointer field changing): 13.1's pointer-block steps don't apply —
+the structure's LBA is unchanged, so nothing points anywhere new.
+
+1. Rewrite the structure in place at its existing LBA. Recompute its
+   checksum. `fsync()`.
+2. If the structure is the Superblock (the only real structure with a
+   genuine second copy, Section 12): also write the same content to
+   Superblock Backup at its existing LBA, recompute its checksum,
+   `fsync()`. No other structure has a step here — Config Snapshot,
+   Meta/User Table, and Function Table each have exactly one copy.
+3. No pointer block or end-of-device anchor-region write is needed —
+   none of them changed; the tail region already points at the same
+   single copy the head region does.
+
+If the structure is the Superblock or Config Snapshot (Parity-covered,
+Section 6), the Parity Block must also be recomputed and rewritten as
+step 3.5, since it's a function of both their contents.
+
+---
+
+## 14. Recovery Order
+
+Anchor corruption recovery depends on which of two things failed: a
+pointer block (LBA0–5, Section 3), or a real structure the pointers
+point to (Sections 4–8). These are different failure domains with
+different recovery paths — a corrupt pointer block doesn't mean the
+real structure it points to is also corrupt, and vice versa.
+
+**Track A — a pointer block (LBA0–5) fails its own checksum:**
+
+1. Try that block's fallback pointer fields (Section 3.1/3.2) — same
+   block, offset 1024 or 2048. Populated only for LBA0 (Section 2);
+   LBA1–4's fallback fields are unused, so this step only applies to LBA0.
+2. Try the end-of-device copy of that pointer block (Section 12) —
+   this recovers the *pointer*, not necessarily the real structure it
+   points to, which may need Track B or C below regardless.
+3. Full fsck (rebuild the pointer from an anchor-region scan) if both fail.
+
+**Track B1 — Superblock fails its own checksum** (the pointer block
+pointing to it is fine):
+
+1. Try Superblock Backup (Section 12) — the one real structure with a
+   genuine second copy.
+2. XOR-reconstruct it from the Parity Block against Config Snapshot
+   (Section 6).
+3. Full fsck if both fail.
+
+**Track B2 — Config Snapshot fails its own checksum** (the pointer
+block pointing to it is fine):
+
+1. XOR-reconstruct it from the Parity Block against Superblock
+   (Section 6) — there is no distinct Config Snapshot backup to try
+   first (corrected in v20; see Section 12).
+2. Full fsck if that fails.
+
+**Track C — Meta/User Pointer Table or Function Table fails its own
+checksum** (the pointer block pointing to it is fine):
+
+1. Full fsck. Neither structure has a backup copy or Parity Block
+   coverage (Section 12) — there is no intermediate recovery step.
+   This was ADR-006's stated, accepted consequence of scoping
+   redundancy to Superblock and SMART only.
+
+WAL corruption is not covered by any of the above. It requires fsck.
+
+---
+
+## 15. Block Size and Alignment
+
+- `block_size` must be a multiple of 1024 bytes.
+- Power-of-two values are strongly recommended.
+- Non-power-of-two values are allowed but may incur alignment overhead.
+- Physical sector alignment risk is on the user if `block_size` does not match sector size.
+
+## 15a. Data Block / B-Tree Node Checksum Trailer
+
+Resolved in v20 — previously listed as an open gap (Section 18).
+
+Fixed 16-byte trailer, last 16 bytes of every data block and B-tree
+node (Section 7b). Width is fixed regardless of `data_checksum_algo_id`
+(Section 16):
+
+- Algorithm output wider than 16 bytes: split into 16-byte chunks
+  (zero-padding the last if it doesn't divide evenly) and XOR them
+  together. Folding, not truncation — every input byte contributes,
+  rather than discarding half a wide hash's collision resistance for
+  free. Generalizes to any width (a 64-byte output folds into 4
+  chunks; 256 bytes folds into 16 — same rule, more repetitions).
+- Algorithm output narrower than 16 bytes (crc32c = 4B, xxhash64 = 8B):
+  zero-padded up to 16.
+- Little-endian throughout (Decision 9).
+
+Two different blocks producing the same 16-byte trailer is expected at
+scale and not a fault condition — a block's trailer is only ever
+compared against that same block's own previously-stored value, never
+against another block's, so an accidental match between unrelated
+blocks has no effect on anything. This tolerance does **not** apply to
+the Hash Table (Section 8a) or Dedup Table (Section 7d) content-hash
+fields, where a collision risks two different pieces of data being
+treated as share-candidates — those remain full-width, unfolded
+(256-bit, ADR-023).
+
+---
+
+## 16. Algorithm Identifiers
+
+Each of the four fields below has its own independent ID space. The
+same number means a different algorithm depending on which field it's
+read from — `data_checksum_algo_id = 2` and `root_hash_algo_id = 2`
+are unrelated (xxhash64 vs. sha256). Don't cross-reference IDs across
+tables.
+
+**data_checksum_algo_id:**
+
+| ID | Algorithm |
+|----|-----------|
+| 0 | none |
+| 1 | crc32c |
+| 2 | xxhash64 |
+| 3 | blake3 |
+
+**anchor_checksum_algo_id:** must be `1` (blake3-128) for format version 7 — no other value is valid.
+
+**root_hash_algo_id:**
+
+| ID | Algorithm |
+|----|-----------|
+| 0 | none |
+| 1 | blake3 |
+| 2 | sha256 |
+
+**compression_algo (config.fs field, not a Superblock ID):**
+
+| Value | Algorithm |
+|----|-----------|
+| none | none |
+| zstd | zstd |
+| lz4 | lz4 |
+
+**pointer_checksum_algo_id** (Section 3.3, separate from all of the above): `1` = CRC32C, `2` = XXHASH32.
+
+Real structures (Superblock, Config Snapshot, Meta/User Table, Function Table) use BLAKE3-128 exclusively (`anchor_checksum_algo_id`) — the four tables above are for *other* checksums (data blocks, B-tree root hash, compression), not for the anchor-block integrity checksum itself. Pointer blocks (LBA0–5) use `pointer_checksum_algo_id` only.
+
+---
+
+## 17. Config Changes from v15
+
+- `format_version = 4`
+- Added `pointer_checksum_algo`.
+- `dedup.enabled = false`
+- `dedup.algo` immutable, stored in Config Snapshot.
+- `[buffer].block_size` → `[buffer].granularity`.
+- `[journal]` section removed.
+- Superblock `journal_sequence` renamed to `wal_sequence`.
+- `[mount_hints]` remains runtime-only and excluded from Config Snapshot.
+
+## 17b. Changes from v17
+
+- Config Snapshot confirmed as the permanent format (TOML text, Section 5) — the competing fixed-offset binary struct proposal that circulated separately is discarded.
+- Restored `root_hash_algo_id` to the Superblock (Section 4).
+- Restored distinct backup copies for Config Snapshot, Meta/User Table, and Function Table (Section 12) — previously only Superblock and the Parity Block had real redundancy.
+- Pinned down the LBA4–5 fallback pointer field layout (Section 3.2/3.3).
+- Stated the config_self_checksum algorithm (xxhash64) and a 4080-byte bound on the stripped TOML (Section 5).
+- Stated the sync rule across the three `generation` fields (Section 7).
+- Assigned `anchor_id` values and bounded the ANCHOR_DIFF payload size (Section 9.3).
+- Clarified which block receives the WAL allocation-log entry on rollover (Section 10.1).
+- Added WAL region sizing guidance using config.fs's real key names (Section 10.2b).
+- Added an in-place content update protocol (Section 13.3), needed now that Section 12 has more structures with real backups to keep in sync.
+- Split Recovery Order into three failure-domain tracks (Section 14).
+- Split the conflated algorithm ID table into four independent tables (Section 16).
+
+---
+
+## 17c. Changes from v19 (format_version 4 → 5)
+
+- Corrected Section 12 (End-of-Device Backup): removed the four fictional backup structures (Config Snapshot Backup, Meta/User Table Backup, Function Table Backup, Backup Parity Block) introduced in error at v17b. Only Superblock has a genuine second copy — matches ADR-006 as originally accepted, amended 2026-09-06 to spell this out explicitly.
+- Split Recovery Order Track B (Section 14) into B1 (Superblock, two recovery paths) and B2 (Config Snapshot, one path) to match the corrected redundancy model; Track C now goes straight to fsck, no intermediate backup-copy step.
+- Fixed pointer block magic value throughout (Section 2, 3): literal 8-byte ASCII `"CAFSPTR\0"`, not the invalid hex literal `0xCAFSPTR` used in earlier versions (ADR-010).
+- Stated global little-endian byte order explicitly (Decision 9) — previously only stated for `sequence_number`.
+- Added five new critical-tier structures, all pointed from the Meta/User Pointer Table: Identifier Table (7a), B-tree namespace resolution — mechanism only, byte layout still open (7b), Zone Table redefinition with per-block refcount (7c), Dedup Table — formalized with an actual byte layout for the first time (7d), Snapshot Table (7e), plus their shared Reference Counting Protocol (7f) and Snapshot Protocol (7g).
+- Added two new Function Table fields: `hash_table_lba` (8a) and `recent_zero_queue_lba` (8b).
+- Resolved the data block / B-tree node checksum trailer format (15a) — previously an open gap.
+- Corrected Section 13.3 (In-Place Content Update) to match Section 12's fix — only Superblock gets a backup-copy write step.
+
+---
+
+## 17d. Changes from v20 (format_version 5 → 6)
+
+- Resolved B-tree byte layout (Section 7b): hash-keyed, one tree per directory, ~255-way branching, 16-byte slots. Previously fully open. Validated against ext3/ext4 HTree precedent before finalizing (ADR-034).
+- Added `namespace_structure_id` to the Superblock (offset 84–87) — a reserved selector field with exactly one legal value for V1, so a future alternative namespace structure doesn't require a format-breaking change to add (ADR-033's future-proofing pattern, first concrete application).
+- Documented the Identifier Table's directory-row field repurposing (Section 7a): `extent_list_offset` holds a subtree root LBA for directory rows, distinguished via the existing `unix_mode` `S_IFDIR` bit — no new field.
+- Documented Zone Table's second health-field input (Section 7c): a scrub, piggybacked on balance/defrag's existing I/O, feeding the same per-zone health field SMART already populates.
+
+## 17e. Changes from v21 (format_version 6 → 7)
+
+- **Fixed B-tree branching factor** (Section 7b): 254 slots, not 255. The v21 layout overlapped the checksum trailer's fixed last-16-bytes position by 8 bytes whenever a node was completely full — a real conflict, not a hypothetical one, found by checking the two sections' byte ranges against each other directly. Closes the "dx_tail-style" question RESEARCH-JOB3 had flagged as unresolved.
+- **Added the `UNWRITTEN` flag** to extent entries (Section 7): top bit of `length`. A `raw` file's full upfront allocation is now allocated-but-logically-zero rather than physically zero-filled at allocation time — ext4-style unwritten-extent semantics, chosen specifically because a physical zero-fill pass is itself the write-amplification `raw` exists to avoid, while still closing the stale-data-exposure risk of leaving blocks truly uninitialized.
+- **`raw` files are categorically outside snapshot scope**, not subject to a runtime policy — removed `config.fs [snapshot].raw_file_policy` as a behavior fork (see config.fs changelog). No CoW means nothing for a snapshot to hold a reference to; this was always structurally true, the field just implied a choice that didn't actually exist.
+- **`smart_handler.py`'s dual `emergency_mode` precedence resolved**: `--type=smart`'s acute signal wins over `--type=trends` by default, user-configurable — except a hard floor (ATA SMART 187/198; NVMe `critical_warning` bits 2/3) that no configuration can override. Not a format change, noted here since it closes a gap this document previously flagged as open.
+- **Identifier slot lifecycle resolved as "both"**: refcount-zero retires the slot immediately (inline, cheap) and queues it via the Recently-Zeroed Queue's existing `tag` field (a new tag value for "retired identifier, available for reuse") for asynchronous reclaim by defrag/balance/storage-expander — the same background-reclaim pattern already used for data blocks, not new plumbing. The queue's exact byte format is still open (Section 18); the lifecycle policy that format needs to support is not.
+
+## 18. Known Open Gaps
+
+Not resolved in this document — flagged rather than silently left implicit:
+
+- **B-tree rebalancing** (Section 7b): whether the resolved node format needs explicit rebalancing on insert/delete, or achieves HTree's "no balancing required" property by construction, is an implementation question, not a format question — not resolved here.
+- **Hash Table bucket/entry layout** (Section 8a): the config-level toggle and 256-bit width are decided; the physical table format is not.
+- **Recently-Zeroed Queue entry format**: provisional, not locked — now needs to accommodate a second entry kind (retired identifier slots, v22) in addition to zeroed data blocks, via the existing `tag` field. The kind is decided; the byte layout is not.
+- **Snapshot Table `retention_tier` encoding** (Section 7e): field exists, exact value mapping does not.
+- **Metadata deduplication**: explicitly deferred (2026-09-08), not decided either way. Content-addressable data (user data, and filenames specifically) could in principle share this document's dedup mechanism; position-dependent structures (B-tree nodes, Zone Table entries, Identifier Table rows) structurally cannot, since their identity depends on position, not just content.
+- **`wal_lba` (Function Table) needs to become a list of active WAL chunk locations, not a single pointer** — WAL is now allocated as one or more `raw`-tagged 512MB-ish chunks rather than a single fixed region, and the fast-path pointer needs to reflect the current chunk(s), not just a start. Proposed reusing the 16-byte extent-entry shape for this; not yet formally specified in this document.
+- **`fsck_scratch_lba`, `scratch_lba`, `temp_cache_lba`**: three reserved pointer fields (one critical-tier, two non-critical) with no described purpose or format anywhere in this document, and no grounding found in any other project document either as of v22. Needs the underlying intent defined before a format can be proposed.
+- `config.fs [identity].uuid_sequence`, `volume_label`, `volume_label_strict` remain crash-critical fields with no protocol role described anywhere in this document. Treated as inert passthrough data carried in the Config Snapshot's TOML text; no action taken.
+
+---
+
+## 19. End of Document
+
+**CAFS FS.INFO v22 — format version 7**
