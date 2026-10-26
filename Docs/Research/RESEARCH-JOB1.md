@@ -1,3 +1,5 @@
+> **Status:** HISTORICAL (evidence). Its ACL finding (acl_blob_offset / MS-DTYP, ADR-024) is superseded by the dual-ACL decision; see DECISIONS-FORMAT-8.md G1/G4.
+
 # Research Log — Job 1 (On-Disk Binary Data)
 
 Scope: external research performed during Job 1, as distinct from internal design decisions (those are recorded in the ADRs). Each entry states the question, what was actually checked, the finding, and what it fed into.

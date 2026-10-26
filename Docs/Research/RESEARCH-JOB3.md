@@ -1,3 +1,5 @@
+> **Status:** HISTORICAL (evidence). Decisions it fed are in fs.info and the ADR store; open items live in OPEN_ITEMS.md.
+
 # Research Log — Job 3
 
 Scope: external research performed during Job 3, distinct from internal design decisions (recorded in the ADRs) and from code review (recorded in JOB3-OVERVIEW).

@@ -1,3 +1,5 @@
+> **Status:** HISTORICAL (evidence). Superseded in parts by DECISIONS-FORMAT-8.md (e.g. the G1 PoC choice); open items live in OPEN_ITEMS.md.
+
 # CAFS — Consolidated Research (grouped by function)
 **Date:** 2026-09-30
 **Status:** AI-compiled. Informs decisions, is not one. Not canon.
