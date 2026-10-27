@@ -18,6 +18,8 @@ pub enum CafsError {
     NotMounted,
     InvalidArg,
     Unsupported,
+    OutOfRange,
+    Bypassed,
 }
 
 impl fmt::Display for CafsError {
@@ -33,6 +35,8 @@ impl fmt::Display for CafsError {
             CafsError::NotMounted => "called out of order, e.g. confirm before mount",
             CafsError::InvalidArg => "invalid argument",
             CafsError::Unsupported => "operation unsupported in this configuration",
+            CafsError::OutOfRange => "offset+length falls outside the device",
+            CafsError::Bypassed => "operation needs anchors, but the device was opened in bypass mode",
         };
         f.write_str(s)
     }

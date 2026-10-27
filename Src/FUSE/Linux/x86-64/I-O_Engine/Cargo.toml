@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "mkfs_cafs"
 path = "src/bin/mkfs_cafs.rs"
 
+[[bin]]
+name = "cafsctl"
+path = "src/bin/cafsctl.rs"
+
 [dependencies]
 # Syscall foundation (ADR-012): direct-syscall backend where available,
 # I/O-safety typestate (OwnedFd/AsFd) throughout, no unsafe needed for

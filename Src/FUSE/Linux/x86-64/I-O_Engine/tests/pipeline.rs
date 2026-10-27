@@ -110,7 +110,7 @@ fn full_pipeline() {
     ctx.close().unwrap();
 
     let fixed_byte = read_byte(img_path, 16384 + 100);
-    let backup_byte = read_byte(img_path, IMG_SIZE - 4096 + 100);
+    let backup_byte = read_byte(img_path, cafs_io::layout::sb_backup_offset(IMG_SIZE).0 + 100);
     assert_eq!(fixed_byte, backup_byte, "primary Superblock byte 100 was actually rewritten to match the backup on disk");
 
     // --- re-check after repair: no repair needed the second time ---

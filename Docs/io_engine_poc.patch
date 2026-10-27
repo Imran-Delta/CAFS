@@ -1,0 +1,3060 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 8d58e7b..9947106 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -13,6 +13,10 @@ path = "src/lib.rs"
+ name = "mkfs_cafs"
+ path = "src/bin/mkfs_cafs.rs"
+ 
++[[bin]]
++name = "cafsctl"
++path = "src/bin/cafsctl.rs"
++
+ [dependencies]
+ # Syscall foundation (ADR-012): direct-syscall backend where available,
+ # I/O-safety typestate (OwnedFd/AsFd) throughout, no unsafe needed for
+diff --git a/src/anchor.rs b/src/anchor.rs
+index a270857..7ed950c 100644
+--- a/src/anchor.rs
++++ b/src/anchor.rs
+@@ -103,19 +103,27 @@ pub fn verify_ptr_block(raw: &[u8]) -> CafsResult<(PtrBlock, PtrAlgo)> {
+     let real_offset = ByteOffset(read_u64(raw, o.real_lba));
+     let real_size = read_u64(raw, o.real_size);
+ 
++    // The fallback sub-block has its own magic and checksum (§3.1/3.2,
++    // same algorithm as the primary). A fallback that fails either is
++    // treated as absent: acting on a damaged pointer cannot be
++    // 'self-defending' once a verified copy exists at the other end of
++    // the device, and it hid that copy from check().
+     let fallback_lba = read_u64(raw, o.fallback_real_lba);
+     let fallback = if fallback_lba == 0 {
+         None
+     } else {
+-        // The fallback field's own sub-checksum isn't verified here —
+-        // matches the C engine's behavior: an intact fallback pointer
+-        // into a corrupt/wrong region is self-defending, because the
+-        // real structure it points to (e.g. Superblock Backup) gets
+-        // its own BLAKE3 check when read. See fallback_hashed_len /
+-        // fallback_checksum / fallback_magic fields for a future,
+-        // stricter check if ever needed.
+-        let _ = (o.fallback_magic, o.fallback_checksum, o.fallback_hashed_len);
+-        Some((ByteOffset(fallback_lba), read_u64(raw, o.fallback_real_size)))
++        let f_hashed = &raw[o.fallback_magic..o.fallback_magic + o.fallback_hashed_len];
++        let f_stored = read_u32(raw, o.fallback_checksum);
++        let f_sum = match algo {
++            PtrAlgo::Crc32c => checksum::crc32c(f_hashed),
++            PtrAlgo::Xxhash32 => checksum::xxhash32(f_hashed, 0),
++        };
++        let magic_ok = raw[o.fallback_magic..o.fallback_magic + 8] == PTR_MAGIC;
++        if magic_ok && f_sum == f_stored {
++            Some((ByteOffset(fallback_lba), read_u64(raw, o.fallback_real_size)))
++        } else {
++            None
++        }
+     };
+ 
+     Ok((
+@@ -128,25 +136,121 @@ pub fn verify_ptr_block(raw: &[u8]) -> CafsResult<(PtrBlock, PtrAlgo)> {
+     ))
+ }
+ 
++/// Which end of the device a pointer block was read from.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Side {
++    Head,
++    Tail,
++}
++
++/// One end of an anchor slot: verified pointer block + the checksum
++/// algorithm that verified it, or why it failed.
++pub type PtrSide = Result<(PtrBlock, PtrAlgo), CafsError>;
++
++/// Both copies of one anchor slot (head at the start of the device,
++/// tail at the end — fs.info §2, §12) and how each verified.
++#[derive(Debug, Clone, PartialEq)]
++pub struct SlotReport {
++    pub slot: u8,
++    pub head: PtrSide,
++    pub tail: PtrSide,
++}
++
++impl SlotReport {
++    pub fn head_ok(&self) -> bool {
++        self.head.is_ok()
++    }
++    pub fn tail_ok(&self) -> bool {
++        self.tail.is_ok()
++    }
++    /// Head wins when both verify (it is the primary, §13.1).
++    pub fn used(&self) -> Option<Side> {
++        if self.head_ok() {
++            Some(Side::Head)
++        } else if self.tail_ok() {
++            Some(Side::Tail)
++        } else {
++            None
++        }
++    }
++    pub fn chosen(&self) -> Option<&(PtrBlock, PtrAlgo)> {
++        match self.used()? {
++            Side::Head => self.head.as_ref().ok(),
++            Side::Tail => self.tail.as_ref().ok(),
++        }
++    }
++    /// Slot 0 only: (Superblock, Superblock Backup) as seen from the
++    /// side in use. The tail copy swaps primary and fallback (§12).
++    pub fn sb_pair(&self) -> Option<(ByteOffset, Option<ByteOffset>)> {
++        let head = self.head.as_ref().ok().map(|(b, _)| b);
++        let tail = self.tail.as_ref().ok().map(|(b, _)| b);
++        // Primary: the head's real pointer, else the tail's fallback.
++        let primary = head
++            .map(|b| b.real_offset)
++            .or_else(|| tail.and_then(|b| b.fallback.map(|f| f.0)))?;
++        // Backup: the head's (verified) fallback, else the tail's real pointer.
++        let backup = head
++            .and_then(|b| b.fallback.map(|f| f.0))
++            .or_else(|| tail.map(|b| b.real_offset));
++        Some((primary, backup))
++    }
++    /// Verifies AND carries everything this end is supposed to carry
++    /// (slot 0 must have a verified fallback).
++    fn complete(&self, side: &PtrSide) -> bool {
++        match side {
++            Ok((b, _)) => self.slot != 0 || b.fallback.is_some(),
++            Err(_) => false,
++        }
++    }
++    pub fn head_good(&self) -> bool {
++        self.complete(&self.head)
++    }
++    pub fn tail_good(&self) -> bool {
++        self.complete(&self.tail)
++    }
++    /// Both sides verify but point at different places.
++    pub fn disagree(&self) -> bool {
++        let (Ok((h, _)), Ok((t, _))) = (&self.head, &self.tail) else {
++            return false;
++        };
++        if self.slot == 0 {
++            (Some(h.real_offset), h.fallback.map(|f| f.0)) != (t.fallback.map(|f| f.0), Some(t.real_offset))
++        } else {
++            h.real_offset != t.real_offset || h.real_size != t.real_size
++        }
++    }
++}
++
++/// Build a pointer block (2048 B for LBA0-3, 4096 B for LBA4-5).
++/// The fallback sub-block is only written when `fallback` is `Some`.
++pub fn build_ptr_block(block_len: u32, algo: PtrAlgo, real_offset: u64, real_size: u64, fallback: Option<(u64, u64)>) -> Vec<u8> {
++    let o = offsets_for(block_len as usize);
++    let sum = |data: &[u8]| match algo {
++        PtrAlgo::Crc32c => checksum::crc32c(data),
++        PtrAlgo::Xxhash32 => checksum::xxhash32(data, 0),
++    };
++    let mut b = vec![0u8; block_len as usize];
++    b[o.magic..o.magic + 8].copy_from_slice(&PTR_MAGIC);
++    b[o.real_lba..o.real_lba + 8].copy_from_slice(&real_offset.to_le_bytes());
++    b[o.real_size..o.real_size + 8].copy_from_slice(&real_size.to_le_bytes());
++    let c = sum(&b[0..o.primary_hashed_len]);
++    b[o.checksum..o.checksum + 4].copy_from_slice(&c.to_le_bytes());
++    if let Some((fb_off, fb_size)) = fallback {
++        b[o.fallback_magic..o.fallback_magic + 8].copy_from_slice(&PTR_MAGIC);
++        b[o.fallback_real_lba..o.fallback_real_lba + 8].copy_from_slice(&fb_off.to_le_bytes());
++        b[o.fallback_real_size..o.fallback_real_size + 8].copy_from_slice(&fb_size.to_le_bytes());
++        let fc = sum(&b[o.fallback_magic..o.fallback_magic + o.fallback_hashed_len]);
++        b[o.fallback_checksum..o.fallback_checksum + 4].copy_from_slice(&fc.to_le_bytes());
++    }
++    b
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+     fn build_small_ptr(real_offset: u64, real_size: u64, fallback: Option<(u64, u64)>) -> Vec<u8> {
+-        let mut b = vec![0u8; PTR_BLOCK_SMALL_SIZE as usize];
+-        b[PTR2K_OFF_MAGIC..PTR2K_OFF_MAGIC + 8].copy_from_slice(&PTR_MAGIC);
+-        b[PTR2K_OFF_REAL_LBA..PTR2K_OFF_REAL_LBA + 8].copy_from_slice(&real_offset.to_le_bytes());
+-        b[PTR2K_OFF_REAL_SIZE..PTR2K_OFF_REAL_SIZE + 8].copy_from_slice(&real_size.to_le_bytes());
+-        let cksum = checksum::crc32c(&b[0..PTR2K_PRIMARY_HASHED_LEN]);
+-        b[PTR2K_OFF_CHECKSUM..PTR2K_OFF_CHECKSUM + 4].copy_from_slice(&cksum.to_le_bytes());
+-        if let Some((fb_off, fb_size)) = fallback {
+-            b[PTR2K_OFF_FALLBACK_MAGIC..PTR2K_OFF_FALLBACK_MAGIC + 8].copy_from_slice(&PTR_MAGIC);
+-            b[PTR2K_OFF_FALLBACK_REAL_LBA..PTR2K_OFF_FALLBACK_REAL_LBA + 8]
+-                .copy_from_slice(&fb_off.to_le_bytes());
+-            b[PTR2K_OFF_FALLBACK_REAL_SIZE..PTR2K_OFF_FALLBACK_REAL_SIZE + 8]
+-                .copy_from_slice(&fb_size.to_le_bytes());
+-        }
+-        b
++        build_ptr_block(PTR_BLOCK_SMALL_SIZE, PtrAlgo::Crc32c, real_offset, real_size, fallback)
+     }
+ 
+     #[test]
+diff --git a/src/bin/cafsctl.rs b/src/bin/cafsctl.rs
+new file mode 100644
+index 0000000..ec0328f
+--- /dev/null
++++ b/src/bin/cafsctl.rs
+@@ -0,0 +1,163 @@
++//! cafsctl — poke a CAFS image or device through the I/O Engine.
++//! PoC tool: inspect anchors, run check(), and read/write raw bytes,
++//! with or without mounting (`--bypass`).
++//!
++//! SPDX-License-Identifier: BSD-3-Clause
++//! Copyright (c) 2026, Imran Bin Gifary (System Delta)
++
++use std::io::IsTerminal;
++use std::process::exit;
++
++use cafs_io::{ByteOffset, CafsCtx, MountMode};
++
++struct Style {
++    on: bool,
++}
++impl Style {
++    fn new() -> Self {
++        Style { on: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() }
++    }
++    fn p(&self, code: &str, s: &str) -> String {
++        if self.on { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }
++    }
++    fn head(&self, s: &str) -> String { self.p("1;36", s) }
++    fn cmd(&self, s: &str) -> String { self.p("32", s) }
++    fn flag(&self, s: &str) -> String { self.p("33", s) }
++    fn dim(&self, s: &str) -> String { self.p("2", s) }
++    fn ok(&self, s: &str) -> String { self.p("32", s) }
++    fn bad(&self, s: &str) -> String { self.p("1;31", s) }
++}
++
++fn help(st: &Style) {
++    println!("{}  poke a CAFS image or device through the I/O Engine\n", st.head("cafsctl"));
++    println!("{}  cafsctl <command> <path> [options]\n", st.head("USAGE"));
++    println!("{}", st.head("INSPECT"));
++    println!("  {}  <path>                           all 12 pointer blocks (head + end-of-device), which end mount would use", st.cmd("anchors"));
++    println!("  {}    <path> [{}]               mount and run check(); {} opens read-write and repairs\n", st.cmd("check"), st.flag("--repair"), st.flag("--repair"));
++    println!("{}", st.head("RAW I/O  (engine read_block / write_block)"));
++    println!("  {}     <path> <offset> <len>          hex dump", st.cmd("read"));
++    println!("  {}    <path> <offset> {} | {} <len> | {}", st.cmd("write"), st.flag("--hex HEX"), st.flag("--fill BYTE --len"), st.flag("--file FILE"));
++    println!("{}", st.dim("                                           numbers: decimal, 0x hex, or with K/M suffix\n"));
++    println!("{}", st.head("OPTIONS"));
++    println!("  {}   open without mounting: no anchor is read, trusted or required (works on damaged volumes)", st.flag("--bypass"));
++    println!("  {}     fdatasync after a write", st.flag("--sync"));
++    println!("  {}   read-write open for `check`", st.flag("--repair"));
++    println!("  {}     this text", st.flag("-h, --help"));
++}
++
++fn die(st: &Style, msg: &str) -> ! {
++    eprintln!("{} {msg}", st.bad("cafsctl:"));
++    exit(1);
++}
++
++fn num(st: &Style, s: &str) -> u64 {
++    let (body, mult) = match s.chars().last() {
++        Some('K') | Some('k') => (&s[..s.len() - 1], 1024),
++        Some('M') | Some('m') => (&s[..s.len() - 1], 1024 * 1024),
++        _ => (s, 1),
++    };
++    let v = if let Some(h) = body.strip_prefix("0x") { u64::from_str_radix(h, 16) } else { body.parse() };
++    v.map(|v| v * mult).unwrap_or_else(|_| die(st, &format!("not a number: {s}")))
++}
++
++fn hex(st: &Style, s: &str) -> Vec<u8> {
++    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
++    if !s.len().is_multiple_of(2) {
++        die(st, "--hex needs an even number of digits");
++    }
++    (0..s.len() / 2)
++        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap_or_else(|_| die(st, "bad hex digit")))
++        .collect()
++}
++
++fn dump(base: u64, data: &[u8]) {
++    for (i, chunk) in data.chunks(16).enumerate() {
++        let hexs: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
++        let asc: String = chunk.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
++        println!("{:010x}  {:<47}  {}", base + (i * 16) as u64, hexs.join(" "), asc);
++    }
++}
++
++fn main() {
++    let st = Style::new();
++    let args: Vec<String> = std::env::args().skip(1).collect();
++    if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
++        help(&st);
++        return;
++    }
++    let flag = |f: &str| args.iter().any(|a| a == f);
++    let opt = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
++    let pos: Vec<&String> = {
++        let mut v = Vec::new();
++        let mut skip = false;
++        for a in &args {
++            if skip { skip = false; continue; }
++            if ["--hex", "--fill", "--len", "--file"].contains(&a.as_str()) { skip = true; continue; }
++            if a.starts_with("--") { continue; }
++            v.push(a);
++        }
++        v
++    };
++    if pos.len() < 2 {
++        help(&st);
++        exit(1);
++    }
++    let (cmd, path) = (pos[0].as_str(), pos[1].as_str());
++    let mode = if flag("--bypass") { MountMode::Bypass } else { MountMode::Full };
++
++    match cmd {
++        "anchors" => {
++            let mut c = CafsCtx::mount_with(path, false, MountMode::Bypass).unwrap_or_else(|e| die(&st, &format!("open: {e}")));
++            println!("device size {} bytes\n", c.device_size());
++            println!("{}", st.head("slot  block   head                                tail                                use"));
++            for r in c.scan_anchors() {
++                let side = |x: &cafs_io::anchor::PtrSide| match x {
++                    Ok((b, _)) => st.ok(&format!("ok  -> {:<10} {:<10}", b.real_offset.0, b.fallback.map_or("-".into(), |f| format!("fb {}", f.0.0)))),
++                    Err(e) => st.bad(&format!("BAD {:<31}", format!("{e:?}"))),
++                };
++                let used = r.used().map_or(st.bad("NONE"), |u| format!("{u:?}"));
++                println!("{:<5} {:<7} {}  {}  {}{}", r.slot, cafs_io::layout::slot_block_size(r.slot), side(&r.head), side(&r.tail), used, if r.disagree() { st.bad("  DISAGREE") } else { String::new() });
++            }
++        }
++        "check" => {
++            if flag("--bypass") {
++                die(&st, "check needs the anchors; drop --bypass");
++            }
++            let mut c = CafsCtx::mount(path, flag("--repair")).unwrap_or_else(|e| die(&st, &format!("mount: {e}")));
++            let r = c.check().unwrap_or_else(|e| die(&st, &format!("check: {e}")));
++            println!("{r:#?}");
++        }
++        "read" => {
++            if pos.len() < 4 { die(&st, "read <path> <offset> <len>"); }
++            let (off, len) = (num(&st, pos[2]), num(&st, pos[3]));
++            let mut c = CafsCtx::mount_with(path, false, mode).unwrap_or_else(|e| die(&st, &format!("open: {e}")));
++            let mut buf = vec![0u8; len as usize];
++            c.read_block(ByteOffset(off), &mut buf).unwrap_or_else(|e| die(&st, &format!("read: {e}")));
++            dump(off, &buf);
++        }
++        "write" => {
++            if pos.len() < 3 { die(&st, "write <path> <offset> (--hex HEX | --fill BYTE --len N | --file FILE)"); }
++            let off = num(&st, pos[2]);
++            let data = if let Some(h) = opt("--hex") {
++                hex(&st, &h)
++            } else if let Some(b) = opt("--fill") {
++                let n = opt("--len").map(|s| num(&st, &s)).unwrap_or_else(|| die(&st, "--fill needs --len"));
++                vec![num(&st, &b) as u8; n as usize]
++            } else if let Some(f) = opt("--file") {
++                std::fs::read(&f).unwrap_or_else(|e| die(&st, &format!("{f}: {e}")))
++            } else {
++                die(&st, "write needs --hex, --fill or --file")
++            };
++            let mut c = CafsCtx::mount_with(path, true, mode).unwrap_or_else(|e| die(&st, &format!("open: {e}")));
++            c.write_block(ByteOffset(off), &data).unwrap_or_else(|e| die(&st, &format!("write: {e}")));
++            if flag("--sync") {
++                c.sync().unwrap_or_else(|e| die(&st, &format!("sync: {e}")));
++            }
++            println!("wrote {} bytes at {off:#x}{}", data.len(), if flag("--sync") { " (synced)" } else { "" });
++        }
++        _ => {
++            help(&st);
++            exit(1);
++        }
++    }
++}
+diff --git a/src/bin/mkfs_cafs.rs b/src/bin/mkfs_cafs.rs
+index a5590a6..fbda838 100644
+--- a/src/bin/mkfs_cafs.rs
++++ b/src/bin/mkfs_cafs.rs
+@@ -6,7 +6,8 @@
+ //! SPDX-License-Identifier: BSD-3-Clause
+ //! Copyright (c) 2026, Imran Bin Gifary (System Delta)
+ 
+-use std::os::unix::fs::FileExt;
++use std::os::unix::fs::{FileExt, OpenOptionsExt};
++use cafs_io::anchor::{build_ptr_block, PtrAlgo};
+ use cafs_io::layout::*;
+ 
+ const OFF_SUPERBLOCK: u64 = 16384;
+@@ -16,44 +17,19 @@ const OFF_META_PLACEHOLDER: u64 = 28672;
+ const OFF_FUNCTION_TABLE: u64 = 32768;
+ const OFF_SMART_MAIN: u64 = 36864;
+ const FRONT_REGION_SIZE: u64 = 40960;
+-const END_REGION_SIZE: u64 = 8192;
++// End of device (fs.info §12): [B-SMART][Superblock Backup][tail anchors].
++const END_REGION_SIZE: u64 = END_REGION_BYTES;
+ const MIN_DEVICE_SIZE: u64 = 1024 * 1024;
+ const DEFAULT_DEVICE_SIZE: u64 = 4 * 1024 * 1024;
+ 
++/// (slot, real offset, real size, optional fallback (offset, size))
++type HeadSlot = (u8, u64, u64, Option<(u64, u64)>);
++
+ fn die(msg: &str) -> ! {
+     eprintln!("mkfs.cafs: {msg}");
+     std::process::exit(1);
+ }
+ 
+-fn build_ptr_block(block_len: u32, real_offset: u64, real_size: u64, fallback: Option<(u64, u64)>) -> Vec<u8> {
+-    let mut b = vec![0u8; block_len as usize];
+-    let small = block_len == PTR_BLOCK_SMALL_SIZE;
+-    let (m, rlba, rsize, cksum_off, hashed_len) = if small {
+-        (PTR2K_OFF_MAGIC, PTR2K_OFF_REAL_LBA, PTR2K_OFF_REAL_SIZE, PTR2K_OFF_CHECKSUM, PTR2K_PRIMARY_HASHED_LEN)
+-    } else {
+-        (PTR4K_OFF_MAGIC, PTR4K_OFF_REAL_LBA, PTR4K_OFF_REAL_SIZE, PTR4K_OFF_CHECKSUM, PTR4K_PRIMARY_HASHED_LEN)
+-    };
+-    b[m..m + 8].copy_from_slice(&PTR_MAGIC);
+-    b[rlba..rlba + 8].copy_from_slice(&real_offset.to_le_bytes());
+-    b[rsize..rsize + 8].copy_from_slice(&real_size.to_le_bytes());
+-    let c = crc32c::crc32c(&b[0..hashed_len]);
+-    b[cksum_off..cksum_off + 4].copy_from_slice(&c.to_le_bytes());
+-
+-    if let Some((fb_off, fb_size)) = fallback {
+-        let (fm, flba, fsize, fcksum_off, fhashed_len) = if small {
+-            (PTR2K_OFF_FALLBACK_MAGIC, PTR2K_OFF_FALLBACK_REAL_LBA, PTR2K_OFF_FALLBACK_REAL_SIZE, PTR2K_OFF_FALLBACK_CHECKSUM, PTR2K_FALLBACK_HASHED_LEN)
+-        } else {
+-            (PTR4K_OFF_FALLBACK_MAGIC, PTR4K_OFF_FALLBACK_REAL_LBA, PTR4K_OFF_FALLBACK_REAL_SIZE, PTR4K_OFF_FALLBACK_CHECKSUM, PTR4K_FALLBACK_HASHED_LEN)
+-        };
+-        b[fm..fm + 8].copy_from_slice(&PTR_MAGIC);
+-        b[flba..flba + 8].copy_from_slice(&fb_off.to_le_bytes());
+-        b[fsize..fsize + 8].copy_from_slice(&fb_size.to_le_bytes());
+-        let fc = crc32c::crc32c(&b[fm..fm + fhashed_len]);
+-        b[fcksum_off..fcksum_off + 4].copy_from_slice(&fc.to_le_bytes());
+-    }
+-    b
+-}
+-
+ fn blake3_128(data: &[u8]) -> [u8; 16] {
+     let mut hasher = blake3::Hasher::new();
+     hasher.update(data);
+@@ -123,18 +99,51 @@ fn build_smart() -> [u8; REAL_BLOCK_4K as usize] {
+ }
+ 
+ fn main() {
+-    let args: Vec<String> = std::env::args().collect();
+-    if args.len() < 2 || args.len() > 3 {
++    let mut args: Vec<String> = std::env::args().skip(1).collect();
++    let force_device = args.iter().any(|a| a == "--force-device");
++    args.retain(|a| a != "--force-device");
++    if args.is_empty() || args.len() > 2 {
+         eprintln!(
+-            "usage: mkfs_cafs <path> [size_bytes]\n  Creates/truncates <path> as a regular file of the given size\n  (default {DEFAULT_DEVICE_SIZE} bytes) and writes a fresh CAFS V1 anchor region."
++            "usage: mkfs_cafs <path> [size_bytes] [--force-device]\n  \
++             regular file : created/truncated to size_bytes (default {DEFAULT_DEVICE_SIZE}), then formatted\n  \
++             block device : size comes from the device; needs --force-device. Refused if it is mounted,\n                 active swap, a whole disk with partitions, or holds a non-empty/non-swap/non-CAFS\n                 filesystem signature (wipe it yourself with `wipefs -a`)."
+         );
+         std::process::exit(1);
+     }
+-    let path = &args[1];
+-    let size: u64 = if args.len() == 3 {
+-        args[2].parse().unwrap_or_else(|_| die("invalid size"))
++    let path = &args[0];
++    let is_blk = std::fs::metadata(path).map(|m| std::os::unix::fs::FileTypeExt::is_block_device(&m.file_type())).unwrap_or(false);
++
++    let (f, size) = if is_blk {
++        if !force_device {
++            die("target is a block device; pass --force-device to format it");
++        }
++        let info = cafs_io::safety::check_target(path, &cafs_io::safety::Signature::OVERWRITABLE).unwrap_or_else(|e| die(&e));
++        if args.len() == 2 && args[1].parse::<u64>().ok() != Some(info.size) {
++            die(&format!("size argument does not match the device size ({} bytes); omit it", info.size));
++        }
++        // O_EXCL: the kernel's own refusal if anything still holds it.
++        let f = std::fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .custom_flags(rustix::fs::OFlags::EXCL.bits() as i32)
++            .open(path)
++            .unwrap_or_else(|e| die(&format!("could not open {path} exclusively: {e}")));
++        (f, info.size)
+     } else {
+-        DEFAULT_DEVICE_SIZE
++        let size: u64 = if args.len() == 2 {
++            args[1].parse().unwrap_or_else(|_| die("invalid size"))
++        } else {
++            DEFAULT_DEVICE_SIZE
++        };
++        let f = std::fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .create(true)
++            .truncate(true)
++            .open(path)
++            .unwrap_or_else(|_| die("could not create/open target path"));
++        f.set_len(size).unwrap_or_else(|_| die("could not extend target to full size"));
++        (f, size)
+     };
+     if size < MIN_DEVICE_SIZE {
+         die("size too small (minimum 1 MiB)");
+@@ -143,17 +152,8 @@ fn main() {
+         die("size too small to fit the front and end regions without overlap");
+     }
+ 
+-    let f = std::fs::OpenOptions::new()
+-        .read(true)
+-        .write(true)
+-        .create(true)
+-        .truncate(true)
+-        .open(path)
+-        .unwrap_or_else(|_| die("could not create/open target path"));
+-    f.set_len(size).unwrap_or_else(|_| die("could not extend target to full size"));
+-
+-    let sb_backup_off = size - 4096;
+-    let bsmart_off = size - 8192;
++    let sb_backup_off = sb_backup_offset(size).0;
++    let bsmart_off = smart_backup_offset(size).0;
+ 
+     let sb = build_superblock();
+     let cs = build_config_snapshot();
+@@ -162,33 +162,50 @@ fn main() {
+     let ft = build_function_table(OFF_SMART_MAIN, bsmart_off);
+     let smart = build_smart();
+ 
+-    let lba0 = build_ptr_block(PTR_BLOCK_SMALL_SIZE, OFF_SUPERBLOCK, REAL_BLOCK_4K as u64, Some((sb_backup_off, REAL_BLOCK_4K as u64)));
+-    let lba1 = build_ptr_block(PTR_BLOCK_SMALL_SIZE, OFF_CONFIG_SNAPSHOT, REAL_BLOCK_4K as u64, None);
+-    let lba2 = build_ptr_block(PTR_BLOCK_SMALL_SIZE, OFF_PARITY, REAL_BLOCK_4K as u64, None);
+-    let lba3 = build_ptr_block(PTR_BLOCK_SMALL_SIZE, OFF_META_PLACEHOLDER, REAL_BLOCK_4K as u64, None);
+-    let lba4 = build_ptr_block(PTR_BLOCK_LARGE_SIZE, OFF_FUNCTION_TABLE, FT_MIN_REAL_SIZE, None);
+-    let lba5 = lba4.clone(); // byte-for-byte copy, fs.info §2
++    let algo = PtrAlgo::Crc32c;
++    let rb = REAL_BLOCK_4K as u64;
++    // (slot, real offset, real size, fallback) — head copy (fs.info §2).
++    let head: [HeadSlot; 6] = [
++        (0, OFF_SUPERBLOCK, rb, Some((sb_backup_off, rb))),
++        (1, OFF_CONFIG_SNAPSHOT, rb, None),
++        (2, OFF_PARITY, rb, None),
++        (3, OFF_META_PLACEHOLDER, rb, None),
++        (4, OFF_FUNCTION_TABLE, FT_MIN_REAL_SIZE, None),
++        (5, OFF_FUNCTION_TABLE, FT_MIN_REAL_SIZE, None), // byte-for-byte copy of LBA4
++    ];
+ 
+     let write_at = |off: u64, buf: &[u8]| {
+         f.write_all_at(buf, off).unwrap_or_else(|_| die("write failed (target too small, or permission denied)"));
+     };
+ 
+-    write_at(LBA0_OFFSET.0, &lba0);
+-    write_at(LBA1_OFFSET.0, &lba1);
+-    write_at(LBA2_OFFSET.0, &lba2);
+-    write_at(LBA3_OFFSET.0, &lba3);
+-    write_at(LBA4_OFFSET.0, &lba4);
+-    write_at(LBA5_OFFSET.0, &lba5);
+-
++    // Real structures first (fs.info §13.2 step 2), then the tail
++    // mirror, then the head (steps 5-6).
+     write_at(OFF_SUPERBLOCK, &sb);
+     write_at(OFF_CONFIG_SNAPSHOT, &cs);
+     write_at(OFF_PARITY, &parity);
+     write_at(OFF_META_PLACEHOLDER, &meta);
+     write_at(OFF_FUNCTION_TABLE, &ft);
+     write_at(OFF_SMART_MAIN, &smart);
+-
+     write_at(sb_backup_off, &sb);
+     write_at(bsmart_off, &smart);
++    f.sync_data().ok();
++
++    for (slot, real, rsize, fb) in head {
++        let len = slot_block_size(slot);
++        // Tail LBA0 swaps primary and fallback: its primary is the
++        // Superblock Backup, its fallback the real Superblock (§12).
++        let tail = if slot == 0 {
++            build_ptr_block(len, algo, sb_backup_off, rb, Some((OFF_SUPERBLOCK, rb)))
++        } else {
++            build_ptr_block(len, algo, real, rsize, fb)
++        };
++        write_at(tail_slot_offset(slot, size).0, &tail);
++    }
++    f.sync_data().ok();
++    for (slot, real, rsize, fb) in head {
++        let hd = build_ptr_block(slot_block_size(slot), algo, real, rsize, fb);
++        write_at(head_slot_offset(slot).0, &hd);
++    }
+ 
+     f.sync_data().ok();
+     println!("mkfs.cafs: formatted {path} ({size} bytes)");
+diff --git a/src/block_io.rs b/src/block_io.rs
+index 56e2190..3e520c7 100644
+--- a/src/block_io.rs
++++ b/src/block_io.rs
+@@ -14,39 +14,29 @@
+ //! SPDX-License-Identifier: BSD-3-Clause
+ //! Copyright (c) 2026, Imran Bin Gifary (System Delta)
+ 
+-use rustix::io::Errno;
+-
+ use crate::error::{CafsError, CafsResult};
+ use crate::{ByteOffset, CafsCtx, MisalignedAction};
+ 
+ const ALIGN: u64 = 512;
+ 
+-pub(crate) fn read_raw(ctx: &CafsCtx, offset: ByteOffset, buf: &mut [u8]) -> CafsResult<()> {
+-    let mut got = 0usize;
+-    while got < buf.len() {
+-        match rustix::io::pread(&ctx.fd, &mut buf[got..], offset.0 + got as u64) {
+-            Ok(0) => return Err(CafsError::Io), // unexpected EOF against a fixed-size structure
+-            Ok(n) => got += n,
+-            Err(Errno::INTR) => continue,
+-            Err(_) => return Err(CafsError::Io),
+-        }
++fn in_range(size: u64, offset: ByteOffset, len: usize) -> CafsResult<()> {
++    match offset.0.checked_add(len as u64) {
++        Some(end) if end <= size => Ok(()),
++        _ => Err(CafsError::OutOfRange),
+     }
+-    Ok(())
+ }
+ 
+-pub(crate) fn write_raw(ctx: &CafsCtx, offset: ByteOffset, buf: &[u8]) -> CafsResult<()> {
++pub(crate) fn read_raw(ctx: &mut CafsCtx, offset: ByteOffset, buf: &mut [u8]) -> CafsResult<()> {
++    in_range(ctx.dev.size(), offset, buf.len())?;
++    ctx.dev.read_at(offset.0, buf)
++}
++
++pub(crate) fn write_raw(ctx: &mut CafsCtx, offset: ByteOffset, buf: &[u8]) -> CafsResult<()> {
+     if !ctx.want_write {
+         return Err(CafsError::Readonly);
+     }
+-    let mut sent = 0usize;
+-    while sent < buf.len() {
+-        match rustix::io::pwrite(&ctx.fd, &buf[sent..], offset.0 + sent as u64) {
+-            Ok(n) => sent += n,
+-            Err(Errno::INTR) => continue,
+-            Err(_) => return Err(CafsError::Io),
+-        }
+-    }
+-    Ok(())
++    in_range(ctx.dev.size(), offset, buf.len())?;
++    ctx.dev.write_at(offset.0, buf)
+ }
+ 
+ fn is_aligned(offset: ByteOffset, len: usize) -> bool {
+@@ -59,7 +49,9 @@ impl CafsCtx {
+             return Err(CafsError::InvalidArg);
+         }
+ 
+-        let result = if is_aligned(offset, buf.len()) {
++        let result = if let Err(e) = in_range(self.dev.size(), offset, buf.len()) {
++            Err(e)
++        } else if is_aligned(offset, buf.len()) {
+             read_raw(self, offset, buf)
+         } else if self.opts.misaligned_action == MisalignedAction::Reject {
+             Err(CafsError::Misaligned)
+@@ -89,7 +81,9 @@ impl CafsCtx {
+             return Err(CafsError::Readonly);
+         }
+ 
+-        let result = if is_aligned(offset, buf.len()) {
++        let result = if let Err(e) = in_range(self.dev.size(), offset, buf.len()) {
++            Err(e)
++        } else if is_aligned(offset, buf.len()) {
+             write_raw(self, offset, buf)
+         } else if self.opts.misaligned_action == MisalignedAction::Reject {
+             Err(CafsError::Misaligned)
+diff --git a/src/check.rs b/src/check.rs
+index 068ee31..8f72da9 100644
+--- a/src/check.rs
++++ b/src/check.rs
+@@ -1,18 +1,25 @@
+-//! `CafsCtx::check` — verifies the Superblock's BLAKE3-128 checksum.
+-//! On mismatch: tries Superblock Backup (via LBA0's fallback
+-//! pointer); if that's good, copies it over the primary in place
+-//! (when the mount is writable) and logs the repair. All other
+-//! anchor structures are neither checked nor repaired in V1
+-//! (ADR-007).
++//! `CafsCtx::check` — two stages, in this order:
++//!
++//! 1. Anchor pointer blocks: all six slots are verified at both ends
++//!    of the device (fs.info §2, §12). A slot with exactly one bad end
++//!    is rebuilt from the intact end (§14 Track A) when the mount is
++//!    writable; a slot with both ends bad is reported as lost.
++//! 2. Superblock: verifies its BLAKE3-128 checksum. On mismatch, tries
++//!    the Superblock Backup; if that is good, copies it over the
++//!    primary (when writable) and syncs.
++//!
++//! The Config Snapshot, Parity Block, Function Table and Meta/User
++//! table are neither checked nor repaired (ADR-007).
+ //!
+ //! SPDX-License-Identifier: BSD-3-Clause
+ //! Copyright (c) 2026, Imran Bin Gifary (System Delta)
+ 
++use crate::anchor::{build_ptr_block, Side, SlotReport};
+ use crate::block_io::{read_raw, write_raw};
+ use crate::checksum;
+-use crate::error::CafsResult;
++use crate::error::{CafsError, CafsResult};
+ use crate::layout::*;
+-use crate::{CafsCtx, CheckResult};
++use crate::{CafsCtx, CheckResult, MountMode};
+ 
+ fn superblock_checksum_ok(sb: &[u8; REAL_BLOCK_4K as usize]) -> bool {
+     let computed = checksum::blake3_128(&sb[0..SB_HASHED_LEN]);
+@@ -20,21 +27,117 @@ fn superblock_checksum_ok(sb: &[u8; REAL_BLOCK_4K as usize]) -> bool {
+ }
+ 
+ impl CafsCtx {
++    fn can_write(&self) -> bool {
++        self.want_write && !self.opts.readonly
++    }
++
+     pub fn check(&mut self) -> CafsResult<CheckResult> {
++        if self.mode == MountMode::Bypass {
++            return Err(CafsError::Bypassed);
++        }
+         let mut result = CheckResult {
+-            pointer_checksum_algo_used: Some(self.lba0_algo),
++            pointer_checksum_algo_used: Some(self.ptr_algo),
+             ..Default::default()
+         };
++        self.check_pointer_blocks(&mut result);
++        self.check_superblock(&mut result)?;
++        Ok(result)
++    }
++
++    /// Rebuild the failed end of `r` from its intact end. `None` if
++    /// the intact end lacks what is needed (slot 0 needs both
++    /// Superblock offsets to write the tail copy).
++    fn rebuild_ptr_block(r: &SlotReport, bad: Side) -> Option<Vec<u8>> {
++        let (good, algo) = r.chosen().or(r.head.as_ref().ok()).or(r.tail.as_ref().ok())?;
++        let len = slot_block_size(r.slot);
++        if r.slot == 0 {
++            let (primary, backup) = r.sb_pair()?;
++            let backup = backup?;
++            let sz = REAL_BLOCK_4K as u64;
++            return Some(match bad {
++                Side::Head => build_ptr_block(len, *algo, primary.0, sz, Some((backup.0, sz))),
++                Side::Tail => build_ptr_block(len, *algo, backup.0, sz, Some((primary.0, sz))),
++            });
++        }
++        Some(build_ptr_block(
++            len,
++            *algo,
++            good.real_offset.0,
++            good.real_size,
++            good.fallback.map(|(o, s)| (o.0, s)),
++        ))
++    }
++
++    fn check_pointer_blocks(&mut self, result: &mut CheckResult) {
++        let size = self.dev.size();
++        let can_write = self.can_write();
++        let mut repaired = 0u8;
+ 
++        for r in self.anchors.clone() {
++            if r.disagree() {
++                result.anchor_disagreements += 1;
++                eprintln!("cafs: anchor slot {} verifies at both ends but they point at different places; head is used", r.slot);
++            }
++            let (hg, tg) = (r.head_good(), r.tail_good());
++            if hg && tg {
++                continue;
++            }
++            // Slot 0 can be recovered from partial information at
++            // both ends as long as both Superblock offsets are known.
++            let recoverable = if r.slot == 0 {
++                matches!(r.sb_pair(), Some((_, Some(_))))
++            } else {
++                r.head_ok() || r.tail_ok()
++            };
++            if !recoverable {
++                result.anchor_slots_lost += 1;
++                eprintln!("cafs: anchor slot {} cannot be recovered from either end of the device", r.slot);
++                continue;
++            }
++            result.anchor_slots_degraded += 1;
++            for bad in [Side::Head, Side::Tail] {
++                if (bad == Side::Head && hg) || (bad == Side::Tail && tg) {
++                    continue;
++                }
++                if !can_write {
++                    eprintln!("cafs: anchor slot {} bad at the {:?} end; recoverable, but the mount is readonly, so not rewritten", r.slot, bad);
++                    continue;
++                }
++                let Some(raw) = Self::rebuild_ptr_block(&r, bad) else {
++                    eprintln!("cafs: anchor slot {} bad at the {:?} end and cannot be rebuilt", r.slot, bad);
++                    continue;
++                };
++                let off = match bad {
++                    Side::Head => head_slot_offset(r.slot),
++                    Side::Tail => tail_slot_offset(r.slot, size),
++                };
++                match write_raw(self, off, &raw).and_then(|_| self.dev.sync()) {
++                    Ok(()) => {
++                        repaired += 1;
++                        eprintln!("cafs: rebuilt anchor slot {} at the {:?} end (offset {}) from the intact end", r.slot, bad, off.0);
++                    }
++                    Err(e) => eprintln!("cafs: failed to rewrite anchor slot {} at the {:?} end: {e}", r.slot, bad),
++                }
++            }
++        }
++
++        // `anchor_slots_repaired` counts rewritten pointer blocks (ends), not slots.
++        result.anchor_slots_repaired = repaired;
++        if repaired > 0 {
++            self.anchors = self.scan_anchors();
++        }
++    }
++
++    fn check_superblock(&mut self, result: &mut CheckResult) -> CafsResult<()> {
+         if superblock_checksum_ok(&self.superblock) {
+             result.superblock_ok = true;
+-            return Ok(result);
++            return Ok(());
+         }
+ 
+         // Primary is bad — try the backup.
+-        let Some((backup_offset, _size)) = self.lba0.fallback else {
++        let Some(backup_offset) = self.sb_backup else {
+             eprintln!("cafs: primary Superblock checksum mismatch, and no backup pointer is set — unrecoverable");
+-            return Ok(result); // superblock_ok stays false
++            return Ok(()); // superblock_ok stays false
+         };
+ 
+         let mut backup = [0u8; REAL_BLOCK_4K as usize];
+@@ -43,7 +146,7 @@ impl CafsCtx {
+                 "cafs: primary Superblock checksum mismatch, and Superblock Backup at offset {} is also bad or unreadable — unrecoverable",
+                 backup_offset.0
+             );
+-            return Ok(result);
++            return Ok(());
+         }
+ 
+         // Backup is good. Adopt it in memory regardless of write
+@@ -52,11 +155,13 @@ impl CafsCtx {
+         self.superblock = backup;
+         result.superblock_ok = true;
+ 
+-        if self.want_write {
+-            write_raw(self, self.lba0.real_offset, &self.superblock)?;
++        if self.can_write() {
++            let (sb, at) = (self.superblock, self.sb_primary);
++            write_raw(self, at, &sb)?;
++            self.dev.sync()?;
+             eprintln!(
+                 "cafs: repaired primary Superblock at offset {} from Superblock Backup at offset {}",
+-                self.lba0.real_offset.0, backup_offset.0
++                at.0, backup_offset.0
+             );
+             result.superblock_repaired = true;
+         } else {
+@@ -64,7 +169,6 @@ impl CafsCtx {
+                 "cafs: primary Superblock checksum mismatch — valid backup found, but mount is readonly, so the fix was not written back"
+             );
+         }
+-
+-        Ok(result)
++        Ok(())
+     }
+ }
+diff --git a/src/confirm.rs b/src/confirm.rs
+index 60542c6..1ca7437 100644
+--- a/src/confirm.rs
++++ b/src/confirm.rs
+@@ -1,16 +1,14 @@
+-//! `CafsCtx::confirm` — sets Superblock `last_mount_time = now`,
+-//! recomputes its BLAKE3-128 checksum, and commits it via fs.info
+-//! §13.3 (In-Place Content Update): primary Superblock, then
+-//! Superblock Backup (via LBA0's fallback), then the primary Parity
+-//! Block (XOR of the new Superblock and the cached Config Snapshot).
+-//! Each write is followed by `fdatasync()`. There is no Backup Parity
+-//! Block to keep in sync — Parity has no backup under the revised
+-//! redundancy design (ADR-006).
++//! `CafsCtx::confirm` — marks the mount as started in M-SMART:
++//! `mount_count += 1`, `clean_unmount_flag = 0`, `last_mount_time =
++//! now`; recomputes the table's BLAKE3-128, writes it, syncs. Best-
++//! effort, never fatal (ADR-008): a missing/unwritable SMART table does
++//! not fail the call.
+ //!
+-//! Also increments `mount_count` and sets `clean_unmount_flag = 0` on
+-//! M-SMART directly, best-effort (ADR-008) — a missing/unavailable
+-//! SMART table doesn't fail the call. Only the primary Superblock
+-//! write is fatal to `confirm()`.
++//! TEMPORARY (2026-10-27): `last_mount_time` is no longer written to
++//! the Superblock. The Superblock, its backup and the Parity Block
++//! therefore stay untouched on mount (fs.info §13.3 does not run).
++//! `last_mount_time` lives in M-SMART at `SMART_OFF_LAST_MOUNT_TIME`
++//! (reserved space in §11.1) until the decision is revisited.
+ //!
+ //! SPDX-License-Identifier: BSD-3-Clause
+ //! Copyright (c) 2026, Imran Bin Gifary (System Delta)
+@@ -21,7 +19,7 @@ use crate::block_io::write_raw;
+ use crate::checksum;
+ use crate::error::{CafsError, CafsResult};
+ use crate::layout::*;
+-use crate::CafsCtx;
++use crate::{CafsCtx, MountMode};
+ 
+ fn now_unix() -> u64 {
+     SystemTime::now()
+@@ -32,68 +30,35 @@ fn now_unix() -> u64 {
+ 
+ impl CafsCtx {
+     pub fn confirm(&mut self) -> CafsResult<()> {
++        if self.mode == MountMode::Bypass {
++            return Err(CafsError::Bypassed);
++        }
+         if self.opts.readonly || !self.want_write {
+             return Err(CafsError::Readonly);
+         }
+ 
+-        // 1. Primary Superblock: last_mount_time = now, recompute
+-        // checksum, write, fsync.
+-        let now = now_unix();
+-        self.superblock[SB_OFF_LAST_MOUNT_TIME..SB_OFF_LAST_MOUNT_TIME + 8]
+-            .copy_from_slice(&now.to_le_bytes());
+-        let cksum = checksum::blake3_128(&self.superblock[0..SB_HASHED_LEN]);
+-        self.superblock[SB_OFF_CHECKSUM..SB_OFF_CHECKSUM + SB_CHECKSUM_LEN].copy_from_slice(&cksum);
+-
+-        write_raw(self, self.lba0.real_offset, &self.superblock.clone())?;
+-        rustix::fs::fdatasync(&self.fd)?;
+-
+-        // 2. Superblock Backup, same content — best-effort, logged
+-        // and non-fatal on failure (ADR-007/008 posture: only the
+-        // primary write is load-bearing for the call to succeed).
+-        if let Some((backup_offset, _)) = self.lba0.fallback {
+-            if let Err(e) = write_raw(self, backup_offset, &self.superblock.clone()) {
+-                eprintln!("cafs: confirm(): failed to update Superblock Backup at offset {}: {e}", backup_offset.0);
+-            } else if let Err(e) = rustix::fs::fdatasync(&self.fd) {
+-                eprintln!("cafs: confirm(): fdatasync after Superblock Backup write failed: {e}");
+-            }
+-        }
++        let Some((mut smart, offset)) = self.smart_main else {
++            return Ok(());
++        };
++        let mount_count = u32::from_le_bytes(
++            smart[SMART_OFF_MOUNT_COUNT..SMART_OFF_MOUNT_COUNT + 4].try_into().unwrap(),
++        );
++        smart[SMART_OFF_MOUNT_COUNT..SMART_OFF_MOUNT_COUNT + 4]
++            .copy_from_slice(&mount_count.wrapping_add(1).to_le_bytes());
++        smart[SMART_OFF_CLEAN_UNMOUNT_FLAG] = 0;
++        smart[SMART_OFF_LAST_MOUNT_TIME..SMART_OFF_LAST_MOUNT_TIME + 8]
++            .copy_from_slice(&now_unix().to_le_bytes());
++        let sc = checksum::blake3_128(&smart[0..SMART_HASHED_LEN]);
++        smart[SMART_OFF_CHECKSUM..SMART_OFF_CHECKSUM + SMART_CHECKSUM_LEN].copy_from_slice(&sc);
+ 
+-        // 2.5. Primary Parity Block = XOR(new Superblock, cached
+-        // Config Snapshot) — only possible if Config Snapshot was
+-        // successfully read at mount() (best-effort, ADR-007).
+-        if let Some(cfg) = &self.config_snapshot {
+-            let mut parity = [0u8; REAL_BLOCK_4K as usize];
+-            for i in 0..REAL_BLOCK_4K as usize {
+-                parity[i] = self.superblock[i] ^ cfg[i];
+-            }
+-            if let Err(e) = write_raw(self, self.parity_offset, &parity) {
+-                eprintln!("cafs: confirm(): failed to update Parity Block at offset {}: {e}", self.parity_offset.0);
+-            } else if let Err(e) = rustix::fs::fdatasync(&self.fd) {
+-                eprintln!("cafs: confirm(): fdatasync after Parity Block write failed: {e}");
++        if let Err(e) = write_raw(self, offset, &smart) {
++            eprintln!("cafs: confirm(): failed to update M-SMART at offset {}: {e}", offset.0);
++        } else {
++            if let Err(e) = self.dev.sync() {
++                eprintln!("cafs: confirm(): fdatasync after M-SMART write failed: {e}");
+             }
++            self.smart_main = Some((smart, offset));
+         }
+-
+-        // M-SMART: best-effort, never fatal.
+-        if let Some((mut smart, offset)) = self.smart_main {
+-            let mount_count = u32::from_le_bytes(
+-                smart[SMART_OFF_MOUNT_COUNT..SMART_OFF_MOUNT_COUNT + 4].try_into().unwrap(),
+-            );
+-            smart[SMART_OFF_MOUNT_COUNT..SMART_OFF_MOUNT_COUNT + 4]
+-                .copy_from_slice(&mount_count.wrapping_add(1).to_le_bytes());
+-            smart[SMART_OFF_CLEAN_UNMOUNT_FLAG] = 0;
+-            let sc = checksum::blake3_128(&smart[0..SMART_HASHED_LEN]);
+-            smart[SMART_OFF_CHECKSUM..SMART_OFF_CHECKSUM + SMART_CHECKSUM_LEN].copy_from_slice(&sc);
+-
+-            if let Err(e) = write_raw(self, offset, &smart) {
+-                eprintln!("cafs: confirm(): failed to update M-SMART at offset {}: {e}", offset.0);
+-            } else {
+-                if let Err(e) = rustix::fs::fdatasync(&self.fd) {
+-                    eprintln!("cafs: confirm(): fdatasync after M-SMART write failed: {e}");
+-                }
+-                self.smart_main = Some((smart, offset));
+-            }
+-        }
+-
+         Ok(())
+     }
+ }
+diff --git a/src/device.rs b/src/device.rs
+new file mode 100644
+index 0000000..3a76141
+--- /dev/null
++++ b/src/device.rs
+@@ -0,0 +1,141 @@
++//! Device seam: everything the engine does to storage goes through
++//! this trait, so the same engine runs against a real file/block
++//! device ([`FileDevice`]) or a fault-injecting in-memory one
++//! ([`crate::fault::FaultDevice`]).
++//!
++//! SPDX-License-Identifier: BSD-3-Clause
++//! Copyright (c) 2026, Imran Bin Gifary (System Delta)
++
++use rustix::fd::OwnedFd;
++use rustix::fs::{self, Mode, OFlags};
++use rustix::io::Errno;
++
++use crate::error::{CafsError, CafsResult};
++
++/// Byte-addressed storage. No alignment or bounds policy lives here;
++/// that is the engine's job. `read_at` fills `buf` completely or
++/// fails; `write_at` writes all of `buf` or fails.
++pub trait Device: Send {
++    fn size(&self) -> u64;
++    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> CafsResult<()>;
++    fn write_at(&mut self, offset: u64, buf: &[u8]) -> CafsResult<()>;
++    /// Durability barrier (`fdatasync` on a real device).
++    fn sync(&mut self) -> CafsResult<()>;
++    /// Apply runtime I/O flags (`O_DIRECT`, `O_SYNC`). Semantics of a
++    /// real device are whatever the kernel does; see `remount.rs`.
++    fn apply_flags(&mut self, direct: bool, sync: bool, direct_required: bool) -> CafsResult<()>;
++}
++
++const BLKGETSIZE64: u32 = 0x8008_1272;
++
++fn device_size(fd: &OwnedFd) -> CafsResult<u64> {
++    // std::fs::File::metadata().len() would also work for a regular
++    // file, but silently returns a *wrong* number on an actual block
++    // device (it reports 0 or the backing inode's size, not device
++    // capacity) — BLKGETSIZE64 is the correct call for a device.
++    // rustix has no named wrapper for it yet; this is the one place
++    // in the engine that still needs `unsafe`, isolated and
++    // documented, per rustix's own generic-ioctl pattern.
++    let result: Result<u64, Errno> = unsafe {
++        let ctl = rustix::ioctl::Getter::<BLKGETSIZE64, u64>::new();
++        rustix::ioctl::ioctl(fd, ctl)
++    };
++    match result {
++        Ok(v) => Ok(v),
++        // ENOTTY: not a block device (e.g. a regular file test
++        // image) — fall back to the file's actual length.
++        Err(Errno::NOTTY) => {
++            let stat = fs::fstat(fd).map_err(CafsError::from)?;
++            Ok(stat.st_size as u64)
++        }
++        Err(e) => Err(CafsError::from(e)),
++    }
++}
++
++/// A regular file or block device opened through rustix.
++pub struct FileDevice {
++    fd: OwnedFd,
++    size: u64,
++}
++
++impl FileDevice {
++    pub fn open(path: &str, want_write: bool) -> CafsResult<Self> {
++        let mut flags = if want_write { OFlags::RDWR } else { OFlags::RDONLY };
++        // A block device opened for writing is claimed exclusively:
++        // the kernel then refuses (EBUSY) if it is mounted, in use as
++        // swap, or held by another driver. Not applied to regular
++        // files, or to read-only opens (inspection of a live volume).
++        let is_blk = fs::stat(path).is_ok_and(|st| fs::FileType::from_raw_mode(st.st_mode) == fs::FileType::BlockDevice);
++        if want_write && is_blk {
++            flags |= OFlags::EXCL;
++        }
++        let fd = fs::open(path, flags, Mode::empty()).map_err(|_| CafsError::Open)?;
++        let size = device_size(&fd)?;
++        Ok(FileDevice { fd, size })
++    }
++}
++
++impl FileDevice {
++    /// (logical, physical) sector size in bytes from the block-device
++    /// ioctls; `None` for a regular file or if the kernel refuses.
++    pub fn sector_sizes(&self) -> (Option<u32>, Option<u32>) {
++        const BLKSSZGET: u32 = 0x1268;
++        const BLKPBSZGET: u32 = 0x127B;
++        // SAFETY: both ioctls write one C int through the pointer
++        // rustix's Getter supplies; same pattern as BLKGETSIZE64 above.
++        let logical: Result<i32, Errno> = unsafe { rustix::ioctl::ioctl(&self.fd, rustix::ioctl::Getter::<BLKSSZGET, i32>::new()) };
++        let physical: Result<i32, Errno> = unsafe { rustix::ioctl::ioctl(&self.fd, rustix::ioctl::Getter::<BLKPBSZGET, i32>::new()) };
++        (logical.ok().map(|v| v as u32), physical.ok().map(|v| v as u32))
++    }
++}
++
++impl Device for FileDevice {
++    fn size(&self) -> u64 {
++        self.size
++    }
++
++    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> CafsResult<()> {
++        let mut got = 0usize;
++        while got < buf.len() {
++            match rustix::io::pread(&self.fd, &mut buf[got..], offset + got as u64) {
++                Ok(0) => return Err(CafsError::Io), // unexpected EOF against a fixed-size structure
++                Ok(n) => got += n,
++                Err(Errno::INTR) => continue,
++                Err(_) => return Err(CafsError::Io),
++            }
++        }
++        Ok(())
++    }
++
++    fn write_at(&mut self, offset: u64, buf: &[u8]) -> CafsResult<()> {
++        let mut sent = 0usize;
++        while sent < buf.len() {
++            match rustix::io::pwrite(&self.fd, &buf[sent..], offset + sent as u64) {
++                Ok(n) => sent += n,
++                Err(Errno::INTR) => continue,
++                Err(_) => return Err(CafsError::Io),
++            }
++        }
++        Ok(())
++    }
++
++    fn sync(&mut self) -> CafsResult<()> {
++        fs::fdatasync(&self.fd)?;
++        Ok(())
++    }
++
++    fn apply_flags(&mut self, direct: bool, sync: bool, direct_required: bool) -> CafsResult<()> {
++        let mut flags = fs::fcntl_getfl(&self.fd)?;
++        flags.set(OFlags::DIRECT, direct);
++        flags.set(OFlags::SYNC, sync);
++        fs::fcntl_setfl(&self.fd, flags)?;
++
++        if direct && direct_required {
++            let now = fs::fcntl_getfl(&self.fd)?;
++            if !now.contains(OFlags::DIRECT) {
++                return Err(CafsError::Unsupported);
++            }
++        }
++        Ok(())
++    }
++}
+diff --git a/src/error.rs b/src/error.rs
+index a56f4ff..3fbc79c 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -18,6 +18,8 @@ pub enum CafsError {
+     NotMounted,
+     InvalidArg,
+     Unsupported,
++    OutOfRange,
++    Bypassed,
+ }
+ 
+ impl fmt::Display for CafsError {
+@@ -33,6 +35,8 @@ impl fmt::Display for CafsError {
+             CafsError::NotMounted => "called out of order, e.g. confirm before mount",
+             CafsError::InvalidArg => "invalid argument",
+             CafsError::Unsupported => "operation unsupported in this configuration",
++            CafsError::OutOfRange => "offset+length falls outside the device",
++            CafsError::Bypassed => "operation needs anchors, but the device was opened in bypass mode",
+         };
+         f.write_str(s)
+     }
+diff --git a/src/fault.rs b/src/fault.rs
+new file mode 100644
+index 0000000..e7531a2
+--- /dev/null
++++ b/src/fault.rs
+@@ -0,0 +1,270 @@
++//! Fault-injecting in-memory [`Device`] for deterministic tests.
++//!
++//! Model (an ASSUMPTION about devices, not a measurement of any real
++//! one — it is the model every crash test here is proved under):
++//!  * writes land in a volatile cache; reads see them immediately;
++//!  * `sync()` is the only durability barrier;
++//!  * on power loss, writes issued since the last `sync()` may land
++//!    or not, independently per "granule" (whole write, 512 B, 4096 B);
++//!  * writes before the last `sync()` are durable and intact.
++//!
++//! [`FaultDevice`] is a cheap clone-able handle onto shared state, so
++//! a test can hand one clone to the engine and keep another to inspect
++//! counters, the op log and crash images.
++//!
++//! SPDX-License-Identifier: BSD-3-Clause
++//! Copyright (c) 2026, Imran Bin Gifary (System Delta)
++
++use std::sync::{Arc, Mutex};
++
++use crate::device::Device;
++use crate::error::{CafsError, CafsResult};
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum Op {
++    Write { offset: u64, data: Vec<u8> },
++    Sync,
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct Counters {
++    pub reads: u64,
++    pub writes: u64,
++    pub syncs: u64,
++    pub bytes_read: u64,
++    pub bytes_written: u64,
++}
++
++impl Counters {
++    pub fn since(self, earlier: Counters) -> Counters {
++        Counters {
++            reads: self.reads - earlier.reads,
++            writes: self.writes - earlier.writes,
++            syncs: self.syncs - earlier.syncs,
++            bytes_read: self.bytes_read - earlier.bytes_read,
++            bytes_written: self.bytes_written - earlier.bytes_written,
++        }
++    }
++}
++
++/// What survives power loss among writes not yet covered by a sync.
++#[derive(Clone, Copy, Debug)]
++pub struct CrashModel {
++    /// 0 = a write lands whole or not at all; otherwise tearing at
++    /// absolute multiples of this many bytes (512, 4096, ...).
++    pub granule: u64,
++    /// Chance (0-100) that each in-flight granule lands.
++    pub keep_percent: u8,
++    pub seed: u64,
++}
++
++impl CrashModel {
++    pub const DROP_ALL: CrashModel = CrashModel { granule: 0, keep_percent: 0, seed: 0 };
++    pub const KEEP_ALL: CrashModel = CrashModel { granule: 0, keep_percent: 100, seed: 0 };
++    pub fn torn(granule: u64, seed: u64) -> CrashModel {
++        CrashModel { granule, keep_percent: 50, seed }
++    }
++}
++
++struct Rng(u64);
++impl Rng {
++    fn new(seed: u64) -> Self {
++        Rng((seed ^ 0x9E37_79B9_7F4A_7C15) | 1)
++    }
++    fn next(&mut self) -> u64 {
++        let mut x = self.0;
++        x ^= x >> 12;
++        x ^= x << 25;
++        x ^= x >> 27;
++        self.0 = x;
++        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
++    }
++    fn chance(&mut self, percent: u8) -> bool {
++        (self.next() % 100) < percent as u64
++    }
++}
++
++struct Inner {
++    cache: Vec<u8>,
++    durable: Vec<u8>,
++    epoch_base: Vec<u8>,
++    log: Vec<Op>,
++    counters: Counters,
++    bad_reads: Vec<(u64, u64)>,
++    fail_writes_after: Option<u64>,
++    writes_ok: u64,
++}
++
++#[derive(Clone)]
++pub struct FaultDevice {
++    inner: Arc<Mutex<Inner>>,
++}
++
++impl FaultDevice {
++    pub fn from_image(image: Vec<u8>) -> Self {
++        FaultDevice {
++            inner: Arc::new(Mutex::new(Inner {
++                cache: image.clone(),
++                durable: image.clone(),
++                epoch_base: image,
++                log: Vec::new(),
++                counters: Counters::default(),
++                bad_reads: Vec::new(),
++                fail_writes_after: None,
++                writes_ok: 0,
++            })),
++        }
++    }
++
++    /// Start recording from a quiescent point: syncs, snapshots the
++    /// durable image as the crash baseline, clears the op log and
++    /// counters.
++    pub fn begin_recording(&self) {
++        let mut s = self.inner.lock().unwrap();
++        s.durable = s.cache.clone();
++        s.epoch_base = s.durable.clone();
++        s.log.clear();
++        s.counters = Counters::default();
++    }
++
++    pub fn counters(&self) -> Counters {
++        self.inner.lock().unwrap().counters
++    }
++
++    pub fn ops(&self) -> Vec<Op> {
++        self.inner.lock().unwrap().log.clone()
++    }
++
++    /// What a reader sees right now (media + cache).
++    pub fn visible_image(&self) -> Vec<u8> {
++        self.inner.lock().unwrap().cache.clone()
++    }
++
++    /// What survives a power cut right now with every unsynced write
++    /// dropped.
++    pub fn durable_image(&self) -> Vec<u8> {
++        self.inner.lock().unwrap().durable.clone()
++    }
++
++    /// Media corruption injected outside the op stream (setup only:
++    /// call before `begin_recording`).
++    pub fn poke(&self, offset: u64, bytes: &[u8]) {
++        let mut guard = self.inner.lock().unwrap();
++        let s = &mut *guard;
++        let o = offset as usize;
++        for img in [&mut s.cache, &mut s.durable, &mut s.epoch_base] {
++            img[o..o + bytes.len()].copy_from_slice(bytes);
++        }
++    }
++
++    pub fn flip_byte(&self, offset: u64) {
++        let b = self.visible_image()[offset as usize] ^ 0xFF;
++        self.poke(offset, &[b]);
++    }
++
++    /// Reads overlapping `[offset, offset+len)` fail with `Io`
++    /// (an unreadable sector).
++    pub fn add_bad_read_range(&self, offset: u64, len: u64) {
++        self.inner.lock().unwrap().bad_reads.push((offset, len));
++    }
++
++    /// After `n` successful writes, every further write fails with `Io`.
++    pub fn fail_writes_after(&self, n: u64) {
++        let mut s = self.inner.lock().unwrap();
++        s.fail_writes_after = Some(n);
++        s.writes_ok = 0;
++    }
++
++    /// The media image after power loss at op-log position `prefix`
++    /// (ops `0..prefix` were issued) under `model`.
++    pub fn crash_image(&self, prefix: usize, model: CrashModel) -> Vec<u8> {
++        let s = self.inner.lock().unwrap();
++        let mut img = s.epoch_base.clone();
++        let ops = &s.log[..prefix];
++        let durable_end = ops.iter().rposition(|o| matches!(o, Op::Sync)).map_or(0, |i| i + 1);
++
++        for op in &ops[..durable_end] {
++            if let Op::Write { offset, data } = op {
++                img[*offset as usize..*offset as usize + data.len()].copy_from_slice(data);
++            }
++        }
++
++        let mut rng = Rng::new(model.seed);
++        for op in &ops[durable_end..] {
++            let Op::Write { offset, data } = op else { continue };
++            let (start, end) = (*offset, *offset + data.len() as u64);
++            if model.granule == 0 {
++                if rng.chance(model.keep_percent) {
++                    img[start as usize..end as usize].copy_from_slice(data);
++                }
++                continue;
++            }
++            let mut pos = start;
++            while pos < end {
++                let next = ((pos / model.granule) + 1) * model.granule;
++                let chunk_end = next.min(end);
++                if rng.chance(model.keep_percent) {
++                    img[pos as usize..chunk_end as usize]
++                        .copy_from_slice(&data[(pos - start) as usize..(chunk_end - start) as usize]);
++                }
++                pos = chunk_end;
++            }
++        }
++        img
++    }
++}
++
++impl Device for FaultDevice {
++    fn size(&self) -> u64 {
++        self.inner.lock().unwrap().cache.len() as u64
++    }
++
++    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> CafsResult<()> {
++        let mut s = self.inner.lock().unwrap();
++        let end = offset + buf.len() as u64;
++        if end > s.cache.len() as u64 {
++            return Err(CafsError::Io);
++        }
++        if s.bad_reads.iter().any(|&(o, l)| offset < o + l && o < end) {
++            return Err(CafsError::Io);
++        }
++        buf.copy_from_slice(&s.cache[offset as usize..end as usize]);
++        s.counters.reads += 1;
++        s.counters.bytes_read += buf.len() as u64;
++        Ok(())
++    }
++
++    fn write_at(&mut self, offset: u64, buf: &[u8]) -> CafsResult<()> {
++        let mut s = self.inner.lock().unwrap();
++        let end = offset + buf.len() as u64;
++        if end > s.cache.len() as u64 {
++            return Err(CafsError::Io);
++        }
++        if let Some(n) = s.fail_writes_after {
++            if s.writes_ok >= n {
++                return Err(CafsError::Io);
++            }
++        }
++        s.writes_ok += 1;
++        s.cache[offset as usize..end as usize].copy_from_slice(buf);
++        s.log.push(Op::Write { offset, data: buf.to_vec() });
++        s.counters.writes += 1;
++        s.counters.bytes_written += buf.len() as u64;
++        Ok(())
++    }
++
++    fn sync(&mut self) -> CafsResult<()> {
++        let mut s = self.inner.lock().unwrap();
++        s.durable = s.cache.clone();
++        s.log.push(Op::Sync);
++        s.counters.syncs += 1;
++        Ok(())
++    }
++
++    fn apply_flags(&mut self, direct: bool, _sync: bool, direct_required: bool) -> CafsResult<()> {
++        if direct && direct_required {
++            return Err(CafsError::Unsupported);
++        }
++        Ok(())
++    }
++}
+diff --git a/src/layout.rs b/src/layout.rs
+index 21e6a83..b95a9a7 100644
+--- a/src/layout.rs
++++ b/src/layout.rs
+@@ -176,3 +176,52 @@ pub const SMART_OFF_CLEAN_UNMOUNT_FLAG: usize = 72;
+ pub const SMART_OFF_CHECKSUM: usize = 128;
+ pub const SMART_CHECKSUM_LEN: usize = 16;
+ pub const SMART_HASHED_LEN: usize = 128; // bytes 0-127
++
++// ---- Slot geometry + end-of-device mirror (fs.info §2, §12) --------
++pub const SLOT_COUNT: usize = 6;
++
++pub const fn head_slot_offset(slot: u8) -> ByteOffset {
++    match slot {
++        0 => LBA0_OFFSET,
++        1 => LBA1_OFFSET,
++        2 => LBA2_OFFSET,
++        3 => LBA3_OFFSET,
++        4 => LBA4_OFFSET,
++        _ => LBA5_OFFSET,
++    }
++}
++
++pub const fn slot_block_size(slot: u8) -> u32 {
++    if slot < 4 {
++        PTR_BLOCK_SMALL_SIZE
++    } else {
++        PTR_BLOCK_LARGE_SIZE
++    }
++}
++
++/// End-of-device mirror of LBA0-5: the last `ANCHOR_REGION_BYTES` of
++/// the device hold the six pointer blocks in the same relative order
++/// as at the head. ASSUMPTION: fs.info §12 says "the last 6 anchor
++/// blocks" but states neither the order nor the exact offsets.
++pub const fn tail_slot_offset(slot: u8, device_size: u64) -> ByteOffset {
++    ByteOffset(device_size - ANCHOR_REGION_BYTES + head_slot_offset(slot).0)
++}
++
++/// Superblock Backup sits immediately before the tail anchor region.
++/// ASSUMPTION: fs.info states no placement rule for it.
++pub const fn sb_backup_offset(device_size: u64) -> ByteOffset {
++    ByteOffset(device_size - ANCHOR_REGION_BYTES - REAL_BLOCK_4K as u64)
++}
++
++/// B-SMART sits immediately before the Superblock Backup.
++pub const fn smart_backup_offset(device_size: u64) -> ByteOffset {
++    ByteOffset(sb_backup_offset(device_size).0 - REAL_BLOCK_4K as u64)
++}
++
++/// Bytes at the end of the device used by the mirror + backups.
++pub const END_REGION_BYTES: u64 = ANCHOR_REGION_BYTES + 2 * REAL_BLOCK_4K as u64;
++
++/// TEMPORARY (2026-10-27): `last_mount_time` lives in M-SMART, in what
++/// fs.info §11.1 lists as reserved space (73-127), instead of the
++/// Superblock. Not in fs.info; to be reconsidered.
++pub const SMART_OFF_LAST_MOUNT_TIME: usize = 80;
+diff --git a/src/lib.rs b/src/lib.rs
+index 6aa874a..43cdb6e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -4,12 +4,20 @@
+ //! lifecycle (mount -> check -> remount -> confirm) plus generic
+ //! block read/write. No allocator, no filesystem semantics.
+ //!
++//! PoC additions (2026-10-27): all device access goes through the
++//! [`Device`] trait; anchors are read from both the head and the
++//! end-of-device mirror; [`MountMode::Bypass`] opens a device for raw
++//! reads/writes without reading or trusting any anchor.
++//!
+ //! SPDX-License-Identifier: BSD-3-Clause
+ //! Copyright (c) 2026, Imran Bin Gifary (System Delta)
+ 
+-mod anchor;
++pub mod anchor;
+ mod checksum;
++pub mod device;
++pub mod fault;
+ pub mod layout;
++pub mod safety;
+ 
+ mod block_io;
+ mod check;
+@@ -17,15 +25,28 @@ mod confirm;
+ mod mount;
+ mod remount;
+ 
++pub use anchor::{PtrAlgo, Side, SlotReport};
++pub use device::{Device, FileDevice};
+ pub use error::{CafsError, CafsResult};
+ pub use layout::ByteOffset;
+-pub use anchor::PtrAlgo;
+ 
+ mod error;
+ 
+-use anchor::PtrBlock;
+ use layout::{REAL_BLOCK_4K, SMART_TABLE_SIZE};
+-use rustix::fd::OwnedFd;
++
++/// How a device is opened.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub enum MountMode {
++    /// Read and verify the anchors; `check`/`confirm` available.
++    #[default]
++    Full,
++    /// Open the device only. No anchor is read or trusted; `check`
++    /// and `confirm` return [`CafsError::Bypassed`]. `read_block`,
++    /// `write_block`, `sync`, `scan_anchors` and `remount` work, so
++    /// the raw disk can be inspected or modified (including a damaged
++    /// one that `Full` would refuse to mount).
++    Bypass,
++}
+ 
+ /// Per-mount runtime options — maps to config.fs's `[mount_hints]`/
+ /// `[io]` sections (both explicitly runtime-only, not in the Config
+@@ -60,14 +81,22 @@ pub struct ConfigSnapshot {
+     pub verify_data: Option<bool>,
+ }
+ 
+-/// `check()` result: Superblock only, per ADR-007. All other anchor
+-/// structures are read best-effort at mount() but neither verified
+-/// nor repaired here.
++/// `check()` result. The Superblock is verified and repaired from its
++/// backup; each of the six anchor slots is verified at both ends of
++/// the device and a damaged end is rebuilt from the intact one.
+ #[derive(Debug, Clone, Copy, Default)]
+ pub struct CheckResult {
+     pub superblock_ok: bool,
+     pub superblock_repaired: bool,
+     pub pointer_checksum_algo_used: Option<PtrAlgo>,
++    /// Slots where exactly one end failed verification.
++    pub anchor_slots_degraded: u8,
++    /// Of those, how many were rewritten from the intact end.
++    pub anchor_slots_repaired: u8,
++    /// Slots where both ends failed.
++    pub anchor_slots_lost: u8,
++    /// Slots where both ends verify but point at different places.
++    pub anchor_disagreements: u8,
+ }
+ 
+ /// In-RAM-only per-session telemetry — mirrors the on-disk SMART
+@@ -83,22 +112,24 @@ pub struct SmartCounters {
+     pub total_write_errors: u32,
+ }
+ 
+-/// A mounted CAFS device. Not `Clone`/`Copy` — owns the device file
+-/// descriptor.
++/// A mounted CAFS device. Not `Clone`/`Copy` — owns the device.
+ pub struct CafsCtx {
+-    pub(crate) fd: OwnedFd,
++    pub(crate) dev: Box<dyn Device>,
+     pub(crate) want_write: bool,
++    pub(crate) mode: MountMode,
+     #[allow(dead_code)]
+     pub(crate) device_size: u64,
+ 
+-    pub(crate) lba0: PtrBlock,
+-    pub(crate) lba0_algo: crate::anchor::PtrAlgo,
+-    pub(crate) parity_offset: ByteOffset,
++    pub(crate) ptr_algo: PtrAlgo,
++    pub(crate) anchors: Vec<SlotReport>,
++    pub(crate) sb_primary: layout::ByteOffset,
++    pub(crate) sb_backup: Option<layout::ByteOffset>,
++    pub(crate) parity_offset: layout::ByteOffset,
+ 
+     pub(crate) superblock: [u8; REAL_BLOCK_4K as usize],
+     pub(crate) config_snapshot: Option<[u8; REAL_BLOCK_4K as usize]>,
+     pub(crate) function_table: Vec<u8>,
+-    pub(crate) smart_main: Option<([u8; SMART_TABLE_SIZE], ByteOffset)>,
++    pub(crate) smart_main: Option<([u8; SMART_TABLE_SIZE], layout::ByteOffset)>,
+ 
+     pub(crate) opts: MountOpts,
+     pub(crate) smart: SmartCounters,
+@@ -109,6 +140,25 @@ impl CafsCtx {
+         self.smart
+     }
+ 
++    pub fn mode(&self) -> MountMode {
++        self.mode
++    }
++
++    pub fn device_size(&self) -> u64 {
++        self.dev.size()
++    }
++
++    /// Anchor slots as read at mount (empty in bypass mode; call
++    /// [`CafsCtx::scan_anchors`] to read them on demand).
++    pub fn anchors(&self) -> &[SlotReport] {
++        &self.anchors
++    }
++
++    /// Durability barrier on the device (`fdatasync`).
++    pub fn sync(&mut self) -> CafsResult<()> {
++        self.dev.sync()
++    }
++
+     /// Not one of the originally-named four stages — added because
+     /// `confirm()` only ever marks a mount as started; without a
+     /// counterpart, `destroy_flush` never runs. Consumes `self`: the
+@@ -116,11 +166,12 @@ impl CafsCtx {
+     /// error, not a runtime bug — a class of mistake the C version's
+     /// `cafs_close()` had no way to prevent.
+     pub fn close(self) -> CafsResult<()> {
+-        if self.opts.destroy_flush && self.want_write {
+-            rustix::fs::fsync(&self.fd)?;
++        let mut this = self;
++        if this.opts.destroy_flush && this.want_write {
++            this.dev.sync()?;
+         }
+-        // fd closes automatically on drop (OwnedFd RAII) — no leak
+-        // even if a caller never calls close() at all.
++        // The device (and its fd, for FileDevice) closes on drop —
++        // no leak even if a caller never calls close() at all.
+         Ok(())
+     }
+ }
+diff --git a/src/mount.rs b/src/mount.rs
+index 8d37c87..06103e6 100644
+--- a/src/mount.rs
++++ b/src/mount.rs
+@@ -1,67 +1,61 @@
+-//! `CafsCtx::mount` — opens the device and reads the anchor region:
+-//! LBA0-2/4 pointer blocks, then the real Superblock (raw), and
+-//! best-effort Config Snapshot / Function Table / M-SMART. No
+-//! Superblock checksum verification here (that's `check()`'s job)
+-//! and no writes. LBA3 (Meta/User Pointer Table) is not read —
+-//! delegated upward, out of scope for this library.
++//! `CafsCtx::mount` — opens the device and reads the anchor region.
++//! Each of LBA0-5 is read from the head AND from the end-of-device
++//! mirror (fs.info §2, §12); a slot whose head copy fails verification
++//! is served from the tail copy (§14 Track A, step 2). The real
++//! Superblock is then read raw (checksum verification is `check()`'s
++//! job), followed by best-effort Config Snapshot / Function Table /
++//! M-SMART. No writes. LBA3 (Meta/User Pointer Table) is not
++//! interpreted — delegated upward.
++//!
++//! `MountMode::Bypass` opens the device and stops there.
+ //!
+ //! SPDX-License-Identifier: BSD-3-Clause
+ //! Copyright (c) 2026, Imran Bin Gifary (System Delta)
+ 
+-use rustix::fs::{self, Mode, OFlags};
+-
+-use crate::anchor::verify_ptr_block;
++use crate::anchor::{verify_ptr_block, PtrAlgo, PtrBlock, SlotReport};
+ use crate::block_io::read_raw;
++use crate::device::{Device, FileDevice};
+ use crate::error::{CafsError, CafsResult};
+ use crate::layout::*;
+-use crate::{CafsCtx, MountOpts, SmartCounters};
+-
+-const BLKGETSIZE64: u32 = 0x8008_1272;
+-
+-fn device_size(fd: &rustix::fd::OwnedFd) -> CafsResult<u64> {
+-    // std::fs::File::metadata().len() would also work for a regular
+-    // file, but silently returns a *wrong* number on an actual block
+-    // device (it reports 0 or the backing inode's size, not device
+-    // capacity) — BLKGETSIZE64 is the correct call for a device.
+-    // rustix has no named wrapper for it yet; this is the one place
+-    // in the engine that still needs `unsafe`, isolated and
+-    // documented, per rustix's own generic-ioctl pattern.
+-    let result: Result<u64, rustix::io::Errno> = unsafe {
+-        let ctl = rustix::ioctl::Getter::<BLKGETSIZE64, u64>::new();
+-        rustix::ioctl::ioctl(fd, ctl)
+-    };
+-    match result {
+-        Ok(v) => Ok(v),
+-        // ENOTTY: not a block device (e.g. a regular file test
+-        // image) — fall back to the file's actual length.
+-        Err(rustix::io::Errno::NOTTY) => {
+-            let stat = fs::fstat(fd).map_err(CafsError::from)?;
+-            Ok(stat.st_size as u64)
+-        }
+-        Err(e) => Err(CafsError::from(e)),
+-    }
++use crate::{CafsCtx, MountMode, MountOpts, SmartCounters};
++
++fn read_ptr(ctx: &mut CafsCtx, off: ByteOffset, len: usize) -> CafsResult<(PtrBlock, PtrAlgo)> {
++    let mut raw = vec![0u8; len];
++    read_raw(ctx, off, &mut raw)?;
++    verify_ptr_block(&raw)
+ }
+ 
+ impl CafsCtx {
+     pub fn mount(path: &str, want_write: bool) -> CafsResult<Self> {
+-        let flags = if want_write { OFlags::RDWR } else { OFlags::RDONLY };
+-        let fd = fs::open(path, flags, Mode::empty()).map_err(|_| CafsError::Open)?;
++        Self::mount_with(path, want_write, MountMode::Full)
++    }
++
++    pub fn mount_with(path: &str, want_write: bool, mode: MountMode) -> CafsResult<Self> {
++        let dev = FileDevice::open(path, want_write)?;
++        Self::mount_device_with(Box::new(dev), want_write, mode)
++    }
+ 
+-        let size = device_size(&fd)?;
+-        if size < ANCHOR_REGION_BYTES {
++    /// Mount over any [`Device`] (a real file/block device, or a
++    /// fault-injecting in-memory one).
++    pub fn mount_device(dev: Box<dyn Device>, want_write: bool) -> CafsResult<Self> {
++        Self::mount_device_with(dev, want_write, MountMode::Full)
++    }
++
++    pub fn mount_device_with(dev: Box<dyn Device>, want_write: bool, mode: MountMode) -> CafsResult<Self> {
++        let size = dev.size();
++        if size < 2 * ANCHOR_REGION_BYTES {
+             return Err(CafsError::TooSmall);
+         }
+ 
+         let mut ctx = CafsCtx {
+-            fd,
++            dev,
+             want_write,
++            mode,
+             device_size: size,
+-            lba0: crate::anchor::PtrBlock {
+-                real_offset: ByteOffset(0),
+-                real_size: 0,
+-                fallback: None,
+-            },
+-            lba0_algo: crate::anchor::PtrAlgo::Crc32c, // overwritten below before any read happens
++            ptr_algo: PtrAlgo::Crc32c, // overwritten below before any read of a real structure
++            anchors: Vec::new(),
++            sb_primary: ByteOffset(0),
++            sb_backup: None,
+             parity_offset: ByteOffset(0),
+             superblock: [0u8; REAL_BLOCK_4K as usize],
+             config_snapshot: None,
+@@ -71,25 +65,32 @@ impl CafsCtx {
+             smart: SmartCounters::default(),
+         };
+ 
++        if mode == MountMode::Bypass {
++            return Ok(ctx);
++        }
++
++        ctx.anchors = ctx.scan_anchors();
++
+         // LBA0 is the trust root: without a verified pointer to the
+-        // Superblock, nothing else can proceed. This is the one
+-        // pointer-block checksum failure that's fatal to mount().
+-        let mut lba0_raw = vec![0u8; PTR_BLOCK_SMALL_SIZE as usize];
+-        read_raw(&ctx, LBA0_OFFSET, &mut lba0_raw)?;
+-        let (lba0, algo) = verify_ptr_block(&lba0_raw)?;
+-        ctx.lba0 = lba0.clone();
+-        ctx.lba0_algo = algo;
++        // Superblock from EITHER end of the device, nothing else can
++        // proceed. This is the one slot whose loss is fatal to mount().
++        let Some((sb_primary, sb_backup)) = ctx.anchors[0].sb_pair() else {
++            return Err(ctx.anchors[0].head.as_ref().err().copied().unwrap_or(CafsError::BadMagic));
++        };
++        ctx.ptr_algo = ctx.anchors[0].chosen().map(|c| c.1).unwrap_or(PtrAlgo::Crc32c);
++        ctx.sb_primary = sb_primary;
++        ctx.sb_backup = sb_backup;
+ 
+         let mut sb = [0u8; REAL_BLOCK_4K as usize];
+-        read_raw(&ctx, lba0.real_offset, &mut sb)?;
++        read_raw(&mut ctx, sb_primary, &mut sb)?;
+         ctx.superblock = sb;
+ 
+         // Everything past here is best-effort: a failed read just
+         // leaves the corresponding field unpopulated. It never
+         // aborts the mount (ADR-007: Superblock-only scope for V1).
+-        let _ = Self::try_read_lba2_parity_offset(&mut ctx);
+-        let _ = Self::try_read_lba1_config_snapshot(&mut ctx);
+-        let function_table_ok = Self::try_read_lba4_function_table(&mut ctx).is_ok();
++        let _ = Self::try_read_parity_offset(&mut ctx);
++        let _ = Self::try_read_config_snapshot(&mut ctx);
++        let function_table_ok = Self::try_read_function_table(&mut ctx).is_ok();
+         if function_table_ok {
+             let _ = Self::try_read_smart_main(&mut ctx);
+         }
+@@ -97,33 +98,42 @@ impl CafsCtx {
+         Ok(ctx)
+     }
+ 
+-    fn try_read_lba2_parity_offset(ctx: &mut CafsCtx) -> CafsResult<()> {
+-        let mut raw = vec![0u8; PTR_BLOCK_SMALL_SIZE as usize];
+-        read_raw(ctx, LBA2_OFFSET, &mut raw)?;
+-        let (lba2, _algo) = verify_ptr_block(&raw)?;
+-        ctx.parity_offset = lba2.real_offset;
++    /// Read and verify all twelve pointer blocks (six slots x two
++    /// ends). Works in any mount mode and never fails as a whole: a
++    /// block that cannot be read or verified is reported per side.
++    pub fn scan_anchors(&mut self) -> Vec<SlotReport> {
++        let size = self.dev.size();
++        let mut out = Vec::with_capacity(SLOT_COUNT);
++        for slot in 0..SLOT_COUNT as u8 {
++            let len = slot_block_size(slot) as usize;
++            let head = read_ptr(self, head_slot_offset(slot), len);
++            let tail = read_ptr(self, tail_slot_offset(slot, size), len);
++            out.push(SlotReport { slot, head, tail });
++        }
++        out
++    }
++
++    fn try_read_parity_offset(ctx: &mut CafsCtx) -> CafsResult<()> {
++        let (b, _) = ctx.anchors[2].chosen().ok_or(CafsError::Checksum)?.clone();
++        ctx.parity_offset = b.real_offset;
+         Ok(())
+     }
+ 
+-    fn try_read_lba1_config_snapshot(ctx: &mut CafsCtx) -> CafsResult<()> {
+-        let mut raw = vec![0u8; PTR_BLOCK_SMALL_SIZE as usize];
+-        read_raw(ctx, LBA1_OFFSET, &mut raw)?;
+-        let (lba1, _algo) = verify_ptr_block(&raw)?;
++    fn try_read_config_snapshot(ctx: &mut CafsCtx) -> CafsResult<()> {
++        let (b, _) = ctx.anchors[1].chosen().ok_or(CafsError::Checksum)?.clone();
+         let mut cfg = [0u8; REAL_BLOCK_4K as usize];
+-        read_raw(ctx, lba1.real_offset, &mut cfg)?;
++        read_raw(ctx, b.real_offset, &mut cfg)?;
+         ctx.config_snapshot = Some(cfg);
+         Ok(())
+     }
+ 
+-    fn try_read_lba4_function_table(ctx: &mut CafsCtx) -> CafsResult<()> {
+-        let mut raw = vec![0u8; PTR_BLOCK_LARGE_SIZE as usize];
+-        read_raw(ctx, LBA4_OFFSET, &mut raw)?;
+-        let (lba4, _algo) = verify_ptr_block(&raw)?;
+-        if lba4.real_size < FT_MIN_REAL_SIZE {
++    fn try_read_function_table(ctx: &mut CafsCtx) -> CafsResult<()> {
++        let (b, _) = ctx.anchors[4].chosen().ok_or(CafsError::Checksum)?.clone();
++        if b.real_size < FT_MIN_REAL_SIZE {
+             return Err(CafsError::TooSmall);
+         }
+-        let mut ft = vec![0u8; lba4.real_size as usize];
+-        read_raw(ctx, lba4.real_offset, &mut ft)?;
++        let mut ft = vec![0u8; b.real_size as usize];
++        read_raw(ctx, b.real_offset, &mut ft)?;
+         ctx.function_table = ft;
+         Ok(())
+     }
+diff --git a/src/remount.rs b/src/remount.rs
+index f068070..387d111 100644
+--- a/src/remount.rs
++++ b/src/remount.rs
+@@ -12,8 +12,6 @@
+ //! SPDX-License-Identifier: BSD-3-Clause
+ //! Copyright (c) 2026, Imran Bin Gifary (System Delta)
+ 
+-use rustix::fs::{self, OFlags};
+-
+ use crate::error::{CafsError, CafsResult};
+ use crate::layout::{PTR_ALGO_CRC32C, PTR_ALGO_XXHASH32};
+ use crate::{CafsCtx, ConfigSnapshot, MountOpts};
+@@ -86,17 +84,7 @@ impl CafsCtx {
+             return Err(CafsError::Unsupported);
+         }
+ 
+-        let mut flags = fs::fcntl_getfl(&self.fd)?;
+-        flags.set(OFlags::DIRECT, opts.direct_io);
+-        flags.set(OFlags::SYNC, opts.sync_open);
+-        fs::fcntl_setfl(&self.fd, flags)?;
+-
+-        if opts.direct_io && opts.direct_io_required {
+-            let now = fs::fcntl_getfl(&self.fd)?;
+-            if !now.contains(OFlags::DIRECT) {
+-                return Err(CafsError::Unsupported);
+-            }
+-        }
++        self.dev.apply_flags(opts.direct_io, opts.sync_open, opts.direct_io_required)?;
+ 
+         self.opts = *opts;
+         Ok(snapshot)
+diff --git a/src/safety.rs b/src/safety.rs
+new file mode 100644
+index 0000000..ad32134
+--- /dev/null
++++ b/src/safety.rs
+@@ -0,0 +1,219 @@
++//! Guards for pointing destructive tooling (mkfs, the device test
++//! suite) at a real block device. Defence in depth, in this order:
++//!  1. kernel: `FileDevice` opens a block device for writing with
++//!     `O_EXCL`, which the kernel refuses (EBUSY) while the device is
++//!     mounted, in use as swap, or claimed by another driver;
++//!  2. this module: refuse whole disks that have partitions, devices
++//!     with holders (dm/md/LUKS on top), anything listed in
++//!     `/proc/self/mountinfo` or `/proc/swaps`, and any device whose
++//!     first 128 KiB carry a filesystem signature other than "empty",
++//!     "swap" or "CAFS" — so a mistyped partition number cannot
++//!     silently flatten an NTFS/ext4/btrfs volume.
++//!
++//! Linux only (sysfs, procfs).
++//!
++//! SPDX-License-Identifier: BSD-3-Clause
++//! Copyright (c) 2026, Imran Bin Gifary (System Delta)
++
++use std::fs;
++use std::io::Read;
++use std::os::unix::fs::{FileTypeExt, MetadataExt};
++use std::path::{Path, PathBuf};
++
++use crate::device::FileDevice;
++use crate::layout::PTR_MAGIC;
++
++/// What a device's first 128 KiB look like.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Signature {
++    Empty,
++    Swap,
++    Cafs,
++    Ntfs,
++    Fat,
++    Ext,
++    Btrfs,
++    Xfs,
++    Luks,
++    Other,
++}
++
++impl Signature {
++    /// Signatures a destructive CAFS tool may overwrite without being
++    /// told to wipe the device first.
++    pub const OVERWRITABLE: [Signature; 3] = [Signature::Empty, Signature::Swap, Signature::Cafs];
++}
++
++pub fn detect_signature(b: &[u8]) -> Signature {
++    let at = |off: usize, pat: &[u8]| b.len() >= off + pat.len() && &b[off..off + pat.len()] == pat;
++    if at(0, &PTR_MAGIC) {
++        Signature::Cafs
++    } else if at(4086, b"SWAPSPACE2") || at(4086, b"SWAP-SPACE") {
++        Signature::Swap
++    } else if at(3, b"NTFS    ") {
++        Signature::Ntfs
++    } else if at(82, b"FAT32") || at(54, b"FAT16") || at(54, b"FAT12") {
++        Signature::Fat
++    } else if at(1080, &[0x53, 0xEF]) {
++        Signature::Ext
++    } else if at(65600, b"_BHRfS_M") {
++        Signature::Btrfs
++    } else if at(0, b"XFSB") {
++        Signature::Xfs
++    } else if at(0, b"LUKS\xba\xbe") {
++        Signature::Luks
++    } else if b.iter().all(|&x| x == 0) {
++        Signature::Empty
++    } else {
++        Signature::Other
++    }
++}
++
++#[derive(Debug, Clone)]
++pub struct TargetInfo {
++    pub path: PathBuf,
++    pub kernel_name: String,
++    pub size: u64,
++    pub logical_sector: Option<u32>,
++    pub physical_sector: Option<u32>,
++    pub rotational: Option<bool>,
++    pub is_partition: bool,
++    pub signature: Signature,
++}
++
++fn rdev_of(path: &Path) -> Option<u64> {
++    let m = fs::metadata(path).ok()?;
++    m.file_type().is_block_device().then(|| m.rdev())
++}
++
++fn read_trim(p: impl AsRef<Path>) -> Option<String> {
++    fs::read_to_string(p).ok().map(|s| s.trim().to_string())
++}
++
++/// Check that `path` is a block device that is safe to overwrite.
++/// `Ok` carries what was learned about it; `Err` is a human-readable
++/// reason to stop.
++pub fn check_target(path: &str, allowed: &[Signature]) -> Result<TargetInfo, String> {
++    let meta = fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
++    if !meta.file_type().is_block_device() {
++        return Err(format!("{path} is not a block device"));
++    }
++    let rdev = meta.rdev();
++    let (maj, min) = (rustix::fs::major(rdev), rustix::fs::minor(rdev));
++    let sys = fs::canonicalize(format!("/sys/dev/block/{maj}:{min}"))
++        .map_err(|e| format!("cannot resolve {maj}:{min} in sysfs: {e}"))?;
++    let kernel_name = sys.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
++    let is_partition = sys.join("partition").exists();
++
++    // Devices that belong to this target: itself, plus its partitions.
++    let mut mine: Vec<(u32, u32)> = vec![(maj, min)];
++    if !is_partition {
++        let mut children = 0;
++        if let Ok(rd) = fs::read_dir(&sys) {
++            for e in rd.flatten() {
++                if e.path().join("partition").exists() {
++                    children += 1;
++                    if let Some(d) = read_trim(e.path().join("dev")) {
++                        if let Some((a, b)) = d.split_once(':') {
++                            if let (Ok(a), Ok(b)) = (a.parse(), b.parse()) {
++                                mine.push((a, b));
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        if children > 0 {
++            return Err(format!("{path} is a whole disk with {children} partition(s); name a partition instead"));
++        }
++    }
++    if let Ok(rd) = fs::read_dir(sys.join("holders")) {
++        if rd.count() > 0 {
++            return Err(format!("{path} has holders (device-mapper/md/LUKS on top of it)"));
++        }
++    }
++
++    let is_mine = |p: &Path| rdev_of(p).is_some_and(|r| mine.contains(&(rustix::fs::major(r), rustix::fs::minor(r))));
++    if let Ok(mi) = fs::read_to_string("/proc/self/mountinfo") {
++        for line in mi.lines() {
++            let mut halves = line.splitn(2, " - ");
++            let (pre, post) = (halves.next().unwrap_or(""), halves.next().unwrap_or(""));
++            let devno = pre.split_whitespace().nth(2).unwrap_or("");
++            let source = post.split_whitespace().nth(1).unwrap_or("");
++            let by_devno = devno
++                .split_once(':')
++                .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
++                .is_some_and(|d| mine.contains(&d));
++            if by_devno || is_mine(Path::new(source)) {
++                return Err(format!("{path} (or a partition of it) is mounted: {}", line.split_whitespace().nth(4).unwrap_or("?")));
++            }
++        }
++    }
++    if let Ok(sw) = fs::read_to_string("/proc/swaps") {
++        for line in sw.lines().skip(1) {
++            if let Some(p) = line.split_whitespace().next() {
++                if is_mine(Path::new(p)) {
++                    return Err(format!("{path} is active swap ({p}); run `swapoff {p}` first"));
++                }
++            }
++        }
++    }
++
++    let rotational = {
++        let disk = if is_partition { sys.parent().map(Path::to_path_buf).unwrap_or(sys.clone()) } else { sys.clone() };
++        read_trim(disk.join("queue/rotational")).map(|s| s == "1")
++    };
++
++    let dev = FileDevice::open(path, false).map_err(|e| format!("{path}: cannot open for reading: {e}"))?;
++    let size = crate::device::Device::size(&dev);
++    let (logical_sector, physical_sector) = dev.sector_sizes();
++
++    let mut head = vec![0u8; 128 * 1024];
++    let n = fs::File::open(path)
++        .and_then(|mut f| f.read(&mut head))
++        .map_err(|e| format!("{path}: cannot read signature: {e}"))?;
++    let signature = detect_signature(&head[..n]);
++    if !allowed.contains(&signature) {
++        let what = if signature == Signature::Other {
++            "data that is not empty, swap or CAFS (an unrecognised filesystem, LVM, leftovers...)".to_string()
++        } else {
++            format!("a {signature:?} signature")
++        };
++        return Err(format!(
++            "{path} holds {what}; refusing to overwrite it. If you are sure it is expendable, clear its start yourself first: `dd if=/dev/zero of={path} bs=1M count=1 conv=fsync`"
++        ));
++    }
++
++    Ok(TargetInfo { path: PathBuf::from(path), kernel_name, size, logical_sector, physical_sector, rotational, is_partition, signature })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn page(f: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
++        let mut v = vec![0u8; 128 * 1024];
++        f(&mut v);
++        v
++    }
++
++    #[test]
++    fn recognises_common_signatures() {
++        assert_eq!(detect_signature(&page(|_| {})), Signature::Empty);
++        assert_eq!(detect_signature(&page(|v| v[4086..4096].copy_from_slice(b"SWAPSPACE2"))), Signature::Swap);
++        assert_eq!(detect_signature(&page(|v| v[3..11].copy_from_slice(b"NTFS    "))), Signature::Ntfs);
++        assert_eq!(detect_signature(&page(|v| v[1080..1082].copy_from_slice(&[0x53, 0xEF]))), Signature::Ext);
++        assert_eq!(detect_signature(&page(|v| v[65600..65608].copy_from_slice(b"_BHRfS_M"))), Signature::Btrfs);
++        assert_eq!(detect_signature(&page(|v| v[0..8].copy_from_slice(&PTR_MAGIC))), Signature::Cafs);
++        assert_eq!(detect_signature(&page(|v| v[500] = 1)), Signature::Other);
++    }
++
++    #[test]
++    fn regular_files_and_missing_paths_are_refused() {
++        assert!(check_target("/definitely/not/here", &Signature::OVERWRITABLE).is_err());
++        let d = tempfile::tempdir().unwrap();
++        let p = d.path().join("f");
++        std::fs::write(&p, b"x").unwrap();
++        assert!(check_target(p.to_str().unwrap(), &Signature::OVERWRITABLE).unwrap_err().contains("not a block device"));
++    }
++}
+diff --git a/tests/adaptive.rs b/tests/adaptive.rs
+new file mode 100644
+index 0000000..3358804
+--- /dev/null
++++ b/tests/adaptive.rs
+@@ -0,0 +1,160 @@
++//! Adaptive suite: the same scenarios run on a disk image (default) or
++//! on a real block device:
++//!
++//!   CAFS_TEST_DEVICE=/dev/sdXN CAFS_TEST_DEVICE_I_AGREE=/dev/sdXN \
++//!       cargo test --test adaptive --test bench -- --test-threads=1 --nocapture
++//!
++//! Corruption is applied with raw bypass writes (real bytes on the
++//! medium), recovery goes through the normal mount/check path, and the
++//! result is verified by an O_DIRECT read where the platform allows.
++
++mod common;
++use common::*;
++
++use cafs_io::layout::*;
++use cafs_io::{ByteOffset, CafsError, MountMode, Side};
++
++const IMG: u64 = 4 * 1024 * 1024;
++
++fn u32_at(b: &[u8], o: usize) -> u32 {
++    u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
++}
++fn u64_at(b: &[u8], o: usize) -> u64 {
++    u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
++}
++
++#[test]
++fn lifecycle_format_mount_check_confirm() {
++    let t = Target::acquire(IMG);
++    t.format();
++    println!("target: {}", t.describe());
++    let sb_before = t.peek(SB_OFF, 4096);
++
++    for cycle in 1..=2u32 {
++        let mut c = t.mount(true).unwrap();
++        assert_eq!(c.device_size(), t.size);
++        assert!(c.anchors().iter().all(|r| r.head_ok() && r.tail_ok() && !r.disagree()));
++        let r = c.check().unwrap();
++        assert!(r.superblock_ok && r.anchor_slots_degraded == 0 && !r.superblock_repaired);
++        c.confirm().unwrap();
++        c.close().unwrap();
++
++        let (smart, how) = t.peek_media(SMART_OFF, 4096);
++        assert_eq!(u32_at(&smart, SMART_OFF_MOUNT_COUNT), cycle, "mount_count ({how})");
++        assert!(u64_at(&smart, SMART_OFF_LAST_MOUNT_TIME) > 1_700_000_000, "last_mount_time ({how})");
++        assert!(blake3_128_ok(&smart, SMART_HASHED_LEN), "M-SMART checksum ({how})");
++    }
++    assert_eq!(t.peek_media(SB_OFF, 4096).0, sb_before, "confirm() must not touch the Superblock");
++}
++
++#[test]
++fn head_sector_destroyed_recovers_from_the_tail_and_is_rebuilt_exactly() {
++    let t = Target::acquire(IMG);
++    t.format();
++    let before = t.peek(0, 4096);
++    t.poke(0, &[0u8; 4096]);
++
++    let mut c = t.mount(true).unwrap();
++    assert_eq!(c.anchors()[0].used(), Some(Side::Tail));
++    let r = c.check().unwrap();
++    assert_eq!((r.anchor_slots_degraded, r.anchor_slots_repaired), (2, 2));
++    drop(c);
++    let (after, how) = t.peek_media(0, 4096);
++    assert_eq!(after, before, "head rebuilt byte-for-byte ({how})");
++}
++
++#[test]
++fn tail_region_destroyed_recovers_from_the_head_and_is_rebuilt_exactly() {
++    let t = Target::acquire(IMG);
++    t.format();
++    let tail = t.size - ANCHOR_REGION_BYTES;
++    let before = t.peek(tail, ANCHOR_REGION_BYTES as usize);
++    t.poke(tail, &vec![0u8; ANCHOR_REGION_BYTES as usize]);
++
++    let mut c = t.mount(true).unwrap();
++    assert!(c.anchors().iter().all(|r| r.used() == Some(Side::Head)));
++    let r = c.check().unwrap();
++    assert_eq!((r.anchor_slots_degraded, r.anchor_slots_repaired), (6, 6));
++    drop(c);
++    let (after, how) = t.peek_media(tail, ANCHOR_REGION_BYTES as usize);
++    assert_eq!(after, before, "tail rebuilt byte-for-byte ({how})");
++}
++
++#[test]
++fn superblock_corruption_is_repaired_from_the_backup_at_the_end_of_the_device() {
++    let t = Target::acquire(IMG);
++    t.format();
++    let before = t.peek(SB_OFF, 4096);
++    let mut bad = before.clone();
++    bad[100] ^= 0xFF;
++    t.poke(SB_OFF, &bad);
++
++    let mut c = t.mount(true).unwrap();
++    let r = c.check().unwrap();
++    assert!(r.superblock_ok && r.superblock_repaired);
++    drop(c);
++    assert_eq!(t.peek_media(SB_OFF, 4096).0, before);
++    assert_eq!(t.peek(sb_backup_offset(t.size).0, 4096), before, "backup untouched");
++}
++
++#[test]
++fn both_ends_of_lba0_destroyed_refuses_full_mount_but_bypass_still_opens() {
++    let t = Target::acquire(IMG);
++    t.format();
++    t.poke(0, &[0u8; 2048]);
++    t.poke(tail_slot_offset(0, t.size).0, &[0u8; 2048]);
++
++    assert!(matches!(t.mount(false), Err(CafsError::BadMagic)));
++    let mut c = t.bypass(false);
++    let mut b = [0u8; 16];
++    c.read_block(ByteOffset(SB_OFF), &mut b).unwrap(); // data still reachable raw
++    drop(c);
++
++    t.format();
++    assert!(t.mount(false).is_ok(), "re-format restores a mountable volume");
++}
++
++#[test]
++fn raw_io_works_at_the_edges_and_never_leaves_the_device() {
++    let t = Target::acquire(IMG);
++    t.format();
++    let mut c = t.bypass(true);
++    assert_eq!(c.device_size(), t.size);
++    let spots = [0u64, 4096, t.size / 2 / 4096 * 4096, t.size - 4096];
++    for (i, &off) in spots.iter().enumerate() {
++        let pat = vec![0xC0 + i as u8; 4096];
++        c.write_block(ByteOffset(off), &pat).unwrap();
++    }
++    c.sync().unwrap();
++    // Unaligned (bounce) write at the very last bytes.
++    c.write_block(ByteOffset(t.size - 3), &[1, 2, 3]).unwrap();
++    c.sync().unwrap();
++    assert_eq!(c.write_block(ByteOffset(t.size - 2), &[9, 9, 9]), Err(CafsError::OutOfRange));
++    assert_eq!(c.write_block(ByteOffset(t.size), &[9]), Err(CafsError::OutOfRange));
++    drop(c);
++
++    for (i, &off) in spots.iter().enumerate() {
++        let (got, how) = t.peek_media(off, 4096);
++        let mut want = vec![0xC0 + i as u8; 4096];
++        if off == t.size - 4096 {
++            let n = want.len();
++            want[n - 3..].copy_from_slice(&[1, 2, 3]);
++        }
++        assert_eq!(got, want, "pattern at {off} ({how})");
++    }
++}
++
++#[test]
++fn a_second_writer_is_refused_while_one_holds_the_device() {
++    let t = Target::acquire(IMG);
++    if !t.is_device() {
++        eprintln!("skipped: exclusive claim (O_EXCL) exists only for block devices");
++        return;
++    }
++    t.format();
++    let held = t.bypass(true);
++    assert!(matches!(cafs_io::CafsCtx::mount_with(&t.path, true, MountMode::Bypass), Err(CafsError::Open)));
++    assert!(cafs_io::CafsCtx::mount_with(&t.path, false, MountMode::Bypass).is_ok(), "inspection stays possible");
++    drop(held);
++    assert!(cafs_io::CafsCtx::mount_with(&t.path, true, MountMode::Bypass).is_ok());
++}
+diff --git a/tests/anchors.rs b/tests/anchors.rs
+new file mode 100644
+index 0000000..2e3b184
+--- /dev/null
++++ b/tests/anchors.rs
+@@ -0,0 +1,187 @@
++//! Head + end-of-device anchor pointer blocks (fs.info §2, §3, §12,
++//! §14 Track A) as the engine now uses them.
++
++mod common;
++use common::*;
++
++use cafs_io::anchor::build_ptr_block;
++use cafs_io::fault::FaultDevice;
++use cafs_io::layout::*;
++use cafs_io::{CafsCtx, CafsError, MountOpts, PtrAlgo, Side};
++
++const SZ: u64 = 1024 * 1024;
++
++fn img() -> Vec<u8> {
++    formatted_image(SZ)
++}
++fn zero(dev: &FaultDevice, off: u64, n: usize) {
++    dev.poke(off, &vec![0u8; n]);
++}
++fn mount_rw(dev: &FaultDevice) -> CafsCtx {
++    CafsCtx::mount_device(Box::new(dev.clone()), true).unwrap()
++}
++
++#[test]
++fn fresh_volume_has_twelve_good_pointer_blocks_and_the_mirror_matches() {
++    let image = img();
++    let (_d, c) = mount_image(image.clone(), false).unwrap();
++    for r in c.anchors() {
++        assert!(r.head_ok() && r.tail_ok() && !r.disagree(), "slot {}", r.slot);
++        assert_eq!(r.used(), Some(Side::Head));
++    }
++    // Slots 1-5: tail is a byte-for-byte copy of the head.
++    for slot in 1..6u8 {
++        let n = slot_block_size(slot) as usize;
++        let (h, t) = (head_slot_offset(slot).0 as usize, tail_slot_offset(slot, SZ).0 as usize);
++        assert_eq!(image[h..h + n], image[t..t + n], "slot {slot}");
++    }
++    // Slot 0: tail swaps primary and fallback.
++    let (primary, backup) = c.anchors()[0].sb_pair().unwrap();
++    assert_eq!(primary.0, SB_OFF);
++    assert_eq!(backup.unwrap(), sb_backup_offset(SZ));
++}
++
++#[test]
++fn lba0_checksum_flip_mounts_from_the_tail() {
++    let dev = FaultDevice::from_image(img());
++    dev.flip_byte(24);
++    let mut c = mount_rw(&dev);
++    assert_eq!(c.anchors()[0].used(), Some(Side::Tail));
++    assert!(c.check().unwrap().superblock_ok);
++}
++
++#[test]
++fn first_sector_zeroed_mounts_and_check_rebuilds_the_heads_byte_for_byte() {
++    let original = img();
++    let dev = FaultDevice::from_image(original.clone());
++    zero(&dev, 0, 4096); // LBA0 + LBA1 heads
++    let mut c = mount_rw(&dev);
++    assert_eq!(c.anchors()[1].used(), Some(Side::Tail));
++    let r = c.check().unwrap();
++    assert_eq!((r.anchor_slots_degraded, r.anchor_slots_repaired, r.anchor_slots_lost), (2, 2, 0));
++    assert_eq!(dev.durable_image()[0..4096], original[0..4096]);
++    assert!(c.anchors().iter().all(|r| r.head_ok() && r.tail_ok()));
++}
++
++#[test]
++fn unreadable_head_sector_mounts_from_the_tail() {
++    let dev = FaultDevice::from_image(img());
++    dev.add_bad_read_range(0, 4096);
++    let mut c = mount_rw(&dev);
++    let r = c.check().unwrap();
++    assert_eq!(r.anchor_slots_degraded, 2);
++    assert!(r.superblock_ok);
++    // Rewriting cannot cure a sector that still cannot be read.
++    assert!(!c.anchors()[0].head_ok());
++}
++
++#[test]
++fn both_ends_of_lba0_bad_is_unmountable() {
++    let dev = FaultDevice::from_image(img());
++    dev.flip_byte(24);
++    dev.flip_byte(tail_slot_offset(0, SZ).0 + 24);
++    assert!(matches!(CafsCtx::mount_device(Box::new(dev), false), Err(CafsError::Checksum)));
++}
++
++#[test]
++fn both_ends_of_a_non_root_slot_bad_is_reported_lost_but_mount_succeeds() {
++    let dev = FaultDevice::from_image(img());
++    dev.flip_byte(head_slot_offset(2).0 + 24);
++    dev.flip_byte(tail_slot_offset(2, SZ).0 + 24);
++    let mut c = mount_rw(&dev);
++    assert_eq!(c.check().unwrap().anchor_slots_lost, 1);
++}
++
++#[test]
++fn damaged_head_fallback_is_detected_and_the_head_rebuilt() {
++    let original = img();
++    let dev = FaultDevice::from_image(original.clone());
++    dev.flip_byte(1048); // head LBA0 fallback_checksum
++    let mut c = mount_rw(&dev);
++    assert!(c.anchors()[0].head_ok() && !c.anchors()[0].head_good());
++    let r = c.check().unwrap();
++    assert_eq!((r.anchor_slots_degraded, r.anchor_slots_repaired), (1, 1));
++    assert_eq!(dev.durable_image()[0..2048], original[0..2048]);
++}
++
++#[test]
++fn damaged_fallback_pointer_plus_bad_superblock_now_recovers_via_the_tail() {
++    // As uploaded this combination was unrecoverable.
++    let dev = FaultDevice::from_image(img());
++    dev.flip_byte(1034); // head LBA0 fallback_real_lba
++    dev.flip_byte(SB_OFF + 100);
++    let mut c = mount_rw(&dev);
++    let r = c.check().unwrap();
++    assert!(r.superblock_ok && r.superblock_repaired);
++}
++
++#[test]
++fn readonly_mount_reports_damage_but_writes_nothing() {
++    let dev = FaultDevice::from_image(img());
++    zero(&dev, 0, 4096);
++    let mut c = CafsCtx::mount_device(Box::new(dev.clone()), false).unwrap();
++    let r = c.check().unwrap();
++    assert_eq!((r.anchor_slots_degraded, r.anchor_slots_repaired), (2, 0));
++    assert_eq!(dev.counters().writes, 0);
++}
++
++#[test]
++fn software_readonly_remount_blocks_repairs() {
++    // remount.rs documents that check()'s repair path honours
++    // opts.readonly; as uploaded it did not.
++    let dev = FaultDevice::from_image(img());
++    dev.flip_byte(SB_OFF + 100);
++    zero(&dev, 0, 4096);
++    let mut c = mount_rw(&dev);
++    c.remount(&MountOpts { readonly: true, ..Default::default() }).unwrap();
++    let r = c.check().unwrap();
++    assert!(r.superblock_ok && !r.superblock_repaired);
++    assert_eq!(r.anchor_slots_repaired, 0);
++    assert_eq!(dev.counters().writes, 0);
++}
++
++#[test]
++fn ends_that_verify_but_disagree_are_reported_and_head_wins() {
++    let dev = FaultDevice::from_image(img());
++    let other = build_ptr_block(PTR_BLOCK_SMALL_SIZE, PtrAlgo::Crc32c, 8 * 4096, 4096, None);
++    dev.poke(head_slot_offset(1).0, &other);
++    let mut c = mount_rw(&dev);
++    assert_eq!(c.anchors()[1].used(), Some(Side::Head));
++    let r = c.check().unwrap();
++    assert_eq!((r.anchor_disagreements, r.anchor_slots_degraded), (1, 0));
++}
++
++#[test]
++fn grown_device_orphans_the_tail_and_check_rebuilds_it_at_the_new_end() {
++    // The Superblock has no device-size field (fs.info §4), so a
++    // device that grew outside CAFS cannot be told apart from damage.
++    let mut grown = img();
++    grown.resize(2 * SZ as usize, 0);
++    let dev = FaultDevice::from_image(grown);
++    let mut c = mount_rw(&dev);
++    assert!(c.anchors().iter().all(|r| r.head_ok() && !r.tail_ok()));
++    let r = c.check().unwrap();
++    assert_eq!((r.anchor_slots_degraded, r.anchor_slots_repaired), (6, 6));
++    assert!(c.anchors().iter().all(|r| r.head_ok() && r.tail_ok()));
++    // Real structures stay where they were; pointers are authoritative.
++    assert_eq!(c.anchors()[0].sb_pair().unwrap().1.unwrap(), sb_backup_offset(SZ));
++    assert_ne!(sb_backup_offset(SZ), sb_backup_offset(2 * SZ));
++}
++
++#[test]
++fn known_hazard_shrunk_device_check_overwrites_live_structures_with_a_new_tail() {
++    // Same blindness in the other direction: after a shrink the
++    // "end of device" lies inside what used to be the real tail
++    // region, and check() writes a mirror over whatever is there —
++    // here the Superblock Backup. PINS A HAZARD, not a desired result.
++    let original = img();
++    let mut shrunk = original.clone();
++    shrunk.truncate(SZ as usize - 16384);
++    let old_backup = sb_backup_offset(SZ).0 as usize;
++    assert_eq!(shrunk[old_backup..old_backup + 4096], original[SB_OFF as usize..SB_OFF as usize + 4096]);
++    let dev = FaultDevice::from_image(shrunk);
++    let mut c = mount_rw(&dev);
++    c.check().unwrap();
++    let after = dev.durable_image();
++    assert_ne!(after[old_backup..old_backup + 4096], original[SB_OFF as usize..SB_OFF as usize + 4096]);
++}
+diff --git a/tests/bench.rs b/tests/bench.rs
+new file mode 100644
+index 0000000..b3a53ea
+--- /dev/null
++++ b/tests/bench.rs
+@@ -0,0 +1,92 @@
++//! Latency of engine operations on the chosen target. Numbers from a
++//! disk image are page-cache numbers; point CAFS_TEST_DEVICE at a real
++//! partition (see adaptive.rs) for device numbers. Reads are buffered,
++//! so a warm run measures the page cache, not the platter.
++
++mod common;
++use common::*;
++
++use std::time::{Duration, Instant};
++
++use cafs_io::layout::*;
++use cafs_io::{ByteOffset, CafsCtx};
++
++const IMG: u64 = 4 * 1024 * 1024;
++const N: usize = 15;
++
++fn stats(mut v: Vec<Duration>) -> (f64, f64, f64) {
++    v.sort();
++    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
++    (ms(v[0]), ms(v[v.len() / 2]), ms(v[v.len() - 1]))
++}
++
++fn row(name: &str, v: Vec<Duration>) {
++    let (min, med, max) = stats(v);
++    println!("{name:<46} {min:>9.3} {med:>9.3} {max:>9.3}");
++}
++
++#[test]
++fn bench_operation_latency() {
++    let t = Target::acquire(IMG);
++    println!("\ntarget: {}", t.describe());
++    let t0 = Instant::now();
++    t.format();
++    println!("mkfs_cafs (wipe + format + fsync): {:.1} ms\n", t0.elapsed().as_secs_f64() * 1000.0);
++    println!("{:<46} {:>9} {:>9} {:>9}", "operation (ms)", "min", "median", "max");
++
++    let mut v = Vec::new();
++    for _ in 0..N {
++        let t0 = Instant::now();
++        let c = CafsCtx::mount(&t.path, false).unwrap();
++        v.push(t0.elapsed());
++        drop(c);
++    }
++    row("mount (16 reads)", v);
++
++    let (mut vc, mut vf) = (Vec::new(), Vec::new());
++    for _ in 0..N {
++        let mut c = t.mount(true).unwrap();
++        let t0 = Instant::now();
++        c.check().unwrap();
++        vc.push(t0.elapsed());
++        let t0 = Instant::now();
++        c.confirm().unwrap();
++        vf.push(t0.elapsed());
++    }
++    row("check, clean volume", vc);
++    row("confirm (1 write + 1 sync, was 4 + 4)", vf);
++
++    let mut c = t.bypass(true);
++    let mut timed = |name: &str, off: u64, len: usize| {
++        let mut cur = vec![0u8; len];
++        c.read_block(ByteOffset(off), &mut cur).unwrap();
++        let mut v = Vec::new();
++        for _ in 0..N {
++            let t0 = Instant::now();
++            c.write_block(ByteOffset(off), &cur).unwrap(); // same bytes: content unchanged
++            c.sync().unwrap();
++            v.push(t0.elapsed());
++        }
++        row(name, v);
++    };
++    timed("write 144 B + sync @ M-SMART (start of disk)", SMART_OFF, SMART_TABLE_SIZE);
++    timed("write 2048 B + sync @ LBA0 head (start)", 0, 2048);
++    timed("write 4096 B + sync @ LBA4 head (start)", LBA4_OFFSET.0, 4096);
++    timed("write 4096 B + sync @ LBA5 tail (END of device)", tail_slot_offset(5, t.size).0, 4096);
++    timed("write 4096 B + sync @ Superblock Backup (end)", sb_backup_offset(t.size).0, 4096);
++    drop(c);
++
++    let mut v = Vec::new();
++    for _ in 0..N {
++        t.poke(tail_slot_offset(0, t.size).0, &[0u8; 2048]);
++        let mut c = t.mount(true).unwrap();
++        let t0 = Instant::now();
++        let r = c.check().unwrap();
++        v.push(t0.elapsed());
++        assert_eq!(r.anchor_slots_repaired, 1);
++    }
++    row("check + rebuild tail LBA0 (end) incl. 12-block rescan", v);
++
++    t.format();
++    println!("\nbuffered I/O: 2048 B vs 4096 B rows compare page-cache behaviour, not raw device RMW.");
++}
+diff --git a/tests/bypass.rs b/tests/bypass.rs
+new file mode 100644
+index 0000000..4e904c2
+--- /dev/null
++++ b/tests/bypass.rs
+@@ -0,0 +1,72 @@
++//! MountMode::Bypass — raw engine I/O without mount, for inspecting
++//! and modifying a disk (including one Full mount refuses).
++
++mod common;
++use common::*;
++
++use cafs_io::{ByteOffset, CafsCtx, CafsError, MountMode, MountOpts};
++
++const SZ: u64 = 1024 * 1024;
++
++fn file_image(name: &str) -> (tempfile::TempDir, String) {
++    let d = tempfile::tempdir().unwrap();
++    let p = d.path().join(name);
++    std::fs::write(&p, formatted_image(SZ)).unwrap();
++    let s = p.to_str().unwrap().to_string();
++    (d, s)
++}
++
++#[test]
++fn bypass_opens_a_volume_that_full_mount_refuses_and_modifies_it() {
++    let (_d, p) = file_image("a.img");
++    // Destroy both anchor regions completely.
++    std::fs::write(&p, {
++        let mut v = std::fs::read(&p).unwrap();
++        v[..16384].fill(0);
++        let n = v.len();
++        v[n - 16384..].fill(0);
++        v
++    })
++    .unwrap();
++    assert!(CafsCtx::mount(&p, true).is_err());
++
++    let mut c = CafsCtx::mount_with(&p, true, MountMode::Bypass).unwrap();
++    assert!(c.anchors().is_empty());
++    let mut b = [0xAAu8; 8];
++    c.read_block(ByteOffset(0), &mut b).unwrap();
++    assert_eq!(b, [0u8; 8]);
++    c.write_block(ByteOffset(4096), b"RAWWRITE").unwrap();
++    c.sync().unwrap();
++    drop(c);
++    let on_disk = std::fs::read(&p).unwrap();
++    assert_eq!(&on_disk[4096..4104], b"RAWWRITE");
++}
++
++#[test]
++fn bypass_refuses_check_and_confirm_but_allows_scan_and_remount() {
++    let (_d, p) = file_image("a.img");
++    let mut c = CafsCtx::mount_with(&p, true, MountMode::Bypass).unwrap();
++    assert!(matches!(c.check(), Err(CafsError::Bypassed)));
++    assert!(matches!(c.confirm(), Err(CafsError::Bypassed)));
++    assert_eq!(c.scan_anchors().len(), 6);
++    c.remount(&MountOpts::default()).unwrap();
++}
++
++#[test]
++fn every_device_access_is_bounds_checked_and_never_grows_the_image() {
++    let (_d, p) = file_image("a.img");
++    let mut c = CafsCtx::mount_with(&p, true, MountMode::Bypass).unwrap();
++    let mut b = [0u8; 16];
++    assert_eq!(c.read_block(ByteOffset(SZ - 8), &mut b), Err(CafsError::OutOfRange));
++    assert_eq!(c.write_block(ByteOffset(SZ - 8), &b), Err(CafsError::OutOfRange));
++    assert_eq!(c.write_block(ByteOffset(u64::MAX - 4), &b), Err(CafsError::OutOfRange));
++    drop(c);
++    assert_eq!(std::fs::metadata(&p).unwrap().len(), SZ);
++}
++
++#[test]
++fn bypass_readonly_open_rejects_writes() {
++    let (_d, p) = file_image("a.img");
++    let mut c = CafsCtx::mount_with(&p, false, MountMode::Bypass).unwrap();
++    assert_eq!(c.write_block(ByteOffset(0), &[1]), Err(CafsError::Readonly));
++}
+diff --git a/tests/characterization.rs b/tests/characterization.rs
+new file mode 100644
+index 0000000..9f8169c
+--- /dev/null
++++ b/tests/characterization.rs
+@@ -0,0 +1,54 @@
++//! Phase 1 — behaviour pinned from the engine as uploaded (format 4)
++//! that STILL holds after the Device seam, tail-mirror and bypass
++//! changes. Tests whose behaviour intentionally flipped were removed
++//! and re-expressed in `anchors.rs` / `bypass.rs`; see the commit
++//! message of "tests: ..." for the list.
++
++mod common;
++use common::*;
++
++use cafs_io::fault::FaultDevice;
++use cafs_io::{CafsCtx, CafsError, MountOpts};
++
++const SZ: u64 = 1024 * 1024;
++
++#[test]
++fn char_remount_readonly_to_readwrite_is_unsupported() {
++    let (_d, mut c) = mount_image(formatted_image(SZ), false).unwrap();
++    let o = MountOpts { readonly: false, ..Default::default() };
++    assert_eq!(c.remount(&o).map(|_| ()), Err(CafsError::Unsupported));
++}
++
++#[test]
++fn char_sync_open_remount_reports_success() {
++    // The engine claims success...
++    let (_d, mut c) = mount_image(formatted_image(SZ), true).unwrap();
++    let o = MountOpts { sync_open: true, ..Default::default() };
++    assert!(c.remount(&o).is_ok());
++}
++
++#[test]
++fn kernel_fact_o_sync_cannot_be_set_through_f_setfl() {
++    // ...but the kernel ignores O_SYNC via F_SETFL (fcntl(2)), so a
++    // FileDevice remount with sync_open does nothing. Environment fact;
++    // run it on your own host too.
++    use rustix::fs::{fcntl_getfl, fcntl_setfl, open, Mode, OFlags};
++    let d = tempfile::tempdir().unwrap();
++    let p = d.path().join("k.img");
++    std::fs::write(&p, formatted_image(SZ)).unwrap();
++    let fd = open(p.to_str().unwrap(), OFlags::RDWR, Mode::empty()).unwrap();
++    let mut fl = fcntl_getfl(&fd).unwrap();
++    fl.set(OFlags::SYNC, true);
++    fcntl_setfl(&fd, fl).unwrap();
++    assert!(!fcntl_getfl(&fd).unwrap().contains(OFlags::SYNC));
++}
++
++#[test]
++fn char_unreadable_superblock_primary_fails_mount_instead_of_using_the_backup() {
++    // A checksum failure in the Superblock is repaired from the
++    // backup; an I/O error reading it is not.
++    let dev = FaultDevice::from_image(formatted_image(SZ));
++    dev.add_bad_read_range(SB_OFF, 4096);
++    let r = CafsCtx::mount_device(Box::new(dev), false);
++    assert!(matches!(r, Err(CafsError::Io)));
++}
+diff --git a/tests/common/mod.rs b/tests/common/mod.rs
+new file mode 100644
+index 0000000..43b1c47
+--- /dev/null
++++ b/tests/common/mod.rs
+@@ -0,0 +1,171 @@
++#![allow(dead_code)]
++use std::alloc::{alloc_zeroed, dealloc, Layout};
++use std::process::Command;
++use std::sync::{Mutex, MutexGuard};
++
++use cafs_io::fault::FaultDevice;
++use cafs_io::safety::{check_target, Signature, TargetInfo};
++use cafs_io::{ByteOffset, CafsCtx, CafsError, MountMode};
++
++pub const SB_OFF: u64 = 16384;
++pub const CFG_OFF: u64 = 20480;
++pub const PARITY_OFF: u64 = 24576;
++pub const SMART_OFF: u64 = 36864;
++
++/// A freshly formatted image, produced by the real `mkfs_cafs` binary.
++pub fn formatted_image(size: u64) -> Vec<u8> {
++    let d = tempfile::tempdir().unwrap();
++    let p = d.path().join("f.img");
++    let ok = Command::new(env!("CARGO_BIN_EXE_mkfs_cafs"))
++        .arg(&p)
++        .arg(size.to_string())
++        .output()
++        .unwrap()
++        .status
++        .success();
++    assert!(ok, "mkfs_cafs failed");
++    std::fs::read(&p).unwrap()
++}
++
++pub fn mount_image(img: Vec<u8>, write: bool) -> Result<(FaultDevice, CafsCtx), cafs_io::CafsError> {
++    let dev = FaultDevice::from_image(img);
++    let ctx = CafsCtx::mount_device(Box::new(dev.clone()), write)?;
++    Ok((dev, ctx))
++}
++
++pub fn blake3_128_ok(block: &[u8], hashed_len: usize) -> bool {
++    let mut h = [0u8; 16];
++    blake3::Hasher::new().update(&block[..hashed_len]).finalize_xof().fill(&mut h);
++    h[..] == block[hashed_len..hashed_len + 16]
++}
++
++// ---- Adaptive target: disk image by default, real block device on request ----
++//
++//   CAFS_TEST_DEVICE=/dev/sdXN  CAFS_TEST_DEVICE_I_AGREE=/dev/sdXN  cargo test ...
++//
++// The device is DESTROYED. check_target() additionally refuses a mounted or
++// swap-active device, a whole disk with partitions, a device with holders,
++// and any non-empty/non-swap/non-CAFS filesystem signature.
++
++static DEVICE_LOCK: Mutex<()> = Mutex::new(());
++
++pub struct Target {
++    pub path: String,
++    pub size: u64,
++    pub info: Option<TargetInfo>,
++    _dir: Option<tempfile::TempDir>,
++    _guard: Option<MutexGuard<'static, ()>>,
++}
++
++impl Target {
++    pub fn acquire(image_size: u64) -> Target {
++        let dev = std::env::var("CAFS_TEST_DEVICE").unwrap_or_default();
++        if dev.is_empty() {
++            let d = tempfile::tempdir().unwrap();
++            let path = d.path().join("t.img").to_str().unwrap().to_string();
++            std::fs::File::create(&path).unwrap().set_len(image_size).unwrap();
++            return Target { path, size: image_size, info: None, _dir: Some(d), _guard: None };
++        }
++        let agree = std::env::var("CAFS_TEST_DEVICE_I_AGREE").unwrap_or_default();
++        assert_eq!(
++            agree, dev,
++            "CAFS_TEST_DEVICE={dev} will be DESTROYED. Re-run with CAFS_TEST_DEVICE_I_AGREE={dev} to confirm."
++        );
++        let guard = DEVICE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
++        let info = check_target(&dev, &Signature::OVERWRITABLE).unwrap_or_else(|e| panic!("CAFS_TEST_DEVICE refused: {e}"));
++        assert!(info.size >= 64 * 1024 * 1024, "device smaller than 64 MiB");
++        Target { path: dev, size: info.size, info: Some(info), _dir: None, _guard: Some(guard) }
++    }
++
++    pub fn is_device(&self) -> bool {
++        self.info.is_some()
++    }
++
++    pub fn describe(&self) -> String {
++        match &self.info {
++            None => format!("disk image ({} bytes, page-cached host file: not device numbers)", self.size),
++            Some(i) => format!(
++                "{} ({}) {} bytes, logical/physical sector {:?}/{:?}, rotational {:?}, signature before: {:?}",
++                self.path,
++                i.kernel_name,
++                self.size,
++                i.logical_sector,
++                i.physical_sector,
++                i.rotational,
++                i.signature
++            ),
++        }
++    }
++
++    pub fn bypass(&self, write: bool) -> CafsCtx {
++        CafsCtx::mount_with(&self.path, write, MountMode::Bypass).expect("bypass open")
++    }
++
++    pub fn mount(&self, write: bool) -> Result<CafsCtx, CafsError> {
++        CafsCtx::mount(&self.path, write)
++    }
++
++    /// Wipe both anchor regions (device only), then run the real mkfs.
++    pub fn format(&self) {
++        let mut cmd = Command::new(env!("CARGO_BIN_EXE_mkfs_cafs"));
++        cmd.arg(&self.path);
++        if self.is_device() {
++            let mut c = self.bypass(true);
++            let zeros = vec![0u8; 64 * 1024];
++            c.write_block(ByteOffset(0), &zeros).unwrap();
++            c.write_block(ByteOffset(self.size - zeros.len() as u64), &zeros).unwrap();
++            c.sync().unwrap();
++            drop(c);
++            cmd.arg("--force-device");
++        } else {
++            cmd.arg(self.size.to_string());
++        }
++        let out = cmd.output().unwrap();
++        assert!(out.status.success(), "mkfs_cafs: {}", String::from_utf8_lossy(&out.stderr));
++    }
++
++    pub fn peek(&self, off: u64, len: usize) -> Vec<u8> {
++        let mut b = vec![0u8; len];
++        self.bypass(false).read_block(ByteOffset(off), &mut b).unwrap();
++        b
++    }
++
++    pub fn poke(&self, off: u64, bytes: &[u8]) {
++        let mut c = self.bypass(true);
++        c.write_block(ByteOffset(off), bytes).unwrap();
++        c.sync().unwrap();
++    }
++
++    /// Read bypassing the page cache (O_DIRECT, 4096-aligned buffer) so
++    /// the bytes come from the device, not from RAM. Falls back to a
++    /// buffered read where O_DIRECT is unsupported (e.g. tmpfs).
++    pub fn peek_media(&self, off: u64, len: usize) -> (Vec<u8>, &'static str) {
++        let a_off = off / 4096 * 4096;
++        let a_end = (off + len as u64).div_ceil(4096) * 4096;
++        let n = (a_end - a_off) as usize;
++        if let Ok(fd) = rustix::fs::open(self.path.as_str(), rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECT, rustix::fs::Mode::empty()) {
++            let layout = Layout::from_size_align(n, 4096).unwrap();
++            // SAFETY: layout is non-zero-sized and 4096-aligned; the buffer is freed below.
++            let ptr = unsafe { alloc_zeroed(layout) };
++            let buf = unsafe { std::slice::from_raw_parts_mut(ptr, n) };
++            let ok = matches!(rustix::io::pread(&fd, &mut *buf, a_off), Ok(got) if got == n);
++            let out = buf[(off - a_off) as usize..(off - a_off) as usize + len].to_vec();
++            unsafe { dealloc(ptr, layout) };
++            if ok {
++                return (out, "O_DIRECT");
++            }
++        }
++        (self.peek(off, len), "buffered")
++    }
++}
++
++impl Drop for Target {
++    /// Leave a device in the known formatted state so the next test's
++    /// safety check still recognises it. Skipped while panicking, so a
++    /// failing test leaves its evidence on the device.
++    fn drop(&mut self) {
++        if self.is_device() && !std::thread::panicking() {
++            self.format();
++        }
++    }
++}
+diff --git a/tests/crash_sweep.rs b/tests/crash_sweep.rs
+new file mode 100644
+index 0000000..a183970
+--- /dev/null
++++ b/tests/crash_sweep.rs
+@@ -0,0 +1,100 @@
++//! Phase 3 — deterministic power-loss sweeps over the engine's own
++//! write sequences, under the FaultDevice crash model.
++
++mod common;
++use common::*;
++
++use cafs_io::fault::{CrashModel, FaultDevice};
++use cafs_io::CafsCtx;
++
++const SZ: u64 = 1024 * 1024;
++
++fn models() -> Vec<CrashModel> {
++    let mut v = vec![CrashModel::DROP_ALL, CrashModel::KEEP_ALL];
++    for granule in [0u64, 512, 4096] {
++        for seed in 0..8 {
++            v.push(CrashModel::torn(granule, seed));
++        }
++    }
++    v
++}
++
++/// Mount + check every crash image; return the images that fail.
++fn sweep(dev: &FaultDevice) -> (usize, Vec<String>) {
++    let n = dev.ops().len();
++    let mut failures = Vec::new();
++    let mut total = 0;
++    for prefix in 0..=n {
++        for m in models() {
++            total += 1;
++            let img = dev.crash_image(prefix, m);
++            let label = format!("prefix={prefix}/{n} granule={} keep={}% seed={}", m.granule, m.keep_percent, m.seed);
++            match CafsCtx::mount_device(Box::new(FaultDevice::from_image(img)), true) {
++                Err(e) => failures.push(format!("{label}: mount failed: {e}")),
++                Ok(mut c) if !c.anchors().iter().all(|r| r.head_ok() || r.tail_ok()) => {
++                    failures.push(format!("{label}: an anchor slot has no verifying end"));
++                    let _ = &mut c;
++                }
++                Ok(mut c) => match c.check() {
++                    Ok(r) if r.superblock_ok => {}
++                    Ok(_) => failures.push(format!("{label}: superblock unrecoverable")),
++                    Err(e) => failures.push(format!("{label}: check failed: {e}")),
++                },
++            }
++        }
++    }
++    (total, failures)
++}
++
++#[test]
++fn sweep_confirm_every_prefix_stays_mountable() {
++    let dev = FaultDevice::from_image(formatted_image(SZ));
++    let mut ctx = CafsCtx::mount_device(Box::new(dev.clone()), true).unwrap();
++    dev.begin_recording();
++    ctx.confirm().unwrap();
++    let (total, failures) = sweep(&dev);
++    println!("confirm(): {} ops, {} crash images, {} failures", dev.ops().len(), total, failures.len());
++    assert!(failures.is_empty(), "{:#?}", &failures[..failures.len().min(5)]);
++}
++
++#[test]
++fn sweep_superblock_repair_stays_mountable() {
++    let dev = FaultDevice::from_image(formatted_image(SZ));
++    dev.flip_byte(SB_OFF + 100);
++    let mut ctx = CafsCtx::mount_device(Box::new(dev.clone()), true).unwrap();
++    dev.begin_recording();
++    let r = ctx.check().unwrap();
++    assert!(r.superblock_repaired);
++    let (total, failures) = sweep(&dev);
++    println!("check() repair: {} ops, {} crash images, {} failures", dev.ops().len(), total, failures.len());
++    assert!(failures.is_empty(), "{:#?}", &failures[..failures.len().min(5)]);
++}
++
++#[test]
++fn char_smart_checksum_is_not_verified_before_read_modify_write() {
++    // A corrupted M-SMART table is read, incremented and rewritten
++    // with a freshly computed (valid) checksum: the corruption is
++    // laundered into a table that now verifies.
++    let dev = FaultDevice::from_image(formatted_image(SZ));
++    dev.flip_byte(SMART_OFF + 20); // inside total_reads, hashed range
++    let before = dev.visible_image();
++    assert!(!blake3_128_ok(&before[SMART_OFF as usize..], 128), "setup: table is corrupt");
++    let mut ctx = CafsCtx::mount_device(Box::new(dev.clone()), true).unwrap();
++    ctx.confirm().unwrap();
++    let after = dev.visible_image();
++    assert!(blake3_128_ok(&after[SMART_OFF as usize..], 128), "table now verifies");
++    assert_eq!(after[SMART_OFF as usize + 20], before[SMART_OFF as usize + 20], "corrupt byte preserved");
++}
++
++#[test]
++fn sweep_pointer_repair_stays_mountable() {
++    let dev = FaultDevice::from_image(formatted_image(SZ));
++    dev.poke(0, &[0u8; 4096]); // LBA0 + LBA1 heads gone
++    let mut ctx = CafsCtx::mount_device(Box::new(dev.clone()), true).unwrap();
++    dev.begin_recording();
++    let r = ctx.check().unwrap();
++    assert_eq!(r.anchor_slots_repaired, 2);
++    let (total, failures) = sweep(&dev);
++    println!("pointer repair: {} ops, {} crash images, {} failures", dev.ops().len(), total, failures.len());
++    assert!(failures.is_empty(), "{:#?}", &failures[..failures.len().min(5)]);
++}
+diff --git a/tests/measure.rs b/tests/measure.rs
+new file mode 100644
+index 0000000..78810aa
+--- /dev/null
++++ b/tests/measure.rs
+@@ -0,0 +1,56 @@
++//! Phase 4 — what the engine costs in device operations. Counts are
++//! deterministic (device-independent); latency is not measured here.
++
++mod common;
++use common::*;
++
++use cafs_io::CafsCtx;
++
++const SZ: u64 = 1024 * 1024;
++
++#[test]
++fn measure_operation_costs() {
++    let img = formatted_image(SZ);
++
++    let dev = cafs_io::fault::FaultDevice::from_image(img.clone());
++    let c0 = dev.counters();
++    let mut ctx = CafsCtx::mount_device(Box::new(dev.clone()), true).unwrap();
++    let mount = dev.counters().since(c0);
++
++    let c0 = dev.counters();
++    let r = ctx.check().unwrap();
++    let check_clean = dev.counters().since(c0);
++    assert!(r.superblock_ok && !r.superblock_repaired);
++
++    let c0 = dev.counters();
++    ctx.confirm().unwrap();
++    let confirm = dev.counters().since(c0);
++
++    let dev2 = cafs_io::fault::FaultDevice::from_image(img.clone());
++    dev2.flip_byte(SB_OFF + 100);
++    let mut ctx2 = CafsCtx::mount_device(Box::new(dev2.clone()), true).unwrap();
++    let c0 = dev2.counters();
++    ctx2.check().unwrap();
++    let check_repair = dev2.counters().since(c0);
++
++    let dev3 = cafs_io::fault::FaultDevice::from_image(img);
++    dev3.poke(0, &[0u8; 4096]);
++    let mut ctx3 = CafsCtx::mount_device(Box::new(dev3.clone()), true).unwrap();
++    let c0 = dev3.counters();
++    ctx3.check().unwrap();
++    let check_ptr = dev3.counters().since(c0);
++
++    println!("\nop                  reads  writes  syncs  bytes_read  bytes_written");
++    for (name, c) in [("mount", mount), ("check clean", check_clean), ("check repair SB", check_repair), ("check repair 2 ptrs", check_ptr), ("confirm", confirm)] {
++        println!("{name:<19} {:>5}  {:>6}  {:>5}  {:>10}  {:>13}", c.reads, c.writes, c.syncs, c.bytes_read, c.bytes_written);
++    }
++
++    // Pinned numbers for the code as it stands at this commit.
++    // BEFORE (as uploaded, same harness): mount 8 reads / 18656 B;
++    // check repair SB 1 write, 0 syncs; confirm 4 writes, 4 syncs, 12432 B.
++    assert_eq!((mount.reads, mount.bytes_read, mount.writes), (16, 41184, 0));
++    assert_eq!((confirm.writes, confirm.syncs, confirm.bytes_written), (1, 1, 144));
++    assert_eq!((check_repair.writes, check_repair.syncs, check_repair.bytes_written), (1, 1, 4096));
++    assert_eq!((check_ptr.writes, check_ptr.syncs, check_ptr.bytes_written), (2, 2, 4096));
++    assert_eq!((check_clean.writes, check_clean.syncs), (0, 0));
++}
+diff --git a/tests/pipeline.rs b/tests/pipeline.rs
+index 067f848..06df30a 100644
+--- a/tests/pipeline.rs
++++ b/tests/pipeline.rs
+@@ -110,7 +110,7 @@ fn full_pipeline() {
+     ctx.close().unwrap();
+ 
+     let fixed_byte = read_byte(img_path, 16384 + 100);
+-    let backup_byte = read_byte(img_path, IMG_SIZE - 4096 + 100);
++    let backup_byte = read_byte(img_path, cafs_io::layout::sb_backup_offset(IMG_SIZE).0 + 100);
+     assert_eq!(fixed_byte, backup_byte, "primary Superblock byte 100 was actually rewritten to match the backup on disk");
+ 
+     // --- re-check after repair: no repair needed the second time ---

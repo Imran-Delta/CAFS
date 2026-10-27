@@ -176,3 +176,52 @@ pub const SMART_OFF_CLEAN_UNMOUNT_FLAG: usize = 72;
 pub const SMART_OFF_CHECKSUM: usize = 128;
 pub const SMART_CHECKSUM_LEN: usize = 16;
 pub const SMART_HASHED_LEN: usize = 128; // bytes 0-127
+
+// ---- Slot geometry + end-of-device mirror (fs.info §2, §12) --------
+pub const SLOT_COUNT: usize = 6;
+
+pub const fn head_slot_offset(slot: u8) -> ByteOffset {
+    match slot {
+        0 => LBA0_OFFSET,
+        1 => LBA1_OFFSET,
+        2 => LBA2_OFFSET,
+        3 => LBA3_OFFSET,
+        4 => LBA4_OFFSET,
+        _ => LBA5_OFFSET,
+    }
+}
+
+pub const fn slot_block_size(slot: u8) -> u32 {
+    if slot < 4 {
+        PTR_BLOCK_SMALL_SIZE
+    } else {
+        PTR_BLOCK_LARGE_SIZE
+    }
+}
+
+/// End-of-device mirror of LBA0-5: the last `ANCHOR_REGION_BYTES` of
+/// the device hold the six pointer blocks in the same relative order
+/// as at the head. ASSUMPTION: fs.info §12 says "the last 6 anchor
+/// blocks" but states neither the order nor the exact offsets.
+pub const fn tail_slot_offset(slot: u8, device_size: u64) -> ByteOffset {
+    ByteOffset(device_size - ANCHOR_REGION_BYTES + head_slot_offset(slot).0)
+}
+
+/// Superblock Backup sits immediately before the tail anchor region.
+/// ASSUMPTION: fs.info states no placement rule for it.
+pub const fn sb_backup_offset(device_size: u64) -> ByteOffset {
+    ByteOffset(device_size - ANCHOR_REGION_BYTES - REAL_BLOCK_4K as u64)
+}
+
+/// B-SMART sits immediately before the Superblock Backup.
+pub const fn smart_backup_offset(device_size: u64) -> ByteOffset {
+    ByteOffset(sb_backup_offset(device_size).0 - REAL_BLOCK_4K as u64)
+}
+
+/// Bytes at the end of the device used by the mirror + backups.
+pub const END_REGION_BYTES: u64 = ANCHOR_REGION_BYTES + 2 * REAL_BLOCK_4K as u64;
+
+/// TEMPORARY (2026-10-27): `last_mount_time` lives in M-SMART, in what
+/// fs.info §11.1 lists as reserved space (73-127), instead of the
+/// Superblock. Not in fs.info; to be reconsidered.
+pub const SMART_OFF_LAST_MOUNT_TIME: usize = 80;

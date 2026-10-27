@@ -103,19 +103,27 @@ pub fn verify_ptr_block(raw: &[u8]) -> CafsResult<(PtrBlock, PtrAlgo)> {
     let real_offset = ByteOffset(read_u64(raw, o.real_lba));
     let real_size = read_u64(raw, o.real_size);
 
+    // The fallback sub-block has its own magic and checksum (§3.1/3.2,
+    // same algorithm as the primary). A fallback that fails either is
+    // treated as absent: acting on a damaged pointer cannot be
+    // 'self-defending' once a verified copy exists at the other end of
+    // the device, and it hid that copy from check().
     let fallback_lba = read_u64(raw, o.fallback_real_lba);
     let fallback = if fallback_lba == 0 {
         None
     } else {
-        // The fallback field's own sub-checksum isn't verified here —
-        // matches the C engine's behavior: an intact fallback pointer
-        // into a corrupt/wrong region is self-defending, because the
-        // real structure it points to (e.g. Superblock Backup) gets
-        // its own BLAKE3 check when read. See fallback_hashed_len /
-        // fallback_checksum / fallback_magic fields for a future,
-        // stricter check if ever needed.
-        let _ = (o.fallback_magic, o.fallback_checksum, o.fallback_hashed_len);
-        Some((ByteOffset(fallback_lba), read_u64(raw, o.fallback_real_size)))
+        let f_hashed = &raw[o.fallback_magic..o.fallback_magic + o.fallback_hashed_len];
+        let f_stored = read_u32(raw, o.fallback_checksum);
+        let f_sum = match algo {
+            PtrAlgo::Crc32c => checksum::crc32c(f_hashed),
+            PtrAlgo::Xxhash32 => checksum::xxhash32(f_hashed, 0),
+        };
+        let magic_ok = raw[o.fallback_magic..o.fallback_magic + 8] == PTR_MAGIC;
+        if magic_ok && f_sum == f_stored {
+            Some((ByteOffset(fallback_lba), read_u64(raw, o.fallback_real_size)))
+        } else {
+            None
+        }
     };
 
     Ok((
@@ -128,25 +136,121 @@ pub fn verify_ptr_block(raw: &[u8]) -> CafsResult<(PtrBlock, PtrAlgo)> {
     ))
 }
 
+/// Which end of the device a pointer block was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Head,
+    Tail,
+}
+
+/// One end of an anchor slot: verified pointer block + the checksum
+/// algorithm that verified it, or why it failed.
+pub type PtrSide = Result<(PtrBlock, PtrAlgo), CafsError>;
+
+/// Both copies of one anchor slot (head at the start of the device,
+/// tail at the end — fs.info §2, §12) and how each verified.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlotReport {
+    pub slot: u8,
+    pub head: PtrSide,
+    pub tail: PtrSide,
+}
+
+impl SlotReport {
+    pub fn head_ok(&self) -> bool {
+        self.head.is_ok()
+    }
+    pub fn tail_ok(&self) -> bool {
+        self.tail.is_ok()
+    }
+    /// Head wins when both verify (it is the primary, §13.1).
+    pub fn used(&self) -> Option<Side> {
+        if self.head_ok() {
+            Some(Side::Head)
+        } else if self.tail_ok() {
+            Some(Side::Tail)
+        } else {
+            None
+        }
+    }
+    pub fn chosen(&self) -> Option<&(PtrBlock, PtrAlgo)> {
+        match self.used()? {
+            Side::Head => self.head.as_ref().ok(),
+            Side::Tail => self.tail.as_ref().ok(),
+        }
+    }
+    /// Slot 0 only: (Superblock, Superblock Backup) as seen from the
+    /// side in use. The tail copy swaps primary and fallback (§12).
+    pub fn sb_pair(&self) -> Option<(ByteOffset, Option<ByteOffset>)> {
+        let head = self.head.as_ref().ok().map(|(b, _)| b);
+        let tail = self.tail.as_ref().ok().map(|(b, _)| b);
+        // Primary: the head's real pointer, else the tail's fallback.
+        let primary = head
+            .map(|b| b.real_offset)
+            .or_else(|| tail.and_then(|b| b.fallback.map(|f| f.0)))?;
+        // Backup: the head's (verified) fallback, else the tail's real pointer.
+        let backup = head
+            .and_then(|b| b.fallback.map(|f| f.0))
+            .or_else(|| tail.map(|b| b.real_offset));
+        Some((primary, backup))
+    }
+    /// Verifies AND carries everything this end is supposed to carry
+    /// (slot 0 must have a verified fallback).
+    fn complete(&self, side: &PtrSide) -> bool {
+        match side {
+            Ok((b, _)) => self.slot != 0 || b.fallback.is_some(),
+            Err(_) => false,
+        }
+    }
+    pub fn head_good(&self) -> bool {
+        self.complete(&self.head)
+    }
+    pub fn tail_good(&self) -> bool {
+        self.complete(&self.tail)
+    }
+    /// Both sides verify but point at different places.
+    pub fn disagree(&self) -> bool {
+        let (Ok((h, _)), Ok((t, _))) = (&self.head, &self.tail) else {
+            return false;
+        };
+        if self.slot == 0 {
+            (Some(h.real_offset), h.fallback.map(|f| f.0)) != (t.fallback.map(|f| f.0), Some(t.real_offset))
+        } else {
+            h.real_offset != t.real_offset || h.real_size != t.real_size
+        }
+    }
+}
+
+/// Build a pointer block (2048 B for LBA0-3, 4096 B for LBA4-5).
+/// The fallback sub-block is only written when `fallback` is `Some`.
+pub fn build_ptr_block(block_len: u32, algo: PtrAlgo, real_offset: u64, real_size: u64, fallback: Option<(u64, u64)>) -> Vec<u8> {
+    let o = offsets_for(block_len as usize);
+    let sum = |data: &[u8]| match algo {
+        PtrAlgo::Crc32c => checksum::crc32c(data),
+        PtrAlgo::Xxhash32 => checksum::xxhash32(data, 0),
+    };
+    let mut b = vec![0u8; block_len as usize];
+    b[o.magic..o.magic + 8].copy_from_slice(&PTR_MAGIC);
+    b[o.real_lba..o.real_lba + 8].copy_from_slice(&real_offset.to_le_bytes());
+    b[o.real_size..o.real_size + 8].copy_from_slice(&real_size.to_le_bytes());
+    let c = sum(&b[0..o.primary_hashed_len]);
+    b[o.checksum..o.checksum + 4].copy_from_slice(&c.to_le_bytes());
+    if let Some((fb_off, fb_size)) = fallback {
+        b[o.fallback_magic..o.fallback_magic + 8].copy_from_slice(&PTR_MAGIC);
+        b[o.fallback_real_lba..o.fallback_real_lba + 8].copy_from_slice(&fb_off.to_le_bytes());
+        b[o.fallback_real_size..o.fallback_real_size + 8].copy_from_slice(&fb_size.to_le_bytes());
+        let fc = sum(&b[o.fallback_magic..o.fallback_magic + o.fallback_hashed_len]);
+        b[o.fallback_checksum..o.fallback_checksum + 4].copy_from_slice(&fc.to_le_bytes());
+    }
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn build_small_ptr(real_offset: u64, real_size: u64, fallback: Option<(u64, u64)>) -> Vec<u8> {
-        let mut b = vec![0u8; PTR_BLOCK_SMALL_SIZE as usize];
-        b[PTR2K_OFF_MAGIC..PTR2K_OFF_MAGIC + 8].copy_from_slice(&PTR_MAGIC);
-        b[PTR2K_OFF_REAL_LBA..PTR2K_OFF_REAL_LBA + 8].copy_from_slice(&real_offset.to_le_bytes());
-        b[PTR2K_OFF_REAL_SIZE..PTR2K_OFF_REAL_SIZE + 8].copy_from_slice(&real_size.to_le_bytes());
-        let cksum = checksum::crc32c(&b[0..PTR2K_PRIMARY_HASHED_LEN]);
-        b[PTR2K_OFF_CHECKSUM..PTR2K_OFF_CHECKSUM + 4].copy_from_slice(&cksum.to_le_bytes());
-        if let Some((fb_off, fb_size)) = fallback {
-            b[PTR2K_OFF_FALLBACK_MAGIC..PTR2K_OFF_FALLBACK_MAGIC + 8].copy_from_slice(&PTR_MAGIC);
-            b[PTR2K_OFF_FALLBACK_REAL_LBA..PTR2K_OFF_FALLBACK_REAL_LBA + 8]
-                .copy_from_slice(&fb_off.to_le_bytes());
-            b[PTR2K_OFF_FALLBACK_REAL_SIZE..PTR2K_OFF_FALLBACK_REAL_SIZE + 8]
-                .copy_from_slice(&fb_size.to_le_bytes());
-        }
-        b
+        build_ptr_block(PTR_BLOCK_SMALL_SIZE, PtrAlgo::Crc32c, real_offset, real_size, fallback)
     }
 
     #[test]

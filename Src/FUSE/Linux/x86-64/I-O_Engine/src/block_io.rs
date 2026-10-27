@@ -14,39 +14,29 @@
 //! SPDX-License-Identifier: BSD-3-Clause
 //! Copyright (c) 2026, Imran Bin Gifary (System Delta)
 
-use rustix::io::Errno;
-
 use crate::error::{CafsError, CafsResult};
 use crate::{ByteOffset, CafsCtx, MisalignedAction};
 
 const ALIGN: u64 = 512;
 
-pub(crate) fn read_raw(ctx: &CafsCtx, offset: ByteOffset, buf: &mut [u8]) -> CafsResult<()> {
-    let mut got = 0usize;
-    while got < buf.len() {
-        match rustix::io::pread(&ctx.fd, &mut buf[got..], offset.0 + got as u64) {
-            Ok(0) => return Err(CafsError::Io), // unexpected EOF against a fixed-size structure
-            Ok(n) => got += n,
-            Err(Errno::INTR) => continue,
-            Err(_) => return Err(CafsError::Io),
-        }
+fn in_range(size: u64, offset: ByteOffset, len: usize) -> CafsResult<()> {
+    match offset.0.checked_add(len as u64) {
+        Some(end) if end <= size => Ok(()),
+        _ => Err(CafsError::OutOfRange),
     }
-    Ok(())
 }
 
-pub(crate) fn write_raw(ctx: &CafsCtx, offset: ByteOffset, buf: &[u8]) -> CafsResult<()> {
+pub(crate) fn read_raw(ctx: &mut CafsCtx, offset: ByteOffset, buf: &mut [u8]) -> CafsResult<()> {
+    in_range(ctx.dev.size(), offset, buf.len())?;
+    ctx.dev.read_at(offset.0, buf)
+}
+
+pub(crate) fn write_raw(ctx: &mut CafsCtx, offset: ByteOffset, buf: &[u8]) -> CafsResult<()> {
     if !ctx.want_write {
         return Err(CafsError::Readonly);
     }
-    let mut sent = 0usize;
-    while sent < buf.len() {
-        match rustix::io::pwrite(&ctx.fd, &buf[sent..], offset.0 + sent as u64) {
-            Ok(n) => sent += n,
-            Err(Errno::INTR) => continue,
-            Err(_) => return Err(CafsError::Io),
-        }
-    }
-    Ok(())
+    in_range(ctx.dev.size(), offset, buf.len())?;
+    ctx.dev.write_at(offset.0, buf)
 }
 
 fn is_aligned(offset: ByteOffset, len: usize) -> bool {
@@ -59,7 +49,9 @@ impl CafsCtx {
             return Err(CafsError::InvalidArg);
         }
 
-        let result = if is_aligned(offset, buf.len()) {
+        let result = if let Err(e) = in_range(self.dev.size(), offset, buf.len()) {
+            Err(e)
+        } else if is_aligned(offset, buf.len()) {
             read_raw(self, offset, buf)
         } else if self.opts.misaligned_action == MisalignedAction::Reject {
             Err(CafsError::Misaligned)
@@ -89,7 +81,9 @@ impl CafsCtx {
             return Err(CafsError::Readonly);
         }
 
-        let result = if is_aligned(offset, buf.len()) {
+        let result = if let Err(e) = in_range(self.dev.size(), offset, buf.len()) {
+            Err(e)
+        } else if is_aligned(offset, buf.len()) {
             write_raw(self, offset, buf)
         } else if self.opts.misaligned_action == MisalignedAction::Reject {
             Err(CafsError::Misaligned)

@@ -12,8 +12,6 @@
 //! SPDX-License-Identifier: BSD-3-Clause
 //! Copyright (c) 2026, Imran Bin Gifary (System Delta)
 
-use rustix::fs::{self, OFlags};
-
 use crate::error::{CafsError, CafsResult};
 use crate::layout::{PTR_ALGO_CRC32C, PTR_ALGO_XXHASH32};
 use crate::{CafsCtx, ConfigSnapshot, MountOpts};
@@ -86,17 +84,7 @@ impl CafsCtx {
             return Err(CafsError::Unsupported);
         }
 
-        let mut flags = fs::fcntl_getfl(&self.fd)?;
-        flags.set(OFlags::DIRECT, opts.direct_io);
-        flags.set(OFlags::SYNC, opts.sync_open);
-        fs::fcntl_setfl(&self.fd, flags)?;
-
-        if opts.direct_io && opts.direct_io_required {
-            let now = fs::fcntl_getfl(&self.fd)?;
-            if !now.contains(OFlags::DIRECT) {
-                return Err(CafsError::Unsupported);
-            }
-        }
+        self.dev.apply_flags(opts.direct_io, opts.sync_open, opts.direct_io_required)?;
 
         self.opts = *opts;
         Ok(snapshot)
