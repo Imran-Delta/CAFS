@@ -74,7 +74,7 @@ Out of scope for the proof of concept:
 - [`Docs/OPEN_ITEMS.md`](Docs/OPEN_ITEMS.md) — everything still undecided.
 - [`Docs/BUILD_PLAN.md`](Docs/BUILD_PLAN.md) — how the I/O Engine is being built and tested, brick by brick.
 
-## Repo layout
+## Repo layout (Docs is a bit messy I will fix it)
 
 ```text
 cafs/
