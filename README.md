@@ -1,6 +1,6 @@
 # Configurable Adaptive FileSystem (CAFS)
 
-A (Linux Kernel and) ZFS-inspired, config-first filesystem for consumer drives.
+This is a config-first filesystem inspired by the Linux Kernel and ZFS and is for consumer drives.
 
 > [!WARNING]
 > Proof of concept (pre-Alpha). Not production-ready. The on-disk format can still change, so don't store data you can't lose on a CAFS volume.
@@ -13,7 +13,9 @@ A (Linux Kernel and) ZFS-inspired, config-first filesystem for consumer drives.
 
 ## What it is
 
-CAFS aims to bring customizability and adaptability to consumer drives: health-aware block allocation driven by SMART data, two-tier deduplication, and an anchor/recovery design that only duplicates what actually matters. The configuration surface is the point — most design decisions are exposed as parameters rather than baked in.
+The goal of this filesystem is simple, bring the configurability stat to its highest. Seriously- that's the only goal I have for this. That's why kernel inspired. That thing can be used anywhere. Currently the newest thing I'm adding to this that I haven't seen before is using S.M.A.R.T data (and on-disk smart) to dictate how the filesystem works. So a bad drive or slow drive isn't pushed towards failing. It also will have selective deuplication where you can choose to deduplicate user data only or user + meta data. The configurability is the main point of this filesystem, user facing has safety.
+
+But for the custom build you will have absolute freedom, I will try my best to keep everything for custom builds to as little hardcoded constants as possible and standardize the IPC so you can pick and choose.
 
 Currently at PoC stage: the I/O Engine builds and passes tests. Everything else is unbuilt.
 
@@ -23,6 +25,8 @@ Green exists today; dashed is planned. Everything that touches the device goes t
 
 ```mermaid
 flowchart TB
+    CAFS[CAFS Process Start] --> MASTER
+    CAFS --> FS
     FS["FUSE (Linux) / WinFsp (Windows)"] --> MNT["mntproc: request handler"]
     MASTER["Master: supervises"] --> MNT
     MASTER --> HK["Housekeeping children: defrag, balance, scrub, SMART"]
@@ -40,23 +44,30 @@ flowchart TB
 ## Two builds
 
 | Build | IPC | Guardrails | For |
-|---|---|---|---|
+|:---:|:---:|:---:|:---:|
 | Release | Per-interface, CAFS-controlled | On | Normal use |
 | Custom | One standard messaging format | Off | See below |
 
-**Custom** exists for people who want to plug CAFS into their own system, swap the allocator or any other module, or drive it over a standard messaging format instead of the per-interface IPC that Release uses internally. It ships as source only — anyone building Custom is already compiling.
+> **Custom** exists for people who want to plug CAFS into their own system, swap the allocator or any other module, or drive it over a standard messaging format instead of the per-interface IPC that Release uses internally. It ships as source only — anyone building Custom is already compiling.
 
 ## What works right now
 
-- **PoC I/O Engine** — Rust, at [`Src/FUSE/Linux/x86-64/I-O_Engine/`](Src/FUSE/Linux/x86-64/I-O_Engine/). Anchor mount lifecycle, generic block read/write. `cargo test` passes.
-- **`mkfs_cafs`** — format tool, built as a bin target inside the engine crate.
-- **`smart_handler.py`** — shared SMART telemetry processor at [`Src/`](Src/).
+- [X] **PoC I/O Engine** — Rust, at [`Src/FUSE/Linux/x86-64/I-O_Engine/`](Src/FUSE/Linux/x86-64/I-O_Engine/). Anchor mount lifecycle, generic block read/write. `cargo test` passes.
+- [X] **`mkfs_cafs`** — format tool, built as a bin target inside the engine crate.
+- [X] **`smart_handler.py`** — shared SMART telemetry processor at [`Src/`](Src/).
+- [] allocator
+- [] FUSE request layer
+- [] dedup table
+- [] WAL
+Out of scope for the proof of concept:
+- [] hard links
+- [] snapshot reads
 
-Not built yet: allocator, FUSE request layer, dedup table, WAL.
+> [!NOTE]
+> The proof of concepts only deal with the syscall and hardware layer.
+> Logic is tested in alpha not PoC.
 
-Out of scope for the proof of concept: hard links, snapshot reads, and the optional Windows TRIM helper.
-
-### Where the design stands
+### Where the design stands (OUTDATED)
 
 - [`Docs/fs.info`](Docs/fs.info) — on-disk format, byte-for-byte. Canonical.
 - [`Docs/DECISIONS-FORMAT-8.md`](Docs/DECISIONS-FORMAT-8.md) — decisions for the current format revision.
@@ -90,17 +101,16 @@ cafs/
 ├── .github/                    CI pipeline
 ├── LICENSE
 ├── LICENSES/                   BSD-3-Clause, GPL-2.0
-├── Makefile                    provisional
 └── README.md
 ```
 
-Critical files:
+Critical files (OUTDATED)
 
 - [`Docs/fs.info`](Docs/fs.info) — on-disk format, byte-for-byte. Canonical.
 - [`Docs/config.fs`](Docs/config.fs) — config file format and crash-criticality per section.
 - [`LICENSE`](LICENSE) / [`LICENSES/`](LICENSES/) — BSD-3-Clause repo-wide; GPL-2.0-only for `Src/Kernel/` only.
 
-Repo conventions and the full layout rationale: `cafs-repo-structure-2026-09-03.md`.
+### OUTDATED Repo conventions and the full layout rationale: `cafs-repo-structure-2026-09-03.md`.
 
 ## Building
 
@@ -111,8 +121,6 @@ cd Src/FUSE/Linux/x86-64/I-O_Engine
 cargo build
 cargo test
 ```
-
-The root `Makefile` is provisional and may not work.
 
 A workspace root is planned so `cargo build` works from the repo root, but it isn't set up yet.
 
@@ -146,7 +154,7 @@ Bug reports and advice welcome.
 
 </details>
 
-## License
+## License (OUTDATED)
 
 BSD-3-Clause repo-wide. GPL-2.0-only for `Src/Kernel/` only. See [`LICENSE`](LICENSE) and [`LICENSES/`](LICENSES/).
 
