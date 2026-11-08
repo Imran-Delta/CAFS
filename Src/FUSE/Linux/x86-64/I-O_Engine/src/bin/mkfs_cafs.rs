@@ -191,14 +191,8 @@ fn main() {
     f.sync_data().ok();
 
     for (slot, real, rsize, fb) in head {
-        let len = slot_block_size(slot);
-        // Tail LBA0 swaps primary and fallback: its primary is the
-        // Superblock Backup, its fallback the real Superblock (§12).
-        let tail = if slot == 0 {
-            build_ptr_block(len, algo, sb_backup_off, rb, Some((OFF_SUPERBLOCK, rb)))
-        } else {
-            build_ptr_block(len, algo, real, rsize, fb)
-        };
+        // ADR-006: the tail block is a byte-identical copy of the head block.
+        let tail = build_ptr_block(slot_block_size(slot), algo, real, rsize, fb);
         write_at(tail_slot_offset(slot, size).0, &tail);
     }
     f.sync_data().ok();

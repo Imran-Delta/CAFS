@@ -200,9 +200,11 @@ pub const fn slot_block_size(slot: u8) -> u32 {
 }
 
 /// End-of-device mirror of LBA0-5: the last `ANCHOR_REGION_BYTES` of
-/// the device hold the six pointer blocks in the same relative order
-/// as at the head. ASSUMPTION: fs.info §12 says "the last 6 anchor
-/// blocks" but states neither the order nor the exact offsets.
+/// the device hold the six pointer blocks, byte-identical to the head
+/// blocks and in the same relative order (ADR-006: LBA0 and LBA3 at the
+/// tail point to the same single Superblock / Meta-User Table; the
+/// Superblock Backup is reachable identically from either end).
+/// ASSUMPTION: the exact tail offsets are not stated anywhere.
 pub const fn tail_slot_offset(slot: u8, device_size: u64) -> ByteOffset {
     ByteOffset(device_size - ANCHOR_REGION_BYTES + head_slot_offset(slot).0)
 }

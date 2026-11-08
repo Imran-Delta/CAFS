@@ -29,13 +29,12 @@ fn fresh_volume_has_twelve_good_pointer_blocks_and_the_mirror_matches() {
         assert!(r.head_ok() && r.tail_ok() && !r.disagree(), "slot {}", r.slot);
         assert_eq!(r.used(), Some(Side::Head));
     }
-    // Slots 1-5: tail is a byte-for-byte copy of the head.
-    for slot in 1..6u8 {
+    // ADR-006: every tail block is a byte-for-byte copy of its head block.
+    for slot in 0..6u8 {
         let n = slot_block_size(slot) as usize;
         let (h, t) = (head_slot_offset(slot).0 as usize, tail_slot_offset(slot, SZ).0 as usize);
         assert_eq!(image[h..h + n], image[t..t + n], "slot {slot}");
     }
-    // Slot 0: tail swaps primary and fallback.
     let (primary, backup) = c.anchors()[0].sb_pair().unwrap();
     assert_eq!(primary.0, SB_OFF);
     assert_eq!(backup.unwrap(), sb_backup_offset(SZ));

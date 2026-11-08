@@ -11,6 +11,7 @@ pub const SB_OFF: u64 = 16384;
 pub const CFG_OFF: u64 = 20480;
 pub const PARITY_OFF: u64 = 24576;
 pub const SMART_OFF: u64 = 36864;
+pub const FT_OFF: u64 = 32768;
 
 /// A freshly formatted image, produced by the real `mkfs_cafs` binary.
 pub fn formatted_image(size: u64) -> Vec<u8> {

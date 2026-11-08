@@ -179,26 +179,31 @@ impl SlotReport {
             Side::Tail => self.tail.as_ref().ok(),
         }
     }
-    /// Slot 0 only: (Superblock, Superblock Backup) as seen from the
-    /// side in use. The tail copy swaps primary and fallback (§12).
+    /// Slot 0 only: (Superblock, Superblock Backup). ADR-006: the tail
+    /// block is a byte-identical copy of the head block, so either end
+    /// supplies both; a fallback that failed verification at one end
+    /// is taken from the other.
     pub fn sb_pair(&self) -> Option<(ByteOffset, Option<ByteOffset>)> {
         let head = self.head.as_ref().ok().map(|(b, _)| b);
         let tail = self.tail.as_ref().ok().map(|(b, _)| b);
-        // Primary: the head's real pointer, else the tail's fallback.
-        let primary = head
-            .map(|b| b.real_offset)
-            .or_else(|| tail.and_then(|b| b.fallback.map(|f| f.0)))?;
-        // Backup: the head's (verified) fallback, else the tail's real pointer.
+        let primary = head.or(tail)?.real_offset;
         let backup = head
-            .and_then(|b| b.fallback.map(|f| f.0))
-            .or_else(|| tail.map(|b| b.real_offset));
+            .and_then(|b| b.fallback)
+            .or_else(|| tail.and_then(|b| b.fallback))
+            .map(|f| f.0);
         Some((primary, backup))
     }
-    /// Verifies AND carries everything this end is supposed to carry
-    /// (slot 0 must have a verified fallback).
+    /// Slot 0 should carry a verified fallback whenever either end has one.
+    fn want_fallback(&self) -> bool {
+        self.slot == 0
+            && [&self.head, &self.tail]
+                .iter()
+                .any(|s| matches!(s, Ok((b, _)) if b.fallback.is_some()))
+    }
+    /// Verifies AND carries everything this end is supposed to carry.
     fn complete(&self, side: &PtrSide) -> bool {
         match side {
-            Ok((b, _)) => self.slot != 0 || b.fallback.is_some(),
+            Ok((b, _)) => !self.want_fallback() || b.fallback.is_some(),
             Err(_) => false,
         }
     }
@@ -213,11 +218,9 @@ impl SlotReport {
         let (Ok((h, _)), Ok((t, _))) = (&self.head, &self.tail) else {
             return false;
         };
-        if self.slot == 0 {
-            (Some(h.real_offset), h.fallback.map(|f| f.0)) != (t.fallback.map(|f| f.0), Some(t.real_offset))
-        } else {
-            h.real_offset != t.real_offset || h.real_size != t.real_size
-        }
+        h.real_offset != t.real_offset
+            || h.real_size != t.real_size
+            || matches!((h.fallback, t.fallback), (Some(a), Some(b)) if a != b)
     }
 }
 

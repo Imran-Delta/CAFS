@@ -44,28 +44,17 @@ impl CafsCtx {
         Ok(result)
     }
 
-    /// Rebuild the failed end of `r` from its intact end. `None` if
-    /// the intact end lacks what is needed (slot 0 needs both
-    /// Superblock offsets to write the tail copy).
-    fn rebuild_ptr_block(r: &SlotReport, bad: Side) -> Option<Vec<u8>> {
-        let (good, algo) = r.chosen().or(r.head.as_ref().ok()).or(r.tail.as_ref().ok())?;
-        let len = slot_block_size(r.slot);
-        if r.slot == 0 {
-            let (primary, backup) = r.sb_pair()?;
-            let backup = backup?;
-            let sz = REAL_BLOCK_4K as u64;
-            return Some(match bad {
-                Side::Head => build_ptr_block(len, *algo, primary.0, sz, Some((backup.0, sz))),
-                Side::Tail => build_ptr_block(len, *algo, backup.0, sz, Some((primary.0, sz))),
-            });
-        }
-        Some(build_ptr_block(
-            len,
-            *algo,
-            good.real_offset.0,
-            good.real_size,
-            good.fallback.map(|(o, s)| (o.0, s)),
-        ))
+    /// The pointer block to write over a damaged end. ADR-006: both
+    /// ends carry the same block, so this is the intact end's content,
+    /// with a fallback that failed verification there restored from the
+    /// other end. `None` only if neither end verifies.
+    fn rebuild_ptr_block(r: &SlotReport) -> Option<Vec<u8>> {
+        let (good, algo) = r.chosen()?;
+        let fallback = [&r.head, &r.tail]
+            .iter()
+            .find_map(|s| s.as_ref().ok().and_then(|(b, _)| b.fallback))
+            .map(|(o, s)| (o.0, s));
+        Some(build_ptr_block(slot_block_size(r.slot), *algo, good.real_offset.0, good.real_size, fallback))
     }
 
     fn check_pointer_blocks(&mut self, result: &mut CheckResult) {
@@ -82,14 +71,7 @@ impl CafsCtx {
             if hg && tg {
                 continue;
             }
-            // Slot 0 can be recovered from partial information at
-            // both ends as long as both Superblock offsets are known.
-            let recoverable = if r.slot == 0 {
-                matches!(r.sb_pair(), Some((_, Some(_))))
-            } else {
-                r.head_ok() || r.tail_ok()
-            };
-            if !recoverable {
+            if !(r.head_ok() || r.tail_ok()) {
                 result.anchor_slots_lost += 1;
                 eprintln!("cafs: anchor slot {} cannot be recovered from either end of the device", r.slot);
                 continue;
@@ -103,7 +85,7 @@ impl CafsCtx {
                     eprintln!("cafs: anchor slot {} bad at the {:?} end; recoverable, but the mount is readonly, so not rewritten", r.slot, bad);
                     continue;
                 }
-                let Some(raw) = Self::rebuild_ptr_block(&r, bad) else {
+                let Some(raw) = Self::rebuild_ptr_block(&r) else {
                     eprintln!("cafs: anchor slot {} bad at the {:?} end and cannot be rebuilt", r.slot, bad);
                     continue;
                 };

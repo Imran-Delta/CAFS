@@ -15,6 +15,7 @@
 pub mod anchor;
 mod checksum;
 pub mod device;
+pub mod ecc;
 pub mod fault;
 pub mod layout;
 pub mod safety;

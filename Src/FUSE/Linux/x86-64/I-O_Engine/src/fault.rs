@@ -56,13 +56,25 @@ pub struct CrashModel {
     /// Chance (0-100) that each in-flight granule lands.
     pub keep_percent: u8,
     pub seed: u64,
+    /// Physical sector size for the hazards below (0 = none).
+    pub sector: u64,
+    /// Chance (0-100) that each physical sector touched by an in-flight
+    /// write is left unreadable garbage (a sector write is not atomic).
+    pub sector_destroy_percent: u8,
+    /// Extra chance for sectors a write covers only partially (the
+    /// drive's internal read-modify-write window).
+    pub partial_extra_percent: u8,
 }
 
 impl CrashModel {
-    pub const DROP_ALL: CrashModel = CrashModel { granule: 0, keep_percent: 0, seed: 0 };
-    pub const KEEP_ALL: CrashModel = CrashModel { granule: 0, keep_percent: 100, seed: 0 };
+    pub const DROP_ALL: CrashModel = CrashModel { granule: 0, keep_percent: 0, seed: 0, sector: 0, sector_destroy_percent: 0, partial_extra_percent: 0 };
+    pub const KEEP_ALL: CrashModel = CrashModel { granule: 0, keep_percent: 100, seed: 0, sector: 0, sector_destroy_percent: 0, partial_extra_percent: 0 };
     pub fn torn(granule: u64, seed: u64) -> CrashModel {
-        CrashModel { granule, keep_percent: 50, seed }
+        CrashModel { granule, keep_percent: 50, seed, sector: 0, sector_destroy_percent: 0, partial_extra_percent: 0 }
+    }
+    /// Same model plus sector-level hazards on `sector`-byte sectors.
+    pub fn with_hazard(self, sector: u64, destroy: u8, partial_extra: u8) -> CrashModel {
+        CrashModel { sector, sector_destroy_percent: destroy, partial_extra_percent: partial_extra, ..self }
     }
 }
 
@@ -208,6 +220,26 @@ impl FaultDevice {
                         .copy_from_slice(&data[(pos - start) as usize..(chunk_end - start) as usize]);
                 }
                 pos = chunk_end;
+            }
+        }
+
+        // Sector-level hazard, applied last so garbage overrides whatever landed.
+        if model.sector > 0 {
+            let sec = model.sector;
+            for op in &ops[durable_end..] {
+                let Op::Write { offset, data } = op else { continue };
+                let (start, end) = (*offset, *offset + data.len() as u64);
+                for s in (start / sec)..=((end - 1) / sec) {
+                    let (s0, s1) = (s * sec, (s + 1) * sec);
+                    let partial = start > s0 || end < s1;
+                    let hit = rng.chance(model.sector_destroy_percent)
+                        || (partial && rng.chance(model.partial_extra_percent));
+                    if hit {
+                        for b in &mut img[s0 as usize..s1 as usize] {
+                            *b = (rng.next() & 0xFF) as u8;
+                        }
+                    }
+                }
             }
         }
         img

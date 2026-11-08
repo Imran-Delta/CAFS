@@ -12,7 +12,8 @@ mod common;
 use common::*;
 
 use cafs_io::layout::*;
-use cafs_io::{ByteOffset, CafsError, MountMode, Side};
+use cafs_io::anchor::build_ptr_block;
+use cafs_io::{ByteOffset, CafsError, MountMode, PtrAlgo, Side};
 
 const IMG: u64 = 4 * 1024 * 1024;
 
@@ -43,6 +44,7 @@ fn lifecycle_format_mount_check_confirm() {
         assert_eq!(u32_at(&smart, SMART_OFF_MOUNT_COUNT), cycle, "mount_count ({how})");
         assert!(u64_at(&smart, SMART_OFF_LAST_MOUNT_TIME) > 1_700_000_000, "last_mount_time ({how})");
         assert!(blake3_128_ok(&smart, SMART_HASHED_LEN), "M-SMART checksum ({how})");
+        println!("media readback path: {how}");
     }
     assert_eq!(t.peek_media(SB_OFF, 4096).0, sb_before, "confirm() must not touch the Superblock");
 }
@@ -157,4 +159,64 @@ fn a_second_writer_is_refused_while_one_holds_the_device() {
     assert!(cafs_io::CafsCtx::mount_with(&t.path, false, MountMode::Bypass).is_ok(), "inspection stays possible");
     drop(held);
     assert!(cafs_io::CafsCtx::mount_with(&t.path, true, MountMode::Bypass).is_ok());
+}
+
+#[test]
+fn every_slot_heals_from_either_end() {
+    let t = Target::acquire(IMG);
+    t.format();
+    for slot in 0..SLOT_COUNT as u8 {
+        let len = slot_block_size(slot) as usize;
+        for tail in [false, true] {
+            let end = if tail { "tail" } else { "head" };
+            let off = if tail { tail_slot_offset(slot, t.size) } else { head_slot_offset(slot) }.0;
+            let before = t.peek(off, len);
+            t.poke(off, &vec![0u8; len]);
+
+            let mut c = t.mount(true).unwrap_or_else(|e| panic!("slot {slot} {end} zeroed: mount failed: {e}"));
+            let r = c.check().unwrap();
+            assert_eq!(
+                (r.anchor_slots_degraded, r.anchor_slots_repaired, r.anchor_slots_lost),
+                (1, 1, 0),
+                "slot {slot} {end} zeroed"
+            );
+            drop(c);
+            let (after, how) = t.peek_media(off, len);
+            assert_eq!(after, before, "slot {slot} {end} rebuilt byte-for-byte ({how})");
+            let c = t.mount(false).unwrap();
+            assert!(c.anchors().iter().all(|r| r.head_ok() && r.tail_ok()), "slot {slot} {end}: all twelve verify again");
+        }
+    }
+}
+
+#[test]
+fn xxhash32_pointer_blocks_mount_and_heal() {
+    let t = Target::acquire(IMG);
+    t.format();
+    let scan = t.bypass(false).scan_anchors();
+    for r in &scan {
+        let (b, _) = r.head.as_ref().unwrap();
+        let blk = build_ptr_block(
+            slot_block_size(r.slot),
+            PtrAlgo::Xxhash32,
+            b.real_offset.0,
+            b.real_size,
+            b.fallback.map(|(o, s)| (o.0, s)),
+        );
+        t.poke(head_slot_offset(r.slot).0, &blk);
+        t.poke(tail_slot_offset(r.slot, t.size).0, &blk);
+    }
+    let all_xx = |c: &cafs_io::CafsCtx| {
+        c.anchors().iter().all(|r| matches!((&r.head, &r.tail), (Ok((_, PtrAlgo::Xxhash32)), Ok((_, PtrAlgo::Xxhash32)))))
+    };
+    assert!(all_xx(&t.mount(false).unwrap()), "all twelve verify as xxhash32");
+
+    let off = head_slot_offset(2).0;
+    let before = t.peek(off, 2048);
+    t.poke(off, &[0u8; 2048]);
+    let mut c = t.mount(true).unwrap();
+    assert_eq!(c.check().unwrap().anchor_slots_repaired, 1);
+    drop(c);
+    assert_eq!(t.peek_media(off, 2048).0, before, "healed block keeps its checksum algorithm");
+    assert!(all_xx(&t.mount(false).unwrap()));
 }
