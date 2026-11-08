@@ -1,0 +1,9 @@
+[book]
+title = "CAFS Project Documentation"
+authors = ["CAFS contributors"]
+language = "en"
+src = "."
+
+[build]
+build-dir = "../site/docs"
+create-missing = false
